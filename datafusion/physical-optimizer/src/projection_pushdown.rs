@@ -42,7 +42,6 @@ use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
 use datafusion_physical_plan::coop::CooperativeExec;
-use datafusion_physical_plan::execution_plan::replace_children_if_necessary;
 use datafusion_physical_plan::joins::NestedLoopJoinExec;
 use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion_physical_plan::projection::{
@@ -464,27 +463,25 @@ const AGGREGATE_EXPR_ALIAS_PREFIX: &str = "__datafusion_agg_expr";
 /// `avg(octet_length(url))`, the rule builds
 /// `aggregate' <- projection <- source` with `projection` computing
 /// `octet_length(url)` and `aggregate'` referencing the projected column, and
-/// then pushes `projection` into the source with
-/// [`ExecutionPlan::try_swapping_with_projection`].
+/// then lets the regular projection pushdown
+/// ([`remove_unnecessary_projections`]) absorb `projection` into the source.
 ///
 /// The rewrite is speculative and does not rely on a cost model. It is only
-/// kept when:
+/// attempted when only cardinality preserving operators ([`CooperativeExec`]
+/// and round robin [`RepartitionExec`]) sit between the aggregate and the
+/// source, and it is only kept when the source absorbs the projection
+/// entirely, so no `ProjectionExec` is left in the plan. Together these
+/// guarantee that the extracted expressions are evaluated on exactly the rows
+/// they were evaluated on before, regardless of how expensive they are. If
+/// either condition fails, the original aggregate is returned unchanged.
 ///
-/// * the projection is absorbed by the source entirely, so no `ProjectionExec`
-///   is left in the plan, and
-/// * only cardinality preserving operators ([`CooperativeExec`] and round
-///   robin [`RepartitionExec`]) sit between the aggregate and the source.
-///
-/// Together these guarantee that the extracted expressions are evaluated on
-/// exactly the rows they were evaluated on before, regardless of how
-/// expensive they are. If either condition fails, the original aggregate is
-/// returned unchanged.
-///
-/// Crossing a round robin repartition moves the evaluation from the
-/// repartitioned aggregate input into the source's own partitions. A source
-/// that accepts an expression projection is expected to evaluate it
-/// efficiently (typically it is parallel internally, which is why it did not
-/// repartition itself), so this is not treated as a loss of parallelism.
+/// The projection is inserted directly above the source rather than directly
+/// below the aggregate: the regular pushdown refuses to move computed
+/// projections below a repartition, while the aggregate's argument
+/// expressions are already evaluated once per input row on either side of a
+/// round robin repartition. A source that accepts an expression projection is
+/// expected to evaluate it efficiently (typically it is parallel internally,
+/// which is why it did not repartition itself).
 ///
 /// Only `Partial`, `Single` and `SinglePartitioned` aggregates are rewritten:
 /// `Final` aggregates consume intermediate state rather than evaluating their
@@ -512,6 +509,13 @@ fn try_push_down_aggregate_expressions(
 
     let input = aggregate.input();
     let input_schema = input.schema();
+
+    // Only worth trying when nothing between the aggregate and the source
+    // reduces the number of rows; the operators crossed preserve the schema,
+    // so the aggregate's expressions can be evaluated directly on the leaf.
+    let Some(leaf) = cardinality_preserving_leaf(input) else {
+        return Ok(Transformed::no(plan));
+    };
 
     // Collect the distinct expressions worth extracting.
     let mut extracted: Vec<Arc<dyn PhysicalExpr>> = vec![];
@@ -584,12 +588,25 @@ fn try_push_down_aggregate_expressions(
         };
         projection_exprs.push(ProjectionExpr::new(Arc::clone(expr), alias));
     }
-    let projection = ProjectionExec::try_new(projection_exprs, Arc::clone(input))?;
+    let projection: Arc<dyn ExecutionPlan> =
+        Arc::new(ProjectionExec::try_new(projection_exprs, Arc::clone(leaf))?);
     let projected_schema = projection.schema();
 
-    let Some(new_input) = push_projection_into_source(&projection)? else {
+    // Let the regular projection pushdown absorb the projection into the
+    // source; if a `ProjectionExec` survives, the source declined.
+    let new_leaf = remove_unnecessary_projections(projection)?.data;
+    if new_leaf.is::<ProjectionExec>() {
         return Ok(Transformed::no(plan));
-    };
+    }
+    let new_input = Arc::clone(input)
+        .transform_up(|node| {
+            if node.children().is_empty() {
+                Ok(Transformed::yes(Arc::clone(&new_leaf)))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })
+        .data()?;
 
     let rewrite = |expr: &Arc<dyn PhysicalExpr>| -> Result<Arc<dyn PhysicalExpr>> {
         Arc::clone(expr)
@@ -699,35 +716,27 @@ fn is_extractable_aggregate_input(expr: &Arc<dyn PhysicalExpr>) -> bool {
         && !collect_columns(expr).is_empty()
 }
 
-/// Pushes `projection` into the leaf below it, crossing only cardinality
-/// preserving operators. Returns `None` unless the leaf absorbs the projection
-/// entirely.
-fn push_projection_into_source(
-    projection: &ProjectionExec,
-) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let input = projection.input();
-    if input.children().is_empty() {
-        return Ok(input
-            .try_swapping_with_projection(projection)?
-            .filter(|swapped| !swapped.is::<ProjectionExec>()));
-    }
-    let is_round_robin_repartition =
-        input
+/// Returns the leaf below `plan` if every operator on the way to it preserves
+/// both the cardinality and the schema of its input.
+fn cardinality_preserving_leaf(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<&Arc<dyn ExecutionPlan>> {
+    let mut current = plan;
+    loop {
+        let children = current.children();
+        if children.is_empty() {
+            return Some(current);
+        }
+        let is_round_robin_repartition = current
             .downcast_ref::<RepartitionExec>()
             .is_some_and(|repartition| {
                 matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
             });
-    if input.is::<CooperativeExec>() || is_round_robin_repartition {
-        let child = Arc::clone(input.children()[0]);
-        let inner = ProjectionExec::try_new(projection.expr().to_vec(), child)?;
-        return match push_projection_into_source(&inner)? {
-            Some(pushed) => {
-                replace_children_if_necessary(Arc::clone(input), vec![pushed]).map(Some)
-            }
-            None => Ok(None),
-        };
+        if !(current.is::<CooperativeExec>() || is_round_robin_repartition) {
+            return None;
+        }
+        current = children[0];
     }
-    Ok(None)
 }
 
 #[cfg(test)]
