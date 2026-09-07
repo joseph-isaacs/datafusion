@@ -23,7 +23,7 @@
 use crate::PhysicalOptimizerRule;
 use arrow::datatypes::{Fields, Schema, SchemaRef};
 use datafusion_common::alias::AliasGenerator;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion_common::config::ConfigOptions;
@@ -31,14 +31,24 @@ use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
 use datafusion_common::{JoinSide, JoinType, Result};
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, is_volatile};
+use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::Partitioning;
+use datafusion_physical_plan::aggregates::{
+    AggregateExec, AggregateMode, PhysicalGroupBy,
+};
+use datafusion_physical_plan::coop::CooperativeExec;
+use datafusion_physical_plan::execution_plan::replace_children_if_necessary;
 use datafusion_physical_plan::joins::NestedLoopJoinExec;
 use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion_physical_plan::projection::{
-    ProjectionExec, remove_unnecessary_projections,
+    ProjectionExec, ProjectionExpr, remove_unnecessary_projections,
 };
+use datafusion_physical_plan::repartition::RepartitionExec;
 
 /// This rule inspects `ProjectionExec`'s in the given physical plan and tries to
 /// remove or swap with its child.
@@ -46,6 +56,12 @@ use datafusion_physical_plan::projection::{
 /// Furthermore, tries to push down projections from nested loop join filters that only depend on
 /// one side of the join. By pushing these projections down, functions that only depend on one side
 /// of the join must be evaluated for the cartesian product of the two sides.
+///
+/// When `datafusion.optimizer.enable_aggregate_expression_pushdown` is set, the
+/// rule also extracts the scalar expressions used as aggregate arguments and
+/// group by keys into a projection below the aggregate and pushes that
+/// projection into the data source, keeping the rewrite only when the source
+/// absorbs the projection entirely.
 #[derive(Default, Debug)]
 pub struct ProjectionPushdown {}
 
@@ -60,7 +76,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let alias_generator = AliasGenerator::new();
         let plan = plan
@@ -73,6 +89,15 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                 ),
             })
             .map(|t| t.data)?;
+
+        let plan = if config.optimizer.enable_aggregate_expression_pushdown {
+            plan.transform_up(|plan| {
+                try_push_down_aggregate_expressions(plan, &alias_generator)
+            })
+            .data()?
+        } else {
+            plan
+        };
 
         plan.transform_down(remove_unnecessary_projections).data()
     }
@@ -426,6 +451,283 @@ impl<'a> JoinFilterRewriter<'a> {
 
         Ok(result)
     }
+}
+
+/// Prefix for the aliases of aggregate input expressions that
+/// [`try_push_down_aggregate_expressions`] extracts into a projection.
+const AGGREGATE_EXPR_ALIAS_PREFIX: &str = "__datafusion_agg_expr";
+
+/// Tries to move the scalar expressions that an [`AggregateExec`] evaluates on
+/// its input (aggregate arguments and group by keys) into the data source.
+///
+/// Starting from `aggregate <- source`, where the aggregate computes e.g.
+/// `avg(octet_length(url))`, the rule builds
+/// `aggregate' <- projection <- source` with `projection` computing
+/// `octet_length(url)` and `aggregate'` referencing the projected column, and
+/// then pushes `projection` into the source with
+/// [`ExecutionPlan::try_swapping_with_projection`].
+///
+/// The rewrite is speculative and does not rely on a cost model. It is only
+/// kept when:
+///
+/// * the projection is absorbed by the source entirely, so no `ProjectionExec`
+///   is left in the plan, and
+/// * only cardinality preserving operators ([`CooperativeExec`] and round
+///   robin [`RepartitionExec`]) sit between the aggregate and the source.
+///
+/// Together these guarantee that the extracted expressions are evaluated on
+/// exactly the rows they were evaluated on before, regardless of how
+/// expensive they are. If either condition fails, the original aggregate is
+/// returned unchanged.
+///
+/// Crossing a round robin repartition moves the evaluation from the
+/// repartitioned aggregate input into the source's own partitions. A source
+/// that accepts an expression projection is expected to evaluate it
+/// efficiently (typically it is parallel internally, which is why it did not
+/// repartition itself), so this is not treated as a loss of parallelism.
+///
+/// Only `Partial`, `Single` and `SinglePartitioned` aggregates are rewritten:
+/// `Final` aggregates consume intermediate state rather than evaluating their
+/// arguments. Aggregates that produce a dynamic filter are left alone as well.
+fn try_push_down_aggregate_expressions(
+    plan: Arc<dyn ExecutionPlan>,
+    alias_generator: &AliasGenerator,
+) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+    let Some(aggregate) = plan.downcast_ref::<AggregateExec>() else {
+        return Ok(Transformed::no(plan));
+    };
+    if !matches!(
+        aggregate.mode(),
+        AggregateMode::Partial | AggregateMode::Single | AggregateMode::SinglePartitioned
+    ) {
+        return Ok(Transformed::no(plan));
+    }
+
+    // A dynamic filter produced by the aggregate (e.g. for `max(f(x))`) may
+    // already be referenced by the source in terms of the current arguments.
+    // Rebuilding the aggregate would detach it, so leave such plans alone.
+    if !plan.dynamic_expressions_produced().is_empty() {
+        return Ok(Transformed::no(plan));
+    }
+
+    let input = aggregate.input();
+    let input_schema = input.schema();
+
+    // Collect the distinct expressions worth extracting.
+    let mut extracted: Vec<Arc<dyn PhysicalExpr>> = vec![];
+    let mut consider = |expr: &Arc<dyn PhysicalExpr>| {
+        if is_extractable_aggregate_input(expr) && !extracted.contains(expr) {
+            extracted.push(Arc::clone(expr));
+        }
+    };
+    for (expr, _) in aggregate.group_expr().expr() {
+        consider(expr);
+    }
+    for aggr_expr in aggregate.aggr_expr() {
+        for arg in aggr_expr.expressions() {
+            consider(&arg);
+        }
+    }
+    if extracted.is_empty() {
+        return Ok(Transformed::no(plan));
+    }
+
+    // Columns the aggregate still needs after the extracted expressions have
+    // been replaced by references to the projected columns.
+    let mut needed_columns: Vec<Column> = vec![];
+    let mut collect_needed = |expr: &Arc<dyn PhysicalExpr>| -> Result<()> {
+        expr.apply(|node| {
+            if extracted.contains(node) {
+                return Ok(TreeNodeRecursion::Jump);
+            }
+            if let Some(column) = node.downcast_ref::<Column>()
+                && !needed_columns.contains(column)
+            {
+                needed_columns.push(column.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .map(|_| ())
+    };
+    for (expr, _) in aggregate.group_expr().expr() {
+        collect_needed(expr)?;
+    }
+    for aggr_expr in aggregate.aggr_expr() {
+        for arg in aggr_expr.expressions() {
+            collect_needed(&arg)?;
+        }
+        for sort_expr in aggr_expr.order_bys() {
+            collect_needed(&sort_expr.expr)?;
+        }
+    }
+    for filter in aggregate.filter_expr().iter().flatten() {
+        collect_needed(filter)?;
+    }
+    needed_columns.sort_by_key(|column| column.index());
+
+    // Build the projection: pass-through columns first, extracted expressions
+    // after them under fresh aliases.
+    let mut column_map: HashMap<usize, usize> = HashMap::new();
+    let mut projection_exprs: Vec<ProjectionExpr> = vec![];
+    for column in &needed_columns {
+        column_map.insert(column.index(), projection_exprs.len());
+        projection_exprs
+            .push(ProjectionExpr::new(Arc::new(column.clone()), column.name()));
+    }
+    let extracted_offset = projection_exprs.len();
+    for expr in &extracted {
+        let alias = loop {
+            let alias = alias_generator.next(AGGREGATE_EXPR_ALIAS_PREFIX);
+            if input_schema.index_of(&alias).is_err() {
+                break alias;
+            }
+        };
+        projection_exprs.push(ProjectionExpr::new(Arc::clone(expr), alias));
+    }
+    let projection = ProjectionExec::try_new(projection_exprs, Arc::clone(input))?;
+    let projected_schema = projection.schema();
+
+    let Some(new_input) = push_projection_into_source(&projection)? else {
+        return Ok(Transformed::no(plan));
+    };
+
+    let rewrite = |expr: &Arc<dyn PhysicalExpr>| -> Result<Arc<dyn PhysicalExpr>> {
+        Arc::clone(expr)
+            .transform_down(|node| {
+                if let Some(position) = extracted.iter().position(|e| e == &node) {
+                    let index = extracted_offset + position;
+                    let column = Column::new(projected_schema.field(index).name(), index);
+                    return Ok(Transformed::new(
+                        Arc::new(column) as _,
+                        true,
+                        TreeNodeRecursion::Jump,
+                    ));
+                }
+                if let Some(column) = node.downcast_ref::<Column>() {
+                    let index = column_map[&column.index()];
+                    return Ok(Transformed::yes(
+                        Arc::new(Column::new(column.name(), index)) as _,
+                    ));
+                }
+                Ok(Transformed::no(node))
+            })
+            .data()
+    };
+
+    let group_by = aggregate.group_expr();
+    let new_group_exprs = group_by
+        .expr()
+        .iter()
+        .map(|(expr, name)| Ok((rewrite(expr)?, name.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    let new_group_by = PhysicalGroupBy::new(
+        new_group_exprs,
+        group_by.null_expr().to_vec(),
+        group_by.groups().to_vec(),
+        !group_by.is_single(),
+    );
+
+    let mut new_aggr_exprs = Vec::with_capacity(aggregate.aggr_expr().len());
+    for aggr_expr in aggregate.aggr_expr() {
+        let args = aggr_expr
+            .expressions()
+            .iter()
+            .map(&rewrite)
+            .collect::<Result<Vec<_>>>()?;
+        let order_bys = aggr_expr
+            .order_bys()
+            .iter()
+            .map(|sort_expr| {
+                Ok(PhysicalSortExpr::new(
+                    rewrite(&sort_expr.expr)?,
+                    sort_expr.options,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut builder =
+            AggregateExprBuilder::new(Arc::new(aggr_expr.fun().clone()), args)
+                .schema(Arc::clone(&projected_schema))
+                .alias(aggr_expr.name())
+                .order_by(order_bys)
+                .with_ignore_nulls(aggr_expr.ignore_nulls())
+                .with_distinct(aggr_expr.is_distinct())
+                .with_reversed(aggr_expr.is_reversed());
+        if let Some(human_display) = aggr_expr.human_display() {
+            builder = builder.human_display(human_display);
+        }
+        if let Some(alias) = aggr_expr.human_display_alias() {
+            builder = builder.human_display_alias(alias);
+        }
+        new_aggr_exprs.push(Arc::new(builder.build()?));
+    }
+
+    let new_filter_exprs = aggregate
+        .filter_expr()
+        .iter()
+        .map(|filter| filter.as_ref().map(&rewrite).transpose())
+        .collect::<Result<Vec<_>>>()?;
+
+    let new_aggregate = AggregateExec::try_new(
+        *aggregate.mode(),
+        new_group_by,
+        new_aggr_exprs,
+        new_filter_exprs,
+        new_input,
+        projected_schema,
+    )?
+    .with_limit_options(aggregate.limit_options());
+
+    // The rewrite must be invisible to the parent operators, and must not
+    // downgrade a streaming aggregate to a hash aggregate because the source
+    // no longer advertises the ordering of the extracted expressions.
+    if new_aggregate.schema() != aggregate.schema()
+        || new_aggregate.input_order_mode() != aggregate.input_order_mode()
+    {
+        return Ok(Transformed::no(plan));
+    }
+
+    Ok(Transformed::yes(Arc::new(new_aggregate)))
+}
+
+/// Returns `true` if `expr` is worth extracting out of an aggregate: it does
+/// some computation over at least one input column and re-evaluating it
+/// elsewhere in the plan cannot change its result.
+fn is_extractable_aggregate_input(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    !expr.is::<Column>()
+        && !expr.is::<Literal>()
+        && !is_volatile(expr)
+        && !collect_columns(expr).is_empty()
+}
+
+/// Pushes `projection` into the leaf below it, crossing only cardinality
+/// preserving operators. Returns `None` unless the leaf absorbs the projection
+/// entirely.
+fn push_projection_into_source(
+    projection: &ProjectionExec,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let input = projection.input();
+    if input.children().is_empty() {
+        return Ok(input
+            .try_swapping_with_projection(projection)?
+            .filter(|swapped| !swapped.is::<ProjectionExec>()));
+    }
+    let is_round_robin_repartition =
+        input
+            .downcast_ref::<RepartitionExec>()
+            .is_some_and(|repartition| {
+                matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
+            });
+    if input.is::<CooperativeExec>() || is_round_robin_repartition {
+        let child = Arc::clone(input.children()[0]);
+        let inner = ProjectionExec::try_new(projection.expr().to_vec(), child)?;
+        return match push_projection_into_source(&inner)? {
+            Some(pushed) => {
+                replace_children_if_necessary(Arc::clone(input), vec![pushed]).map(Some)
+            }
+            None => Ok(None),
+        };
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

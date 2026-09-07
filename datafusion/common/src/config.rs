@@ -1867,6 +1867,16 @@ config_namespace! {
         /// towards the leaf nodes.
         pub enable_leaf_expression_pushdown: bool, default = true
 
+        /// When set to true, the physical optimizer will extract the scalar
+        /// expressions used as aggregate arguments and group by keys (for
+        /// example `avg(octet_length(url))`) into a projection below the
+        /// aggregate and push that projection into the data source. The rewrite
+        /// is only kept when the source absorbs the projection entirely and no
+        /// row-reducing operator (filter, sort, limit) sits between the
+        /// aggregate and the source, so the expressions are never evaluated on
+        /// more rows than before.
+        pub enable_aggregate_expression_pushdown: bool, default = false
+
         /// When set to true, the logical optimizer will rewrite `UNION DISTINCT` branches that
         /// read from the same source and differ only by filter predicates into a single branch
         /// with a combined filter. This optimization is conservative and only applies when the
