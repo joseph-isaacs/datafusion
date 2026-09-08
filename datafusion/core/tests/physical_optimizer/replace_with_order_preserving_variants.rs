@@ -269,11 +269,11 @@ async fn test_with_inter_children_change_only(
     allow_duplicates! {
     match (boundedness, sort_pref) {
         (Boundedness::Unbounded, _) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC]
               SortExec: expr=[a@0 ASC], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
@@ -284,7 +284,7 @@ async fn test_with_inter_children_change_only(
 
             Optimized:
             SortPreservingMergeExec: [a@0 ASC]
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     SortPreservingMergeExec: [a@0 ASC]
@@ -294,11 +294,11 @@ async fn test_with_inter_children_change_only(
             ");
         },
         (Boundedness::Bounded, SortPreference::MaximizeParallelism) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input / Optimized:
             SortPreservingMergeExec: [a@0 ASC]
               SortExec: expr=[a@0 ASC], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
@@ -309,11 +309,11 @@ async fn test_with_inter_children_change_only(
             ");
         },
         (Boundedness::Bounded, SortPreference::PreserveOrder) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC]
               SortExec: expr=[a@0 ASC], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
@@ -324,7 +324,7 @@ async fn test_with_inter_children_change_only(
 
             Optimized:
             SortPreservingMergeExec: [a@0 ASC]
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     SortPreservingMergeExec: [a@0 ASC]
@@ -369,48 +369,48 @@ async fn test_replace_multiple_input_repartition_2(
     allow_duplicates! {
     match (boundedness, sort_pref) {
         (Boundedness::Unbounded, _) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
-                  FilterExec: c@1 > 3
+                  FilterExec: c@1 > Int32(3)
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       StreamingTableExec: partition_sizes=1, projection=[a, c, d], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]
 
             Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     StreamingTableExec: partition_sizes=1, projection=[a, c, d], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]
             ");
         },
         (Boundedness::Bounded, SortPreference::MaximizeParallelism) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input / Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
-                  FilterExec: c@1 > 3
+                  FilterExec: c@1 > Int32(3)
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
             ");
         },
         (Boundedness::Bounded, SortPreference::PreserveOrder) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
-                  FilterExec: c@1 > 3
+                  FilterExec: c@1 > Int32(3)
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
 
             Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
             ");
@@ -451,47 +451,47 @@ async fn test_replace_multiple_input_repartition_with_extra_steps(
     allow_duplicates! {
     match (boundedness, sort_pref) {
         (Boundedness::Unbounded, _) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       StreamingTableExec: partition_sizes=1, projection=[a, c, d], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]
 
             Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     StreamingTableExec: partition_sizes=1, projection=[a, c, d], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]
             ");
         },
         (Boundedness::Bounded, SortPreference::MaximizeParallelism) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input / Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
             ");
         },
         (Boundedness::Bounded, SortPreference::PreserveOrder) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
 
             Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
@@ -533,47 +533,47 @@ async fn test_replace_multiple_input_repartition_with_extra_steps_2(
     allow_duplicates! {
     match (boundedness, sort_pref) {
         (Boundedness::Unbounded, _) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       StreamingTableExec: partition_sizes=1, projection=[a, c, d], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]
 
             Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     StreamingTableExec: partition_sizes=1, projection=[a, c, d], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]
             ");
         },
         (Boundedness::Bounded, SortPreference::MaximizeParallelism) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input / Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
             ");
         },
         (Boundedness::Bounded, SortPreference::PreserveOrder) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
 
             Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
@@ -612,20 +612,20 @@ async fn test_not_replacing_when_no_need_to_preserve_sorting(
     allow_duplicates! {
     match (boundedness, sort_pref) {
         (Boundedness::Unbounded, _) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input / Optimized:
             CoalescePartitionsExec
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     StreamingTableExec: partition_sizes=1, projection=[a, c, d], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]
             ");
         },
         (Boundedness::Bounded, SortPreference::MaximizeParallelism) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input / Optimized:
             CoalescePartitionsExec
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
@@ -633,10 +633,10 @@ async fn test_not_replacing_when_no_need_to_preserve_sorting(
                 // Expected bounded results same with and without flag, because there is no executor  with ordering requirement
         },
         (Boundedness::Bounded, SortPreference::PreserveOrder) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input / Optimized:
             CoalescePartitionsExec
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
@@ -679,12 +679,12 @@ async fn test_with_multiple_replaceable_repartitions(
     allow_duplicates! {
     match (boundedness, sort_pref) {
         (Boundedness::Unbounded, _) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
-                  FilterExec: c@1 > 3
+                  FilterExec: c@1 > Int32(3)
                     RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                       RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                         StreamingTableExec: partition_sizes=1, projection=[a, c, d], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]
@@ -692,31 +692,31 @@ async fn test_with_multiple_replaceable_repartitions(
             Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       StreamingTableExec: partition_sizes=1, projection=[a, c, d], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]
             ");
         },
         (Boundedness::Bounded, SortPreference::MaximizeParallelism) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input / Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
-                  FilterExec: c@1 > 3
+                  FilterExec: c@1 > Int32(3)
                     RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                       RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                         DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
             ");
         },
         (Boundedness::Bounded, SortPreference::PreserveOrder) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
-                  FilterExec: c@1 > 3
+                  FilterExec: c@1 > Int32(3)
                     RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                       RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                         DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
@@ -724,7 +724,7 @@ async fn test_with_multiple_replaceable_repartitions(
             Optimized:
             SortPreservingMergeExec: [a@0 ASC NULLS LAST]
               RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=a@0 ASC NULLS LAST
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 ASC NULLS LAST
@@ -920,11 +920,11 @@ async fn test_with_lost_and_kept_ordering(
     allow_duplicates! {
     match (boundedness, sort_pref) {
         (Boundedness::Unbounded, _) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [c@1 ASC]
               SortExec: expr=[c@1 ASC], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       SortExec: expr=[c@1 ASC], preserve_partitioning=[false]
@@ -935,7 +935,7 @@ async fn test_with_lost_and_kept_ordering(
 
             Optimized:
             SortPreservingMergeExec: [c@1 ASC]
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=c@1 ASC
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     SortExec: expr=[c@1 ASC], preserve_partitioning=[false]
@@ -946,11 +946,11 @@ async fn test_with_lost_and_kept_ordering(
             ");
         },
         (Boundedness::Bounded, SortPreference::MaximizeParallelism) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input / Optimized:
             SortPreservingMergeExec: [c@1 ASC]
               SortExec: expr=[c@1 ASC], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       SortExec: expr=[c@1 ASC], preserve_partitioning=[false]
@@ -961,11 +961,11 @@ async fn test_with_lost_and_kept_ordering(
             ");
         },
         (Boundedness::Bounded, SortPreference::PreserveOrder) => {
-            assert_snapshot!(physical_plan, @r"
+            assert_snapshot!(physical_plan, @"
             Input:
             SortPreservingMergeExec: [c@1 ASC]
               SortExec: expr=[c@1 ASC], preserve_partitioning=[true]
-                FilterExec: c@1 > 3
+                FilterExec: c@1 > Int32(3)
                   RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8
                     RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                       SortExec: expr=[c@1 ASC], preserve_partitioning=[false]
@@ -976,7 +976,7 @@ async fn test_with_lost_and_kept_ordering(
 
             Optimized:
             SortPreservingMergeExec: [c@1 ASC]
-              FilterExec: c@1 > 3
+              FilterExec: c@1 > Int32(3)
                 RepartitionExec: partitioning=Hash([c@1], 8), input_partitions=8, preserve_order=true, sort_exprs=c@1 ASC
                   RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
                     SortExec: expr=[c@1 ASC], preserve_partitioning=[false]

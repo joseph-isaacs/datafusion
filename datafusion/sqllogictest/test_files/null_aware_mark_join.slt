@@ -227,7 +227,7 @@ logical_plan
 06)--------SubqueryAlias: __correlated_sq_1
 07)----------TableScan: inner_table_with_null projection=[id]
 physical_plan
-01)FilterExec: mark@1 OR value@0 = e, projection=[value@0]
+01)FilterExec: mark@1 OR value@0 = Utf8View("e"), projection=[value@0]
 02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
 03)----HashJoinExec: mode=CollectLeft, join_type=RightMark, on=[(id@0, id@0)], projection=[value@1, mark@2]
 04)------DataSourceExec: partitions=1, partition_sizes=[1]
@@ -266,7 +266,7 @@ logical_plan
 06)--------SubqueryAlias: __correlated_sq_1
 07)----------TableScan: inner_table_with_null projection=[id]
 physical_plan
-01)FilterExec: NOT mark@1 OR value@0 = b, projection=[value@0]
+01)FilterExec: NOT mark@1 OR value@0 = Utf8View("b"), projection=[value@0]
 02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
 03)----HashJoinExec: mode=CollectLeft, join_type=RightMark, on=[(id@0, id@0)], projection=[value@1, mark@2]
 04)------DataSourceExec: partitions=1, partition_sizes=[1]
@@ -311,13 +311,13 @@ logical_plan
 12)--------SubqueryAlias: __correlated_sq_3
 13)----------TableScan: inner_table_with_null projection=[id]
 physical_plan
-01)FilterExec: mark@1 OR mark@2 AND NOT mark@3 AND NULL IS NULL, projection=[value@0]
-02)--NestedLoopJoinExec: join_type=RightMark, filter=(id@0 = id@1) IS NOT DISTINCT FROM true, projection=[value@1, mark@2, mark@3, mark@4]
+01)FilterExec: mark@1 OR mark@2 AND NOT mark@3 AND Boolean(NULL) IS NULL, projection=[value@0]
+02)--NestedLoopJoinExec: join_type=RightMark, filter=(id@0 = id@1) IS NOT DISTINCT FROM Boolean(true), projection=[value@1, mark@2, mark@3, mark@4]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 04)----NestedLoopJoinExec: join_type=RightMark, filter=id@0 = id@1 IS NULL
 05)------DataSourceExec: partitions=1, partition_sizes=[1]
 06)------RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-07)--------NestedLoopJoinExec: join_type=RightMark, filter=(id@0 = id@1) IS NOT DISTINCT FROM true
+07)--------NestedLoopJoinExec: join_type=RightMark, filter=(id@0 = id@1) IS NOT DISTINCT FROM Boolean(true)
 08)----------DataSourceExec: partitions=1, partition_sizes=[1]
 09)----------DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -351,13 +351,13 @@ logical_plan
 12)--------SubqueryAlias: __correlated_sq_3
 13)----------TableScan: inner_table_no_null projection=[id]
 physical_plan
-01)FilterExec: (mark@1 OR mark@2 AND NOT mark@3 AND NULL) IS NOT DISTINCT FROM true, projection=[value@0]
-02)--NestedLoopJoinExec: join_type=RightMark, filter=(id@0 = id@1) IS NOT DISTINCT FROM true, projection=[value@1, mark@2, mark@3, mark@4]
+01)FilterExec: (mark@1 OR mark@2 AND NOT mark@3 AND Boolean(NULL)) IS NOT DISTINCT FROM Boolean(true), projection=[value@0]
+02)--NestedLoopJoinExec: join_type=RightMark, filter=(id@0 = id@1) IS NOT DISTINCT FROM Boolean(true), projection=[value@1, mark@2, mark@3, mark@4]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 04)----NestedLoopJoinExec: join_type=RightMark, filter=id@0 = id@1 IS NULL
 05)------DataSourceExec: partitions=1, partition_sizes=[1]
 06)------RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-07)--------NestedLoopJoinExec: join_type=RightMark, filter=(id@0 = id@1) IS NOT DISTINCT FROM true
+07)--------NestedLoopJoinExec: join_type=RightMark, filter=(id@0 = id@1) IS NOT DISTINCT FROM Boolean(true)
 08)----------DataSourceExec: partitions=1, partition_sizes=[1]
 09)----------DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -463,7 +463,7 @@ logical_plan
 06)--------SubqueryAlias: __correlated_sq_1
 07)----------TableScan: inner_table_no_null projection=[id]
 physical_plan
-01)FilterExec: mark@1 IS NOT DISTINCT FROM true, projection=[value@0]
+01)FilterExec: mark@1 IS NOT DISTINCT FROM Boolean(true), projection=[value@0]
 02)--NestedLoopJoinExec: join_type=RightMark, filter=id@0 < id@1, projection=[value@1, mark@2]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 04)----DataSourceExec: partitions=1, partition_sizes=[1]
@@ -529,7 +529,7 @@ logical_plan
 06)--------SubqueryAlias: __correlated_sq_1
 07)----------TableScan: inner_pushdown_table projection=[id, grp]
 physical_plan
-01)FilterExec: NOT mark@1 OR value@0 = zzz, projection=[value@0]
+01)FilterExec: NOT mark@1 OR value@0 = Utf8View("zzz"), projection=[value@0]
 02)--HashJoinExec: mode=CollectLeft, join_type=LeftMark, on=[(id@0, id@0), (grp@1, grp@1)], projection=[value@2, mark@3], null_aware
 03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/null_aware_mark_join/outer.parquet]]}, projection=[id, grp, value], file_type=parquet
 04)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/null_aware_mark_join/inner.parquet]]}, projection=[id, grp], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible

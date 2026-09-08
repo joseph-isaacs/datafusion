@@ -454,11 +454,11 @@ fn test_filter_over_multi_partition_sort_limit() {
     let sort = Arc::new(SortExec::new(sort_expr, filter));
     let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(21)));
 
-    assert_ensure_requirements_plan!(limit, @r"
+    assert_ensure_requirements_plan!(limit, @"
     GlobalLimitExec: skip=0, fetch=21
       SortPreservingMergeExec: [a@0 DESC]
         SortExec: expr=[a@0 DESC], preserve_partitioning=[true]
-          FilterExec: true
+          FilterExec: Boolean(true)
             MockMultiPartitionExec
     ");
 }

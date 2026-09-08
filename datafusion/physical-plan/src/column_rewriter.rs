@@ -169,7 +169,7 @@ mod tests {
 
         assert_eq!(
             format!("{}", result.data),
-            "(42 + replaced_b) * (c@2 - d@3) + e@4"
+            "(Int32(42) + Utf8(\"replaced_b\")) * (c@2 - d@3) + e@4"
         );
 
         Ok(())
@@ -219,7 +219,7 @@ mod tests {
 
         assert_eq!(
             format!("{}", result.data),
-            "a@0 + b@1 + 100 + new_col@5 + d@3 + e@4"
+            "a@0 + b@1 + Int32(100) + new_col@5 + d@3 + e@4"
         );
 
         Ok(())
@@ -288,7 +288,10 @@ mod tests {
 
         // Verify transformation occurred
         assert!(result.transformed);
-        assert_eq!(format!("{}", result.data), "(10 + b@1) * (20 - d@3) + 30");
+        assert_eq!(
+            format!("{}", result.data),
+            "(Int32(10) + b@1) * (Int32(20) - d@3) + Int32(30)"
+        );
 
         Ok(())
     }
@@ -346,7 +349,7 @@ mod tests {
 
         assert_eq!(
             format!("{}", result.data),
-            "5 * a@0 + 3 - another_col@7 + b@1"
+            "Int32(5) * a@0 + Int32(3) - another_col@7 + b@1"
         );
 
         // Verify transformation occurred

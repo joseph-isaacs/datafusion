@@ -107,7 +107,7 @@ async fn explain_analyze_baseline_metrics() {
 
     assert_metrics!(
         &formatted,
-        "FilterExec: c13@1 != C2GT5KVyOPZpgKVl110TyZO0NcJ434",
+        "FilterExec: c13@1 != Utf8View(\"C2GT5KVyOPZpgKVl110TyZO0NcJ434\")",
         "metrics=[output_rows=99, elapsed_compute=",
         "output_bytes=",
         "output_batches=1"
@@ -115,7 +115,7 @@ async fn explain_analyze_baseline_metrics() {
 
     assert_metrics!(
         &formatted,
-        "FilterExec: c13@1 != C2GT5KVyOPZpgKVl110TyZO0NcJ434",
+        "FilterExec: c13@1 != Utf8View(\"C2GT5KVyOPZpgKVl110TyZO0NcJ434\")",
         "selectivity=99% (99/100)"
     );
 
@@ -710,7 +710,7 @@ async fn csv_explain_verbose_plans() {
     // important content
     assert_contains!(&actual, "logical_plan after optimize_projections");
     assert_contains!(&actual, "physical_plan");
-    assert_contains!(&actual, "FilterExec: c2@1 > 10");
+    assert_contains!(&actual, "FilterExec: c2@1 > Int8(10)");
     assert_contains!(actual, "ProjectionExec: expr=[c1@0 as c1]");
 }
 
@@ -772,14 +772,14 @@ async fn test_physical_plan_display_indent() {
 
     assert_snapshot!(
         actual,
-        @r"
+        @"
     SortPreservingMergeExec: [the_min@2 DESC], fetch=10
       ProjectionExec: expr=[c1@0 as c1, max(aggregate_test_100.c12)@1 as max(aggregate_test_100.c12), min(aggregate_test_100.c12)@2 as the_min]
         SortExec: TopK(fetch=10), expr=[min(aggregate_test_100.c12)@2 DESC], preserve_partitioning=[true]
           AggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[max(aggregate_test_100.c12), min(aggregate_test_100.c12)]
             RepartitionExec: partitioning=Hash([c1@0], 9000), input_partitions=9000
               AggregateExec: mode=Partial, gby=[c1@0 as c1], aggr=[max(aggregate_test_100.c12), min(aggregate_test_100.c12)]
-                FilterExec: c12@1 < 10
+                FilterExec: c12@1 < Float64(10)
                   RepartitionExec: partitioning=RoundRobinBatch(9000), input_partitions=1
                     DataSourceExec: file_groups={1 group: [[ARROW_TEST_DATA/csv/aggregate_test_100.csv]]}, projection=[c1, c12], file_type=csv, has_header=true
     "
@@ -1011,17 +1011,17 @@ async fn parquet_recursive_projection_pushdown() -> Result<()> {
 
     assert_snapshot!(
         actual,
-        @r"
+        @"
     SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
       RecursiveQueryExec: name=number_series, is_distinct=false
         CoalescePartitionsExec
-          ProjectionExec: expr=[CAST(id@0 AS Int64) as id, CAST(1 AS Int64) as level]
-            FilterExec: id@0 = 1
+          ProjectionExec: expr=[CAST(id@0 AS Int64) as id, CAST(Int64(1) AS Int64) as level]
+            FilterExec: id@0 = Int64(1)
               RepartitionExec: partitioning=RoundRobinBatch(NUM_CORES), input_partitions=1
-                DataSourceExec: file_groups={1 group: [[TMP_DIR/hierarchy.parquet]]}, projection=[id], file_type=parquet, predicate=id@0 = 1, pruning_predicate=id_null_count@2 != row_count@3 AND id_min@0 <= 1 AND 1 <= id_max@1, required_guarantees=[id in (1)]
+                DataSourceExec: file_groups={1 group: [[TMP_DIR/hierarchy.parquet]]}, projection=[id], file_type=parquet, predicate=id@0 = Int64(1), pruning_predicate=id_null_count@2 != row_count@3 AND id_min@0 <= Int64(1) AND Int64(1) <= id_max@1, required_guarantees=[id in (1)]
         CoalescePartitionsExec
-          ProjectionExec: expr=[id@0 + 1 as id, level@1 + 1 as level]
-            FilterExec: id@0 < 10
+          ProjectionExec: expr=[id@0 + Int64(1) as id, level@1 + Int64(1) as level]
+            FilterExec: id@0 < Int64(10)
               RepartitionExec: partitioning=RoundRobinBatch(NUM_CORES), input_partitions=1
                 WorkTableExec: name=number_series
     "
@@ -1099,9 +1099,9 @@ async fn explain_physical_plan_only() {
 
     assert_snapshot!(
         actual,
-        @r"
+        @"
     physical_plan
-    ProjectionExec: expr=[2 as count(*)]
+    ProjectionExec: expr=[Int64(2) as count(*)]
       PlaceholderRowExec
     "
     );

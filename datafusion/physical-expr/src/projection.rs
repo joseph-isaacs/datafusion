@@ -2639,7 +2639,7 @@ pub(crate) mod tests {
 
         // Merge should produce: SELECT b@1 + a@0 AS c2, c@2 + 1 AS c1
         let merged = base_projection.try_merge(&top_projection)?;
-        assert_snapshot!(format!("{merged}"), @"Projection[b@1 + a@0 AS c2, c@2 + 1 AS c1]");
+        assert_snapshot!(format!("{merged}"), @"Projection[b@1 + a@0 AS c2, c@2 + Int32(1) AS c1]");
 
         Ok(())
     }
@@ -2691,7 +2691,7 @@ pub(crate) mod tests {
         // This should succeed - literals don't reference columns so they should
         // pass through unchanged when merged with an empty projection
         let merged = base_projection.try_merge(&top_projection)?;
-        assert_snapshot!(format!("{merged}"), @"Projection[1 AS Int64(1)]");
+        assert_snapshot!(format!("{merged}"), @"Projection[Int64(1)]");
 
         Ok(())
     }

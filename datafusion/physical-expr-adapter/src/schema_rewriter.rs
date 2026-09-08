@@ -1292,7 +1292,7 @@ mod tests {
         )) as Arc<dyn PhysicalExpr>;
 
         let result = replace_columns_with_literals(expr, &replacements)?;
-        assert_eq!(result.to_string(), "10 + 20");
+        assert_eq!(result.to_string(), "Int64(10) + Int64(20)");
 
         Ok(())
     }

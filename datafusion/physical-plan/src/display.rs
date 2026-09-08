@@ -1885,7 +1885,7 @@ mod tests {
                   "Plans": [
                     {
                       "Node Type": "FilterExec",
-                      "Details": "FilterExec: a@0 > 5",
+                      "Details": "FilterExec: a@0 > Int32(5)",
                       "Plans": [
                         {
                           "Node Type": "EmptyExec",

@@ -180,6 +180,6 @@ logical_plan
 02)--Projection: CAST(test.int_field AS Int64) AS __common_expr_1
 03)----TableScan: test projection=[int_field]
 physical_plan
-01)ProjectionExec: expr=[CASE WHEN __common_expr_1@0 IS NOT NULL THEN __common_expr_1@0 ELSE 9999 END as nvl(test.int_field,Int64(9999))]
+01)ProjectionExec: expr=[CASE WHEN __common_expr_1@0 IS NOT NULL THEN __common_expr_1@0 ELSE Int64(9999) END as nvl(test.int_field,Int64(9999))]
 02)--ProjectionExec: expr=[CAST(int_field@0 AS Int64) as __common_expr_1]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]

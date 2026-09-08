@@ -16,7 +16,7 @@ logical_plan
 01)Projection: Float64(NULL) AS col0
 02)--EmptyRelation: rows=1
 physical_plan
-01)ProjectionExec: expr=[NULL as col0]
+01)ProjectionExec: expr=[Float64(NULL) as col0]
 02)--PlaceholderRowExec
 
 # Similar, with a few more arithmetic operations
@@ -32,5 +32,5 @@ logical_plan
 01)Projection: Float64(NULL) AS col0
 02)--EmptyRelation: rows=1
 physical_plan
-01)ProjectionExec: expr=[NULL as col0]
+01)ProjectionExec: expr=[Float64(NULL) as col0]
 02)--PlaceholderRowExec

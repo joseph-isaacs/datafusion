@@ -1946,7 +1946,7 @@ mod tests {
         let explain = rt.explain.unwrap();
 
         // check that there was a pruning predicate -> row groups got pruned
-        assert_contains!(&explain, "predicate=c1@0 != bar");
+        assert_contains!(&explain, "predicate=c1@0 != Utf8(\"bar\")");
 
         // there's a single row group, but we can check that it matched
         assert_contains!(
@@ -2085,7 +2085,7 @@ mod tests {
         // But pushdown predicate should be present
         assert_contains!(
             &explain,
-            "predicate=CASE WHEN c1@0 != bar THEN true ELSE false END"
+            "predicate=CASE WHEN c1@0 != Utf8(\"bar\") THEN Boolean(true) ELSE Boolean(false) END"
         );
         assert_contains!(&explain, "pushdown_rows_pruned=5");
     }
@@ -2117,7 +2117,7 @@ mod tests {
         let explain = rt.explain.unwrap();
         assert_contains!(
             &explain,
-            "predicate=c1@0 = foo AND CASE WHEN c1@0 != bar THEN true ELSE false END"
+            "predicate=c1@0 = Utf8(\"foo\") AND CASE WHEN c1@0 != Utf8(\"bar\") THEN Boolean(true) ELSE Boolean(false) END"
         );
 
         // And bloom filters should have been evaluated

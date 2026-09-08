@@ -5188,7 +5188,10 @@ mod tests {
                 lit(ScalarValue::from(4)),
             )),
         );
-        assert_eq!(expr.to_string(), "1 AND 2 AND 3 AND 4");
+        assert_eq!(
+            expr.to_string(),
+            "Int32(1) AND Int32(2) AND Int32(3) AND Int32(4)"
+        );
 
         let expr = BinaryExpr::new(
             Arc::new(BinaryExpr::new(
@@ -5203,7 +5206,10 @@ mod tests {
                 lit(ScalarValue::from(4)),
             )),
         );
-        assert_eq!(expr.to_string(), "1 OR 2 OR 3 OR 4");
+        assert_eq!(
+            expr.to_string(),
+            "Int32(1) OR Int32(2) OR Int32(3) OR Int32(4)"
+        );
 
         let expr = BinaryExpr::new(
             Arc::new(BinaryExpr::new(
@@ -5218,7 +5224,10 @@ mod tests {
                 lit(ScalarValue::from(4)),
             )),
         );
-        assert_eq!(expr.to_string(), "1 AND 2 OR 3 AND 4");
+        assert_eq!(
+            expr.to_string(),
+            "Int32(1) AND Int32(2) OR Int32(3) AND Int32(4)"
+        );
 
         let expr = BinaryExpr::new(
             Arc::new(BinaryExpr::new(
@@ -5233,7 +5242,10 @@ mod tests {
                 lit(ScalarValue::from(4)),
             )),
         );
-        assert_eq!(expr.to_string(), "(1 OR 2) AND (3 OR 4)");
+        assert_eq!(
+            expr.to_string(),
+            "(Int32(1) OR Int32(2)) AND (Int32(3) OR Int32(4))"
+        );
     }
 
     #[test]
@@ -5944,7 +5956,7 @@ mod tests {
             &schema,
         )?;
         let display_string = lit_expr.to_string();
-        assert_eq!(display_string, "a@0 = 42");
+        assert_eq!(display_string, "a@0 = Int32(42)");
         let sql_string = fmt_sql(&lit_expr).to_string();
         assert_eq!(sql_string, "a = 42");
 

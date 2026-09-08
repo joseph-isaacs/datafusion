@@ -312,7 +312,7 @@ logical_plan
 03)----Limit: skip=11, fetch=3
 04)------TableScan: t1 projection=[], fetch=14
 physical_plan
-01)ProjectionExec: expr=[0 as count(*)]
+01)ProjectionExec: expr=[Int64(0) as count(*)]
 02)--PlaceholderRowExec
 
 query I
@@ -331,7 +331,7 @@ logical_plan
 03)----Limit: skip=8, fetch=3
 04)------TableScan: t1 projection=[], fetch=11
 physical_plan
-01)ProjectionExec: expr=[2 as count(*)]
+01)ProjectionExec: expr=[Int64(2) as count(*)]
 02)--PlaceholderRowExec
 
 query I
@@ -350,7 +350,7 @@ logical_plan
 03)----Limit: skip=8, fetch=None
 04)------TableScan: t1 projection=[]
 physical_plan
-01)ProjectionExec: expr=[2 as count(*)]
+01)ProjectionExec: expr=[Int64(2) as count(*)]
 02)--PlaceholderRowExec
 
 query I
@@ -377,7 +377,7 @@ physical_plan
 05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 06)----------ProjectionExec: expr=[]
 07)------------GlobalLimitExec: skip=6, fetch=3
-08)--------------FilterExec: a@0 > 3, fetch=9
+08)--------------FilterExec: a@0 > Int32(3), fetch=9
 09)----------------DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I
@@ -892,7 +892,7 @@ logical_plan
 05)--------Sort: test_limit_with_partitions.part_key ASC NULLS LAST, fetch=1
 06)----------TableScan: test_limit_with_partitions projection=[part_key]
 physical_plan
-01)ProjectionExec: expr=[1 as foo]
+01)ProjectionExec: expr=[Int64(1) as foo]
 02)--SortPreservingMergeExec: [part_key@0 ASC NULLS LAST], fetch=1
 03)----SortExec: TopK(fetch=1), expr=[part_key@0 ASC NULLS LAST], preserve_partitioning=[true]
 04)------DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/limit/test_limit_with_partitions/part-0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/limit/test_limit_with_partitions/part-1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/limit/test_limit_with_partitions/part-2.parquet]]}, projection=[part_key], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[part_key@0 ASC NULLS LAST], dynamic_rg_pruning=eligible
@@ -963,7 +963,7 @@ logical_plan
 03)----Sort: t.value ASC NULLS LAST, fetch=3
 04)------TableScan: t projection=[id, value]
 physical_plan
-01)FilterExec: value@1 > 200
+01)FilterExec: value@1 > Int32(200)
 02)--SortExec: TopK(fetch=3), expr=[value@1 ASC NULLS LAST], preserve_partitioning=[false]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 

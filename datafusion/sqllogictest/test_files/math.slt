@@ -1180,7 +1180,7 @@ EXPLAIN SELECT log(NULL, c2) from aggregate_simple;
 logical_plan
 01)Projection: Float64(NULL) AS log(NULL,aggregate_simple.c2)
 02)--TableScan: aggregate_simple projection=[]
-physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/aggregate_simple.csv]]}, projection=[NULL as log(NULL,aggregate_simple.c2)], file_type=csv, has_header=true
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/aggregate_simple.csv]]}, projection=[Float64(NULL) as log(NULL,aggregate_simple.c2)], file_type=csv, has_header=true
 
 # Simplification must preserve NULLs from nullable columns
 query RRRRR rowsort
@@ -1210,7 +1210,7 @@ logical_plan
 03)----Projection: column1 AS a, column2 AS b
 04)------Values: (Float64(NULL) AS NULL, Float64(2)), (Float64(2), Float64(3))
 physical_plan
-01)ProjectionExec: expr=[log(column1@0, 1) as l1, log(column1@0, column1@0) as la, power(column1@0, 0) as p0, power(column1@0, log(column1@0, column2@1)) as pl]
+01)ProjectionExec: expr=[log(column1@0, Float64(1)) as l1, log(column1@0, column1@0) as la, power(column1@0, Float64(0)) as p0, power(column1@0, log(column1@0, column2@1)) as pl]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Non-nullable bases still use the existing simplifications
@@ -1228,7 +1228,7 @@ logical_plan
 03)----Projection: column2 AS b
 04)------Values: (Float64(2), Float64(3))
 physical_plan
-01)ProjectionExec: expr=[0 as l1, 1 as la, 1 as p0, column2@1 as pl]
+01)ProjectionExec: expr=[Float64(0) as l1, Float64(1) as la, Float64(1) as p0, column2@1 as pl]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Float 16/32/64 for log

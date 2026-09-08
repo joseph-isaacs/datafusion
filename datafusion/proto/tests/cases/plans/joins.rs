@@ -669,8 +669,8 @@ fn roundtrip_piecewise_merge_join_compound_on_exprs() -> Result<()> {
                 Operator::Minus,
                 Arc::new(Literal::new(ScalarValue::Int64(Some(2)))),
             )),
-            "(a@2 + 1) * pad1@1",
-            "b@0 - 2",
+            "(a@2 + Int64(1)) * pad1@1",
+            "b@0 - Int64(2)",
         ),
         // A cast on the buffered side, a plain column on the streamed side: the
         // two halves need not have the same shape.

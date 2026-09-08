@@ -326,7 +326,7 @@ fn no_partition_by_no_change() -> Result<()> {
     let plan = build_window_topn_no_partition(5)?;
     let optimized = optimize(plan)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
-    FilterExec: row_number@2 <= 5
+    FilterExec: row_number@2 <= UInt64(5)
       BoundedWindowAggExec: wdw=[row_number: Field { "row_number": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
         SortExec: expr=[val@1 ASC], preserve_partitioning=[true]
           PlaceholderRowExec

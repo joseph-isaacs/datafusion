@@ -86,7 +86,7 @@ impl Literal {
 
 impl std::fmt::Display for Literal {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.value)
+        write!(f, "{:?}", self.value)
     }
 }
 
@@ -129,7 +129,11 @@ impl PhysicalExpr for Literal {
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
+        if let Some(value) = self.value.try_as_str().flatten() {
+            write!(f, "'{}'", value.replace('\'', "''"))
+        } else {
+            std::fmt::Display::fmt(&self.value, f)
+        }
     }
 
     fn placement(&self) -> ExpressionPlacement {
@@ -198,7 +202,7 @@ mod tests {
 
         // create and evaluate a literal expression
         let literal_expr = lit(42i32);
-        assert_eq!("42", format!("{literal_expr}"));
+        assert_eq!("Int32(42)", format!("{literal_expr}"));
 
         let literal_array = literal_expr
             .evaluate(&batch)?
@@ -220,9 +224,30 @@ mod tests {
         // create and evaluate a literal expression
         let expr = lit(42i32);
         let display_string = expr.to_string();
-        assert_eq!(display_string, "42");
+        assert_eq!(display_string, "Int32(42)");
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         assert_eq!(sql_string, "42");
+
+        for (value, expected) in [
+            (Some(""), "''"),
+            (Some("hello"), "'hello'"),
+            (Some("it's"), "'it''s'"),
+            (Some("NULL"), "'NULL'"),
+            (None, "NULL"),
+        ] {
+            for scalar in [
+                ScalarValue::Utf8(value.map(str::to_owned)),
+                ScalarValue::LargeUtf8(value.map(str::to_owned)),
+                ScalarValue::Utf8View(value.map(str::to_owned)),
+                ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(value.map(str::to_owned))),
+                ),
+            ] {
+                let expr = Literal::new(scalar);
+                assert_eq!(fmt_sql(&expr).to_string(), expected);
+            }
+        }
 
         Ok(())
     }

@@ -38,7 +38,7 @@ logical_plan
 03)----TableScan: data projection=[date, ticker, time]
 physical_plan
 01)SortPreservingMergeExec: [date@0 ASC NULLS LAST, time@2 ASC NULLS LAST]
-02)--FilterExec: ticker@1 = A
+02)--FilterExec: ticker@1 = Utf8View("A")
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
 04)------StreamingTableExec: partition_sizes=1, projection=[date, ticker, time], infinite_source=true, output_ordering=[date@0 ASC NULLS LAST, ticker@1 ASC NULLS LAST, time@2 ASC NULLS LAST]
 
@@ -54,7 +54,7 @@ logical_plan
 03)----TableScan: data projection=[date, ticker, time]
 physical_plan
 01)SortPreservingMergeExec: [time@2 ASC NULLS LAST]
-02)--FilterExec: ticker@1 = A AND CAST(time@2 AS Date32) = date@0
+02)--FilterExec: ticker@1 = Utf8View("A") AND CAST(time@2 AS Date32) = date@0
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
 04)------StreamingTableExec: partition_sizes=1, projection=[date, ticker, time], infinite_source=true, output_ordering=[date@0 ASC NULLS LAST, ticker@1 ASC NULLS LAST, time@2 ASC NULLS LAST]
 
@@ -70,7 +70,7 @@ logical_plan
 03)----TableScan: data projection=[date, ticker, time]
 physical_plan
 01)SortPreservingMergeExec: [date@0 ASC NULLS LAST]
-02)--FilterExec: ticker@1 = A AND CAST(time@2 AS Date32) = date@0
+02)--FilterExec: ticker@1 = Utf8View("A") AND CAST(time@2 AS Date32) = date@0
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
 04)------StreamingTableExec: partition_sizes=1, projection=[date, ticker, time], infinite_source=true, output_ordering=[date@0 ASC NULLS LAST, ticker@1 ASC NULLS LAST, time@2 ASC NULLS LAST]
 
@@ -86,7 +86,7 @@ logical_plan
 03)----TableScan: data projection=[date, ticker, time]
 physical_plan
 01)CoalescePartitionsExec
-02)--FilterExec: ticker@1 = A AND CAST(time@2 AS Date32) = date@0
+02)--FilterExec: ticker@1 = Utf8View("A") AND CAST(time@2 AS Date32) = date@0
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
 04)------StreamingTableExec: partition_sizes=1, projection=[date, ticker, time], infinite_source=true, output_ordering=[date@0 ASC NULLS LAST, ticker@1 ASC NULLS LAST, time@2 ASC NULLS LAST]
 
@@ -102,7 +102,7 @@ logical_plan
 03)----TableScan: data projection=[date, ticker, time]
 physical_plan
 01)SortPreservingMergeExec: [time@2 ASC NULLS LAST, date@0 ASC NULLS LAST]
-02)--FilterExec: ticker@1 = A AND CAST(time@2 AS Date32) = date@0
+02)--FilterExec: ticker@1 = Utf8View("A") AND CAST(time@2 AS Date32) = date@0
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
 04)------StreamingTableExec: partition_sizes=1, projection=[date, ticker, time], infinite_source=true, output_ordering=[date@0 ASC NULLS LAST, ticker@1 ASC NULLS LAST, time@2 ASC NULLS LAST]
 
@@ -142,7 +142,7 @@ logical_plan
 03)----TableScan: data projection=[date, ticker, time]
 physical_plan
 01)SortPreservingMergeExec: [ticker@1 ASC NULLS LAST, time@2 ASC NULLS LAST]
-02)--FilterExec: date@0 = 2006-01-02
+02)--FilterExec: date@0 = Date32("2006-01-02")
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
 04)------StreamingTableExec: partition_sizes=1, projection=[date, ticker, time], infinite_source=true, output_ordering=[date@0 ASC NULLS LAST, ticker@1 ASC NULLS LAST, time@2 ASC NULLS LAST]
 
@@ -186,6 +186,6 @@ logical_plan
 03)----TableScan: cast_ordered projection=[b], partial_filters=[cast_ordered.b > Int64(1)]
 physical_plan
 01)SortPreservingMergeExec: [b@0 ASC NULLS LAST]
-02)--FilterExec: b@0 > 1
+02)--FilterExec: b@0 > Int64(1)
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
-04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_without_sort_exec/cast_ordering.parquet]]}, projection=[b], output_ordering=[b@0 ASC NULLS LAST], file_type=parquet, predicate=b@0 > 1, pruning_predicate=b_null_count@1 != row_count@2 AND b_max@0 > 1, required_guarantees=[]
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_without_sort_exec/cast_ordering.parquet]]}, projection=[b], output_ordering=[b@0 ASC NULLS LAST], file_type=parquet, predicate=b@0 > Int64(1), pruning_predicate=b_null_count@1 != row_count@2 AND b_max@0 > Int64(1), required_guarantees=[]

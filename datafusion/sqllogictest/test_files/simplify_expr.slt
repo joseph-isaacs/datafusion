@@ -26,7 +26,7 @@ logical_plan
 01)Filter: t.a = Int32(3)
 02)--TableScan: t projection=[a]
 physical_plan
-01)FilterExec: a@0 = 3
+01)FilterExec: a@0 = Int32(3)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # test regex exprs
@@ -140,7 +140,7 @@ logical_plan
 01)Projection: Map([{"x":"100"}]) AS a
 02)--EmptyRelation: rows=1
 physical_plan
-01)ProjectionExec: expr=[[{x:100}] as a]
+01)ProjectionExec: expr=[Map([{"x":"100"}]) as a]
 02)--PlaceholderRowExec
 
 # Simplify expr = L1 AND expr != L2 to expr = L1 when L1 != L2
@@ -158,7 +158,7 @@ logical_plan
 03)----Projection: column1 AS v
 04)------Values: (Int64(0)), (Int64(1)), (Int64(2))
 physical_plan
-01)ProjectionExec: expr=[column1@0 = 1 as opt1, column1@0 = 2 AND column1@0 != 2 as noopt1, column1@0 = 4 as opt2, column1@0 != 5 AND column1@0 = 5 as noopt2]
+01)ProjectionExec: expr=[column1@0 = Int64(1) as opt1, column1@0 = Int64(2) AND column1@0 != Int64(2) as noopt1, column1@0 = Int64(4) as opt2, column1@0 != Int64(5) AND column1@0 = Int64(5) as noopt2]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Dedup commutative AND/OR operands in join conditions
@@ -200,7 +200,7 @@ logical_plan
 02)--TableScan: t1 projection=[a]
 03)--TableScan: t2 projection=[b]
 physical_plan
-01)NestedLoopJoinExec: join_type=Inner, filter=a@0 > b@1 AND a@0 + b@1 > 1
+01)NestedLoopJoinExec: join_type=Inner, filter=a@0 > b@1 AND a@0 + b@1 > Int32(1)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 03)--DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -229,7 +229,7 @@ logical_plan
 01)Filter: dates.d = Date32("2024-01-01")
 02)--TableScan: dates projection=[d]
 physical_plan
-01)FilterExec: d@0 = 2024-01-01
+01)FilterExec: d@0 = Date32("2024-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Identity Date cast inside an `IN` predicate. `IN` goes through a separate
@@ -242,7 +242,7 @@ logical_plan
 01)Filter: dates.d = Date32("2024-01-01")
 02)--TableScan: dates projection=[d]
 physical_plan
-01)FilterExec: d@0 = 2024-01-01
+01)FilterExec: d@0 = Date32("2024-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 statement ok
@@ -299,7 +299,7 @@ logical_plan
 02)--Filter: date_unwrap.d32 = Date32("2025-01-01")
 03)----TableScan: date_unwrap projection=[id, d32]
 physical_plan
-01)FilterExec: d32@1 = 2025-01-01, projection=[id@0]
+01)FilterExec: d32@1 = Date32("2025-01-01"), projection=[id@0]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I
@@ -317,7 +317,7 @@ logical_plan
 02)--Filter: date_unwrap.d32 < Date32("2025-01-01")
 03)----TableScan: date_unwrap projection=[id, d32]
 physical_plan
-01)FilterExec: d32@1 < 2025-01-01, projection=[id@0]
+01)FilterExec: d32@1 < Date32("2025-01-01"), projection=[id@0]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -328,7 +328,7 @@ logical_plan
 02)--Filter: date_unwrap.d32 >= Date32("2025-01-01")
 03)----TableScan: date_unwrap projection=[id, d32]
 physical_plan
-01)FilterExec: d32@1 >= 2025-01-01, projection=[id@0]
+01)FilterExec: d32@1 >= Date32("2025-01-01"), projection=[id@0]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I
@@ -366,7 +366,7 @@ logical_plan
 02)--Filter: date_unwrap.d32 > Date32("1969-12-31")
 03)----TableScan: date_unwrap projection=[id, d32]
 physical_plan
-01)FilterExec: d32@1 > 1969-12-31, projection=[id@0]
+01)FilterExec: d32@1 > Date32("1969-12-31"), projection=[id@0]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I
@@ -384,7 +384,7 @@ logical_plan
 02)--Filter: date_unwrap.d32 = Date32("2025-01-01") OR date_unwrap.d32 = Date32("1969-12-31")
 03)----TableScan: date_unwrap projection=[id, d32]
 physical_plan
-01)FilterExec: d32@1 = 2025-01-01 OR d32@1 = 1969-12-31, projection=[id@0]
+01)FilterExec: d32@1 = Date32("2025-01-01") OR d32@1 = Date32("1969-12-31"), projection=[id@0]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I
@@ -406,7 +406,7 @@ logical_plan
 02)--Filter: CAST(date_unwrap.d32 AS Date64) = Date64("2025-01-01")
 03)----TableScan: date_unwrap projection=[id, d32]
 physical_plan
-01)FilterExec: CAST(d32@1 AS Date64) = 2025-01-01, projection=[id@0]
+01)FilterExec: CAST(d32@1 AS Date64) = Date64("2025-01-01"), projection=[id@0]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I
@@ -435,7 +435,7 @@ logical_plan
 02)--Filter: CAST(date_unwrap.d64 AS Date32) = Date32("2025-01-01")
 03)----TableScan: date_unwrap projection=[id, d64]
 physical_plan
-01)FilterExec: CAST(d64@1 AS Date32) = 2025-01-01, projection=[id@0]
+01)FilterExec: CAST(d64@1 AS Date32) = Date32("2025-01-01"), projection=[id@0]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # id 2 is 2025-01-01 12:00 - it truncates to 2025-01-01 and MUST be returned.
@@ -453,7 +453,7 @@ logical_plan
 02)--Filter: CAST(date_unwrap.d64 AS Date32) < Date32("2025-01-01")
 03)----TableScan: date_unwrap projection=[id, d64]
 physical_plan
-01)FilterExec: CAST(d64@1 AS Date32) < 2025-01-01, projection=[id@0]
+01)FilterExec: CAST(d64@1 AS Date32) < Date32("2025-01-01"), projection=[id@0]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # IN-list narrowing is guarded as well.
@@ -465,7 +465,7 @@ logical_plan
 02)--Filter: CAST(date_unwrap.d64 AS Date32) = Date32("2025-01-01")
 03)----TableScan: date_unwrap projection=[id, d64]
 physical_plan
-01)FilterExec: CAST(d64@1 AS Date32) = 2025-01-01, projection=[id@0]
+01)FilterExec: CAST(d64@1 AS Date32) = Date32("2025-01-01"), projection=[id@0]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I

@@ -832,7 +832,7 @@ logical_plan
 03)----TableScan: csv_with_timestamps projection=[ts]
 physical_plan
 01)SortPreservingMergeExec: [db15@0 ASC NULLS LAST]
-02)--ProjectionExec: expr=[date_bin(IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 900000000000 }, ts@0, 1659537600000000000) as db15]
+02)--ProjectionExec: expr=[date_bin(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 900000000000 }"), ts@0, TimestampNanosecond(1659537600000000000, None)) as db15]
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
 04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/timestamps.csv]]}, projection=[ts], output_ordering=[ts@0 ASC NULLS LAST], file_type=csv, has_header=false
 
@@ -847,7 +847,7 @@ logical_plan
 03)----TableScan: csv_with_timestamps projection=[ts]
 physical_plan
 01)SortPreservingMergeExec: [dt_day@0 ASC NULLS LAST]
-02)--ProjectionExec: expr=[date_trunc(DAY, ts@0) as dt_day]
+02)--ProjectionExec: expr=[date_trunc(Utf8("DAY"), ts@0) as dt_day]
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
 04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/timestamps.csv]]}, projection=[ts], output_ordering=[ts@0 ASC NULLS LAST], file_type=csv, has_header=false
 
@@ -1132,13 +1132,13 @@ physical_plan
 01)SortPreservingMergeExec: [m@0 ASC NULLS LAST, t@1 ASC NULLS LAST]
 02)--SortExec: expr=[m@0 ASC NULLS LAST, t@1 ASC NULLS LAST], preserve_partitioning=[true]
 03)----InterleaveExec
-04)------ProjectionExec: expr=[0 as m, t@0 as t]
+04)------ProjectionExec: expr=[Int64(0) as m, t@0 as t]
 05)--------AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[]
 06)----------RepartitionExec: partitioning=Hash([t@0], 2), input_partitions=1
 07)------------AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[]
 08)--------------ProjectionExec: expr=[column1@0 as t]
 09)----------------DataSourceExec: partitions=1, partition_sizes=[1]
-10)------ProjectionExec: expr=[1 as m, t@0 as t]
+10)------ProjectionExec: expr=[Int64(1) as m, t@0 as t]
 11)--------AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[]
 12)----------RepartitionExec: partitioning=Hash([t@0], 2), input_partitions=1
 13)------------AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[]
@@ -1747,8 +1747,8 @@ physical_plan
 01)SortPreservingMergeExec: [d@4 ASC NULLS LAST, c@1 ASC NULLS LAST, a@2 ASC NULLS LAST, a0@3 ASC NULLS LAST, b@0 ASC NULLS LAST], fetch=2
 02)--SortExec: TopK(fetch=2), expr=[d@4 ASC NULLS LAST, c@1 ASC NULLS LAST, a@2 ASC NULLS LAST, a0@3 ASC NULLS LAST, b@0 ASC NULLS LAST], preserve_partitioning=[true]
 03)----UnionExec
-04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[b, c, a, NULL as a0, d], output_ordering=[c@1 ASC NULLS LAST], file_type=csv, has_header=true
-05)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[b, c, NULL as a, a0, d], output_ordering=[c@1 ASC NULLS LAST], file_type=csv, has_header=true
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[b, c, a, Int32(NULL) as a0, d], output_ordering=[c@1 ASC NULLS LAST], file_type=csv, has_header=true
+05)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[b, c, Int32(NULL) as a, a0, d], output_ordering=[c@1 ASC NULLS LAST], file_type=csv, has_header=true
 
 # Test: run the query from above
 query IIIII
@@ -1788,11 +1788,11 @@ logical_plan
 07)--------EmptyRelation: rows=1
 physical_plan
 01)SortPreservingMergeExec: [a@0 DESC]
-02)--ProjectionExec: expr=[CASE WHEN name@0 = name1 THEN 0 WHEN name@0 = name2 THEN 0.5 END as a]
+02)--ProjectionExec: expr=[CASE WHEN name@0 = Utf8("name1") THEN Float64(0) WHEN name@0 = Utf8("name2") THEN Float64(0.5) END as a]
 03)----UnionExec
-04)------ProjectionExec: expr=[name1 as name]
+04)------ProjectionExec: expr=[Utf8("name1") as name]
 05)--------PlaceholderRowExec
-06)------ProjectionExec: expr=[name2 as name]
+06)------ProjectionExec: expr=[Utf8("name2") as name]
 07)--------PlaceholderRowExec
 
 query R
@@ -1953,7 +1953,7 @@ physical_plan
 query TT
 EXPLAIN SELECT named_struct('sum', a + b) AS s FROM ordered ORDER BY s['sum'];
 ----
-physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[named_struct(sum, a@0 + b@1) as s], file_type=csv, has_header=true
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[named_struct(Utf8("sum"), a@0 + b@1) as s], file_type=csv, has_header=true
 
 # Wrapping a non-ordered column into a struct — SortExec required.
 # Reuses the `ordered` table above which has WITH ORDER (a + b).
@@ -1963,8 +1963,8 @@ query TT
 EXPLAIN SELECT named_struct('a', a, 'b', b) AS s FROM ordered ORDER BY s['a'];
 ----
 physical_plan
-01)SortExec: expr=[get_field(s@0, a) ASC NULLS LAST], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[named_struct(a, a@0, b, b@1) as s], file_type=csv, has_header=true
+01)SortExec: expr=[get_field(s@0, Utf8("a")) ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[named_struct(Utf8("a"), a@0, Utf8("b"), b@1) as s], file_type=csv, has_header=true
 
 # Simple column ordering tests using a table ordered by (a)
 statement ok
@@ -1981,21 +1981,21 @@ WITH ORDER (a);
 query TT
 EXPLAIN SELECT named_struct('a', a, 'b', b) AS s FROM ordered_by_a ORDER BY s['a'];
 ----
-physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[named_struct(a, a@0, b, b@1) as s], file_type=csv, has_header=true
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[named_struct(Utf8("a"), a@0, Utf8("b"), b@1) as s], file_type=csv, has_header=true
 
 # Struct field not matching source ordering -- SortExec required
 query TT
 EXPLAIN SELECT named_struct('a', a, 'b', b) AS s FROM ordered_by_a ORDER BY s['b'];
 ----
 physical_plan
-01)SortExec: expr=[get_field(s@0, b) ASC NULLS LAST], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[named_struct(a, a@0, b, b@1) as s], file_type=csv, has_header=true
+01)SortExec: expr=[get_field(s@0, Utf8("b")) ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[named_struct(Utf8("a"), a@0, Utf8("b"), b@1) as s], file_type=csv, has_header=true
 
 # Mixed projection: top-level column alongside struct, order by struct field
 query TT
 EXPLAIN SELECT a, named_struct('a', a, 'b', b) AS s FROM ordered_by_a ORDER BY s['a'];
 ----
-physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[a, named_struct(a, a@0, b, b@1) as s], output_ordering=[a@0 ASC NULLS LAST], file_type=csv, has_header=true
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/data/composite_order.csv]]}, projection=[a, named_struct(Utf8("a"), a@0, Utf8("b"), b@1) as s], output_ordering=[a@0 ASC NULLS LAST], file_type=csv, has_header=true
 
 query I
 COPY (
@@ -2082,10 +2082,10 @@ physical_plan
 02)--SortPreservingMergeExec: [a@0 ASC NULLS LAST, b@1 ASC NULLS LAST]
 03)----UnionExec
 04)------SortExec: expr=[b@1 ASC NULLS LAST], preserve_partitioning=[false]
-05)--------ProjectionExec: expr=[2 as a, b@0 as b]
+05)--------ProjectionExec: expr=[Int64(2) as a, b@0 as b]
 06)----------DataSourceExec: partitions=1, partition_sizes=[1]
 07)------SortExec: expr=[b@1 ASC NULLS LAST], preserve_partitioning=[false]
-08)--------ProjectionExec: expr=[1 as a, b@0 as b]
+08)--------ProjectionExec: expr=[Int64(1) as a, b@0 as b]
 09)----------DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Actually execute the COPY and verify the rows written to the file are in

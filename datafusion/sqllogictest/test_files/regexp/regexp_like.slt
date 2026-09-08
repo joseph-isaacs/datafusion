@@ -261,7 +261,7 @@ logical_plan
 01)Filter: dict_table.column1 LIKE Utf8("%oo%")
 02)--TableScan: dict_table projection=[column1]
 physical_plan
-01)FilterExec: column1@0 LIKE %oo%
+01)FilterExec: column1@0 LIKE Utf8("%oo%")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Ensure casting / coercion works for all operators
@@ -278,7 +278,7 @@ logical_plan
 01)Projection: dict_table.column1 LIKE Utf8("%oo%"), dict_table.column1 NOT LIKE Utf8("%oo%"), dict_table.column1 ILIKE Utf8("%oo%"), dict_table.column1 NOT ILIKE Utf8("%oo%")
 02)--TableScan: dict_table projection=[column1]
 physical_plan
-01)ProjectionExec: expr=[column1@0 LIKE %oo% as dict_table.column1 LIKE Utf8("%oo%"), column1@0 NOT LIKE %oo% as dict_table.column1 NOT LIKE Utf8("%oo%"), column1@0 ILIKE %oo% as dict_table.column1 ILIKE Utf8("%oo%"), column1@0 NOT ILIKE %oo% as dict_table.column1 NOT ILIKE Utf8("%oo%")]
+01)ProjectionExec: expr=[column1@0 LIKE Utf8("%oo%") as dict_table.column1 LIKE Utf8("%oo%"), column1@0 NOT LIKE Utf8("%oo%") as dict_table.column1 NOT LIKE Utf8("%oo%"), column1@0 ILIKE Utf8("%oo%") as dict_table.column1 ILIKE Utf8("%oo%"), column1@0 NOT ILIKE Utf8("%oo%") as dict_table.column1 NOT ILIKE Utf8("%oo%")]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 statement ok
@@ -323,7 +323,7 @@ logical_plan
 01)Projection: regexp_test.column1 ~ Utf8("fo.*") AS regexp_like(regexp_test.column1,Utf8("fo.*")), regexp_test.column1 ~* Utf8("fo.*") AS regexp_like(regexp_test.column1,Utf8("fo.*"),Utf8("i"))
 02)--TableScan: regexp_test projection=[column1]
 physical_plan
-01)ProjectionExec: expr=[column1@0 ~ fo.* as regexp_like(regexp_test.column1,Utf8("fo.*")), column1@0 ~* fo.* as regexp_like(regexp_test.column1,Utf8("fo.*"),Utf8("i"))]
+01)ProjectionExec: expr=[column1@0 ~ Utf8("fo.*") as regexp_like(regexp_test.column1,Utf8("fo.*")), column1@0 ~* Utf8("fo.*") as regexp_like(regexp_test.column1,Utf8("fo.*"),Utf8("i"))]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query BB
@@ -348,7 +348,7 @@ logical_plan
 01)Projection: regexp_like(regexp_test.column1, Utf8("f.*r"), Utf8("mi")), regexp_like(regexp_test.column1, Utf8("f.*r"), regexp_test.column2)
 02)--TableScan: regexp_test projection=[column1, column2]
 physical_plan
-01)ProjectionExec: expr=[regexp_like(column1@0, f.*r, mi) as regexp_like(regexp_test.column1,Utf8("f.*r"),Utf8("mi")), regexp_like(column1@0, f.*r, column2@1) as regexp_like(regexp_test.column1,Utf8("f.*r"),regexp_test.column2)]
+01)ProjectionExec: expr=[regexp_like(column1@0, Utf8("f.*r"), Utf8("mi")) as regexp_like(regexp_test.column1,Utf8("f.*r"),Utf8("mi")), regexp_like(column1@0, Utf8("f.*r"), column2@1) as regexp_like(regexp_test.column1,Utf8("f.*r"),regexp_test.column2)]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query BB

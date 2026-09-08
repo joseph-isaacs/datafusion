@@ -91,15 +91,15 @@ fn test_pushdown_into_scan() {
     // expect the predicate to be pushed down into the DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          - DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -153,16 +153,16 @@ fn test_pushdown_into_scan_with_config_options() {
             FilterPushdown::new(),
             false
         ),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - FilterExec: a@0 = foo
+          - FilterExec: a@0 = Utf8("foo")
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    "
+    "#
     );
 
     cfg.execution.parquet.pushdown_filters = true;
@@ -172,15 +172,15 @@ fn test_pushdown_into_scan_with_config_options() {
             FilterPushdown::new(),
             true
         ),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          - DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -273,12 +273,12 @@ async fn test_static_filter_pushdown_through_hash_join() {
     // Test that filters are pushed down correctly to each side of the join
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
         - FilterExec: a@0 = d@3
-        -   FilterExec: e@4 = ba
-        -     FilterExec: a@0 = aa
+        -   FilterExec: e@4 = Utf8("ba")
+        -     FilterExec: a@0 = Utf8("aa")
         -       HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)]
         -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
         -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true
@@ -286,9 +286,9 @@ async fn test_static_filter_pushdown_through_hash_join() {
         Ok:
           - FilterExec: a@0 = d@3
           -   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)]
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = aa
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=e@1 = ba
-    "
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("aa")
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=e@1 = Utf8("ba")
+    "#
     );
 
     // Test left join: filter on preserved (build) side is pushed down,
@@ -327,21 +327,21 @@ async fn test_static_filter_pushdown_through_hash_join() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: e@4 = ba
-        -   FilterExec: a@0 = aa
+        - FilterExec: e@4 = Utf8("ba")
+        -   FilterExec: a@0 = Utf8("aa")
         -     HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, d@0)]
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - FilterExec: e@4 = ba
+          - FilterExec: e@4 = Utf8("ba")
           -   HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, d@0)]
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = aa
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("aa")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true
-    "
+    "#
     );
 }
 
@@ -356,16 +356,16 @@ fn test_filter_collapse() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar
-        -   FilterExec: a@0 = foo
+        - FilterExec: b@1 = Utf8("bar")
+        -   FilterExec: a@0 = Utf8("foo")
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo AND b@1 = bar
-    "
+          - DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo") AND b@1 = Utf8("bar")
+    "#
     );
 }
 
@@ -385,16 +385,16 @@ fn test_filter_with_projection() {
     // expect the predicate to be pushed down into the DataSource but the FilterExec to be converted to ProjectionExec
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo, projection=[b@1, a@0]
+        - FilterExec: a@0 = Utf8("foo"), projection=[b@1, a@0]
         -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
           - ProjectionExec: expr=[b@1 as b, a@0 as a]
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    ",
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#,
     );
 
     // add a test where the filter is on a column that isn't included in the output
@@ -409,16 +409,16 @@ fn test_filter_with_projection() {
     );
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(),true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo, projection=[b@1]
+        - FilterExec: a@0 = Utf8("foo"), projection=[b@1]
         -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
           - ProjectionExec: expr=[b@1 as b]
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -438,17 +438,17 @@ fn test_filter_collapse_outer_fetch_preserved() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar, fetch=10
-        -   FilterExec: a@0 = foo
+        - FilterExec: b@1 = Utf8("bar"), fetch=10
+        -   FilterExec: a@0 = Utf8("foo")
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
-          - FilterExec: b@1 = bar AND a@0 = foo, fetch=10
+          - FilterExec: b@1 = Utf8("bar") AND a@0 = Utf8("foo"), fetch=10
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -468,17 +468,17 @@ fn test_filter_collapse_inner_fetch_preserved() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar
-        -   FilterExec: a@0 = foo, fetch=5
+        - FilterExec: b@1 = Utf8("bar")
+        -   FilterExec: a@0 = Utf8("foo"), fetch=5
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
-          - FilterExec: b@1 = bar AND a@0 = foo, fetch=5
+          - FilterExec: b@1 = Utf8("bar") AND a@0 = Utf8("foo"), fetch=5
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -504,17 +504,17 @@ fn test_filter_collapse_both_fetch_uses_minimum() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar, fetch=10
-        -   FilterExec: a@0 = foo, fetch=5
+        - FilterExec: b@1 = Utf8("bar"), fetch=10
+        -   FilterExec: a@0 = Utf8("foo"), fetch=5
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
-          - FilterExec: b@1 = bar AND a@0 = foo, fetch=5
+          - FilterExec: b@1 = Utf8("bar") AND a@0 = Utf8("foo"), fetch=5
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -534,15 +534,15 @@ fn test_filter_with_fetch_fully_pushed_to_scan() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo, fetch=10
+        - FilterExec: a@0 = Utf8("foo"), fetch=10
         -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], limit=10, file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          - DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], limit=10, file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -565,16 +565,16 @@ fn test_filter_with_fetch_and_projection_fully_pushed_to_scan() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo, projection=[b@1, a@0], fetch=5
+        - FilterExec: a@0 = Utf8("foo"), projection=[b@1, a@0], fetch=5
         -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
           - ProjectionExec: expr=[b@1 as b, a@0 as a]
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], limit=5, file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], limit=5, file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -615,16 +615,16 @@ fn test_filter_with_fetch_partially_pushed_to_scan() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo AND a@0 = random(), fetch=7
+        - FilterExec: a@0 = Utf8("foo") AND a@0 = random(), fetch=7
         -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
           - FilterExec: a@0 = random(), fetch=7
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -643,16 +643,16 @@ fn test_filter_with_fetch_not_pushed_to_unsupportive_scan() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo, fetch=3
+        - FilterExec: a@0 = Utf8("foo"), fetch=3
         -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
-          - FilterExec: a@0 = foo, fetch=3
+          - FilterExec: a@0 = Utf8("foo"), fetch=3
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -671,18 +671,18 @@ fn test_push_down_through_transparent_nodes() {
     // expect the predicate to be pushed down into the DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(),true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar
+        - FilterExec: b@1 = Utf8("bar")
         -   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=1
-        -     FilterExec: a@0 = foo
+        -     FilterExec: a@0 = Utf8("foo")
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
           - RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=1
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo AND b@1 = bar
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo") AND b@1 = Utf8("bar")
+    "#
     );
 }
 
@@ -736,18 +736,18 @@ fn test_pushdown_through_aggregates_on_grouping_columns() {
     // Both filters should be pushed down to the DataSource since both reference grouping columns
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar
+        - FilterExec: b@1 = Utf8("bar")
         -   AggregateExec: mode=Final, gby=[a@0 as a, b@1 as b], aggr=[cnt], ordering_mode=PartiallySorted([0])
-        -     FilterExec: a@0 = foo
+        -     FilterExec: a@0 = Utf8("foo")
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
           - AggregateExec: mode=Final, gby=[a@0 as a, b@1 as b], aggr=[cnt], ordering_mode=Sorted
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo AND b@1 = bar
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo") AND b@1 = Utf8("bar")
+    "#
     );
 }
 
@@ -795,18 +795,18 @@ fn test_pushdown_through_aggregates_preserves_parent_filter_order() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: cnt@2 = 1 AND b@1 = bar
+        - FilterExec: cnt@2 = Int64(1) AND b@1 = Utf8("bar")
         -   AggregateExec: mode=Final, gby=[a@0 as a, b@1 as b], aggr=[cnt]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - FilterExec: cnt@2 = 1
+          - FilterExec: cnt@2 = Int64(1)
           -   AggregateExec: mode=Final, gby=[a@0 as a, b@1 as b], aggr=[cnt], ordering_mode=PartiallySorted([1])
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = bar
-    "
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = Utf8("bar")
+    "#
     );
 }
 
@@ -821,7 +821,7 @@ fn test_node_handles_child_pushdown_result() {
     let plan = Arc::new(TestNode::new(true, Arc::clone(&scan), predicate));
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
         - TestInsertExec { inject_filter: true }
@@ -829,8 +829,8 @@ fn test_node_handles_child_pushdown_result() {
       output:
         Ok:
           - TestInsertExec { inject_filter: true }
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    ",
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#,
     );
 
     // If we set `with_support(false)` + `inject_filter = true` then the filter is not pushed down to the DataSource
@@ -840,7 +840,7 @@ fn test_node_handles_child_pushdown_result() {
     let plan = Arc::new(TestNode::new(true, Arc::clone(&scan), predicate));
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
         - TestInsertExec { inject_filter: true }
@@ -848,9 +848,9 @@ fn test_node_handles_child_pushdown_result() {
       output:
         Ok:
           - TestInsertExec { inject_filter: false }
-          -   FilterExec: a@0 = foo
+          -   FilterExec: a@0 = Utf8("foo")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    ",
+    "#,
     );
 
     // If we set `with_support(false)` + `inject_filter = false` then the filter is not pushed down to the DataSource
@@ -1158,15 +1158,15 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     #[cfg(not(feature = "force_hash_collisions"))]
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @r#"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
     -     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
     -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ CASE hash_repartition % 12 WHEN 5 THEN a@0 >= ab AND a@0 <= ab AND b@1 >= bb AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:ab,c1:bb}]) WHEN 8 THEN a@0 >= aa AND a@0 <= aa AND b@1 >= ba AND b@1 <= ba AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}]) ELSE false END ]
-    "
+    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ CASE hash_repartition % UInt64(12) WHEN UInt64(5) THEN a@0 >= Utf8("ab") AND a@0 <= Utf8("ab") AND b@1 >= Utf8("bb") AND b@1 <= Utf8("bb") AND struct(a@0, b@1) IN (SET) ([Struct({c0:ab,c1:bb})]) WHEN UInt64(8) THEN a@0 >= Utf8("aa") AND a@0 <= Utf8("aa") AND b@1 >= Utf8("ba") AND b@1 <= Utf8("ba") AND struct(a@0, b@1) IN (SET) ([Struct({c0:aa,c1:ba})]) ELSE Boolean(false) END ]
+    "#
     );
 
     // When hash collisions force all data into a single partition, we optimize away the CASE expression.
@@ -1374,15 +1374,15 @@ async fn test_hashjoin_dynamic_filter_pushdown_range_partitioned() {
     // Now check what our filter looks like
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @r#"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
     -     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -       RepartitionExec: partitioning=Range([a@0 ASC, b@1 ASC], [(aa, bb)], 2), input_partitions=1
     -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
     -       RepartitionExec: partitioning=Range([a@0 ASC, b@1 ASC], [(aa, bb)], 2), input_partitions=1
-    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ CASE range_partition WHEN 0 THEN a@0 >= aa AND a@0 <= aa AND b@1 >= ba AND b@1 <= ba AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}]) WHEN 1 THEN a@0 >= ab AND a@0 <= ab AND b@1 >= bb AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:ab,c1:bb}]) ELSE false END ]
-    "
+    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ CASE range_partition WHEN UInt64(0) THEN a@0 >= Utf8("aa") AND a@0 <= Utf8("aa") AND b@1 >= Utf8("ba") AND b@1 <= Utf8("ba") AND struct(a@0, b@1) IN (SET) ([Struct({c0:aa,c1:ba})]) WHEN UInt64(1) THEN a@0 >= Utf8("ab") AND a@0 <= Utf8("ab") AND b@1 >= Utf8("bb") AND b@1 <= Utf8("bb") AND struct(a@0, b@1) IN (SET) ([Struct({c0:ab,c1:bb})]) ELSE Boolean(false) END ]
+    "#
     );
 
     let result = format!("{}", pretty_format_batches(&batches).unwrap());
@@ -1503,14 +1503,14 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
     // Now check what our filter looks like
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @r#"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
     -     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ]
-    "
+    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= Utf8("aa") AND a@0 <= Utf8("ab") AND b@1 >= Utf8("ba") AND b@1 <= Utf8("bb") AND struct(a@0, b@1) IN (SET) ([Struct({c0:aa,c1:ba}), Struct({c0:ab,c1:bb})]) ]
+    "#
     );
 
     let result = format!("{}", pretty_format_batches(&batches).unwrap());
@@ -1584,20 +1584,20 @@ fn test_hashjoin_parent_filter_pushdown_same_column_names() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: probe_val@3 = x
-        -   FilterExec: id@0 = aa
+        - FilterExec: probe_val@3 = Utf8("x")
+        -   FilterExec: id@0 = Utf8("aa")
         -     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(id@0, id@0)]
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id, build_val], file_type=test, pushdown_supported=true
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id, probe_val], file_type=test, pushdown_supported=true
       output:
         Ok:
           - HashJoinExec: mode=Partitioned, join_type=Inner, on=[(id@0, id@0)]
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id, build_val], file_type=test, pushdown_supported=true, predicate=id@0 = aa
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id, probe_val], file_type=test, pushdown_supported=true, predicate=probe_val@1 = x
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id, build_val], file_type=test, pushdown_supported=true, predicate=id@0 = Utf8("aa")
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id, probe_val], file_type=test, pushdown_supported=true, predicate=probe_val@1 = Utf8("x")
+    "#
     );
 }
 
@@ -1648,21 +1648,21 @@ fn test_hashjoin_parent_filter_pushdown_mark_join() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: mark@2 = true
-        -   FilterExec: val@1 = x
+        - FilterExec: mark@2 = Boolean(true)
+        -   FilterExec: val@1 = Utf8("x")
         -     HashJoinExec: mode=Partitioned, join_type=LeftMark, on=[(id@0, id@0)]
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id, val], file_type=test, pushdown_supported=true
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - FilterExec: mark@2 = true
+          - FilterExec: mark@2 = Boolean(true)
           -   HashJoinExec: mode=Partitioned, join_type=LeftMark, on=[(id@0, id@0)]
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id, val], file_type=test, pushdown_supported=true, predicate=val@1 = x
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id, val], file_type=test, pushdown_supported=true, predicate=val@1 = Utf8("x")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[id], file_type=test, pushdown_supported=true
-    "
+    "#
     );
 }
 
@@ -1719,20 +1719,20 @@ fn test_hashjoin_parent_filter_pushdown_semi_anti_join() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: v@1 = y
-        -   FilterExec: k@0 = x
+        - FilterExec: v@1 = Utf8("y")
+        -   FilterExec: k@0 = Utf8("x")
         -     HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(k@0, k@0)]
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[k, v], file_type=test, pushdown_supported=true
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[k, w], file_type=test, pushdown_supported=true
       output:
         Ok:
           - HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(k@0, k@0)]
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[k, v], file_type=test, pushdown_supported=true, predicate=k@0 = x AND v@1 = y
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[k, w], file_type=test, pushdown_supported=true, predicate=k@0 = x
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[k, v], file_type=test, pushdown_supported=true, predicate=k@0 = Utf8("x") AND v@1 = Utf8("y")
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[k, w], file_type=test, pushdown_supported=true, predicate=k@0 = Utf8("x")
+    "#
     );
 
     let join = Arc::new(
@@ -1766,19 +1766,19 @@ fn test_filter_pushdown_through_union() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   UnionExec
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
           - UnionExec
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -1795,20 +1795,20 @@ fn test_filter_pushdown_through_union_mixed_support() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   UnionExec
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
           - UnionExec
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-          -   FilterExec: a@0 = foo
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+          -   FilterExec: a@0 = Utf8("foo")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -1825,21 +1825,21 @@ fn test_filter_pushdown_through_union_does_not_support() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   UnionExec
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
           - UnionExec
-          -   FilterExec: a@0 = foo
+          -   FilterExec: a@0 = Utf8("foo")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-          -   FilterExec: a@0 = foo
+          -   FilterExec: a@0 = Utf8("foo")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -1861,10 +1861,10 @@ fn test_filter_with_fetch_fully_pushed_through_union() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo, fetch=10
+        - FilterExec: a@0 = Utf8("foo"), fetch=10
         -   UnionExec
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
@@ -1872,9 +1872,9 @@ fn test_filter_with_fetch_fully_pushed_through_union() {
         Ok:
           - LocalLimitExec: fetch=10
           -   UnionExec
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -1899,10 +1899,10 @@ fn test_filter_with_fetch_and_projection_fully_pushed_through_union() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo, projection=[b@1, a@0], fetch=5
+        - FilterExec: a@0 = Utf8("foo"), projection=[b@1, a@0], fetch=5
         -   UnionExec
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
@@ -1911,9 +1911,9 @@ fn test_filter_with_fetch_and_projection_fully_pushed_through_union() {
           - ProjectionExec: expr=[b@1 as b, a@0 as a]
           -   LocalLimitExec: fetch=5
           -     UnionExec
-          -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-          -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+          -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -1934,10 +1934,10 @@ fn test_filter_with_fetch_not_fully_pushed_through_union() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo, fetch=8
+        - FilterExec: a@0 = Utf8("foo"), fetch=8
         -   UnionExec
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
@@ -1945,11 +1945,11 @@ fn test_filter_with_fetch_not_fully_pushed_through_union() {
         Ok:
           - LocalLimitExec: fetch=8
           -   UnionExec
-          -     FilterExec: a@0 = foo
+          -     FilterExec: a@0 = Utf8("foo")
           -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-          -     FilterExec: a@0 = foo
+          -     FilterExec: a@0 = Utf8("foo")
           -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -2091,17 +2091,17 @@ fn test_pushdown_filter_on_non_first_grouping_column() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar
+        - FilterExec: b@1 = Utf8("bar")
         -   AggregateExec: mode=Final, gby=[a@0 as a, b@1 as b], aggr=[cnt]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
           - AggregateExec: mode=Final, gby=[a@0 as a, b@1 as b], aggr=[cnt], ordering_mode=PartiallySorted([1])
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = bar
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = Utf8("bar")
+    "#
     );
 }
 
@@ -2160,18 +2160,18 @@ fn test_no_pushdown_grouping_sets_filter_on_missing_column() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
-        -   AggregateExec: mode=Final, gby=[(a@0 as a, b@1 as b), (NULL as a, b@1 as b)], aggr=[cnt]
+        - FilterExec: a@0 = Utf8("foo")
+        -   AggregateExec: mode=Final, gby=[(a@0 as a, b@1 as b), (Utf8(NULL) as a, b@1 as b)], aggr=[cnt]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - FilterExec: a@0 = foo
-          -   AggregateExec: mode=Final, gby=[(a@0 as a, b@1 as b), (NULL as a, b@1 as b)], aggr=[cnt]
+          - FilterExec: a@0 = Utf8("foo")
+          -   AggregateExec: mode=Final, gby=[(a@0 as a, b@1 as b), (Utf8(NULL) as a, b@1 as b)], aggr=[cnt]
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    "
+    "#
     );
 }
 
@@ -2230,17 +2230,17 @@ fn test_pushdown_grouping_sets_filter_on_common_column() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar
-        -   AggregateExec: mode=Final, gby=[(a@0 as a, b@1 as b), (NULL as a, b@1 as b)], aggr=[cnt]
+        - FilterExec: b@1 = Utf8("bar")
+        -   AggregateExec: mode=Final, gby=[(a@0 as a, b@1 as b), (Utf8(NULL) as a, b@1 as b)], aggr=[cnt]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - AggregateExec: mode=Final, gby=[(a@0 as a, b@1 as b), (NULL as a, b@1 as b)], aggr=[cnt]
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = bar
-    "
+          - AggregateExec: mode=Final, gby=[(a@0 as a, b@1 as b), (Utf8(NULL) as a, b@1 as b)], aggr=[cnt]
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = Utf8("bar")
+    "#
     );
 }
 
@@ -2426,10 +2426,10 @@ fn test_pushdown_through_aggregate_with_reordered_input_columns() {
     // The filter should be pushed down
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar
+        - FilterExec: b@1 = Utf8("bar")
         -   AggregateExec: mode=Final, gby=[a@1 as a, b@2 as b], aggr=[cnt]
         -     ProjectionExec: expr=[c@2 as c, a@0 as a, b@1 as b]
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
@@ -2437,8 +2437,8 @@ fn test_pushdown_through_aggregate_with_reordered_input_columns() {
         Ok:
           - AggregateExec: mode=Final, gby=[a@1 as a, b@2 as b], aggr=[cnt], ordering_mode=PartiallySorted([1])
           -   ProjectionExec: expr=[c@2 as c, a@0 as a, b@1 as b]
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = bar
-    "
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = Utf8("bar")
+    "#
     );
 }
 
@@ -2515,19 +2515,19 @@ fn test_pushdown_through_aggregate_grouping_sets_with_reordered_input() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar
-        -   AggregateExec: mode=Final, gby=[(a@1 as a, b@2 as b), (NULL as a, b@2 as b)], aggr=[cnt]
+        - FilterExec: b@1 = Utf8("bar")
+        -   AggregateExec: mode=Final, gby=[(a@1 as a, b@2 as b), (Utf8(NULL) as a, b@2 as b)], aggr=[cnt]
         -     ProjectionExec: expr=[c@2 as c, a@0 as a, b@1 as b]
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - AggregateExec: mode=Final, gby=[(a@1 as a, b@2 as b), (NULL as a, b@2 as b)], aggr=[cnt]
+          - AggregateExec: mode=Final, gby=[(a@1 as a, b@2 as b), (Utf8(NULL) as a, b@2 as b)], aggr=[cnt]
           -   ProjectionExec: expr=[c@2 as c, a@0 as a, b@1 as b]
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = bar
-    "
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=b@1 = Utf8("bar")
+    "#
     );
 
     // Filter on a (missing from second grouping set) should not be pushed down
@@ -2536,20 +2536,20 @@ fn test_pushdown_through_aggregate_grouping_sets_with_reordered_input() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
-        -   AggregateExec: mode=Final, gby=[(a@1 as a, b@2 as b), (NULL as a, b@2 as b)], aggr=[cnt]
+        - FilterExec: a@0 = Utf8("foo")
+        -   AggregateExec: mode=Final, gby=[(a@1 as a, b@2 as b), (Utf8(NULL) as a, b@2 as b)], aggr=[cnt]
         -     ProjectionExec: expr=[c@2 as c, a@0 as a, b@1 as b]
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - FilterExec: a@0 = foo
-          -   AggregateExec: mode=Final, gby=[(a@1 as a, b@2 as b), (NULL as a, b@2 as b)], aggr=[cnt]
+          - FilterExec: a@0 = Utf8("foo")
+          -   AggregateExec: mode=Final, gby=[(a@1 as a, b@2 as b), (Utf8(NULL) as a, b@2 as b)], aggr=[cnt]
           -     ProjectionExec: expr=[c@2 as c, a@0 as a, b@1 as b]
           -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    "
+    "#
     );
 }
 
@@ -2604,16 +2604,16 @@ fn test_pushdown_with_computed_grouping_key() {
     // The filter should be pushed down because 'c' is extracted from the grouping expression (c + 1.0)
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
-        - AggregateExec: mode=Final, gby=[c@2 + 1 as c_plus_1], aggr=[cnt]
-        -   FilterExec: c@2 > 5
+        - AggregateExec: mode=Final, gby=[c@2 + Float64(1) as c_plus_1], aggr=[cnt]
+        -   FilterExec: c@2 > Float64(5)
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - AggregateExec: mode=Final, gby=[c@2 + 1 as c_plus_1], aggr=[cnt]
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=c@2 > 5
+          - AggregateExec: mode=Final, gby=[c@2 + Float64(1) as c_plus_1], aggr=[cnt]
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=c@2 > Float64(5)
     "
     );
 }
@@ -2742,12 +2742,12 @@ async fn test_hashjoin_dynamic_filter_all_partitions_empty() {
     // Test that filters are pushed down correctly to each side of the join
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
     -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ false ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ Boolean(false) ]
     "
     );
 }
@@ -3145,7 +3145,7 @@ async fn test_hashjoin_dynamic_filter_survives_probe_subtree_replacement() {
         .expect("dynamic filter should be retained");
     insta::assert_snapshot!(
         format!("{dynamic_filter}"),
-        @"DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ]",
+        @r#"DynamicFilter [ a@0 >= Utf8("aa") AND a@0 <= Utf8("ab") AND b@1 >= Utf8("ba") AND b@1 <= Utf8("bb") AND struct(a@0, b@1) IN (SET) ([Struct({c0:aa,c1:ba}), Struct({c0:ab,c1:bb})]) ]"#,
     );
 }
 
@@ -3507,17 +3507,17 @@ fn test_filter_pushdown_through_sort_into_scan() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
           - SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = foo
-    "
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = Utf8("foo")
+    "#
     );
 }
 
@@ -3539,18 +3539,18 @@ fn test_filter_pushdown_through_sort_no_scan_support() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
           - SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
-          -   FilterExec: a@0 = foo
+          -   FilterExec: a@0 = Utf8("foo")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -3576,18 +3576,18 @@ fn test_multiple_filters_pushdown_through_sort() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo AND b@1 = bar
+        - FilterExec: a@0 = Utf8("foo") AND b@1 = Utf8("bar")
         -   SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
           - SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
-          -   FilterExec: a@0 = foo AND b@1 = bar
+          -   FilterExec: a@0 = Utf8("foo") AND b@1 = Utf8("bar")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -3612,18 +3612,18 @@ fn test_filter_not_pushed_through_sort_with_fetch() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[false]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
-          - FilterExec: a@0 = foo
+          - FilterExec: a@0 = Utf8("foo")
           -   SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[false]
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -3648,18 +3648,18 @@ fn test_filter_pushed_through_sort_with_fetch() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[false]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - FilterExec: a@0 = foo
+          - FilterExec: a@0 = Utf8("foo")
           -   SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[false]
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    "
+    "#
     );
 }
 
@@ -3688,19 +3688,19 @@ fn test_filter_with_projection_pushdown_through_sort() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar, projection=[a@0]
+        - FilterExec: b@1 = Utf8("bar"), projection=[a@0]
         -   SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
           - ProjectionExec: expr=[a@0 as a]
           -   SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
-          -     FilterExec: b@1 = bar
+          -     FilterExec: b@1 = Utf8("bar")
           -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -3724,18 +3724,18 @@ fn test_filter_pushdown_through_sort_preserves_partitioning() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo
+        - FilterExec: a@0 = Utf8("foo")
         -   SortExec: expr=[a@0 ASC], preserve_partitioning=[true]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
           - SortExec: expr=[a@0 ASC], preserve_partitioning=[true]
-          -   FilterExec: a@0 = foo
+          -   FilterExec: a@0 = Utf8("foo")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -3762,18 +3762,18 @@ fn test_filter_with_fetch_pushdown_through_sort() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: a@0 = foo, fetch=10
+        - FilterExec: a@0 = Utf8("foo"), fetch=10
         -   SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
           - SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[false]
-          -   FilterExec: a@0 = foo
+          -   FilterExec: a@0 = Utf8("foo")
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 
@@ -3800,19 +3800,19 @@ fn test_filter_pushdown_through_sort_with_projection() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
-        @r"
+        @r#"
     OptimizationTest:
       input:
-        - FilterExec: b@1 = bar, projection=[a@0]
+        - FilterExec: b@1 = Utf8("bar"), projection=[a@0]
         -   SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
           - ProjectionExec: expr=[a@0 as a]
           -   SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
-          -     FilterExec: b@1 = bar
+          -     FilterExec: b@1 = Utf8("bar")
           -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
-    "
+    "#
     );
 }
 

@@ -273,7 +273,7 @@ logical_plan
 05)--------TableScan: users projection=[id, name]
 physical_plan
 01)SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
-02)--FilterExec: count(Int64(1)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@2 > 1, projection=[id@0, name@1]
+02)--FilterExec: count(Int64(1)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@2 > Int64(1), projection=[id@0, name@1]
 03)----WindowAggExec: wdw=[count(Int64(1)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING: Ok(Field { name: "count(Int64(1)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING", data_type: Int64 }), frame: WindowFrame { units: Rows, start_bound: Preceding(UInt64(NULL)), end_bound: Following(UInt64(NULL)), is_causal: false }]
 04)------DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -289,7 +289,7 @@ logical_plan
 05)--------TableScan: users projection=[dept]
 physical_plan
 01)ProjectionExec: expr=[row_number() PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@0 as rk]
-02)--FilterExec: row_number() PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@0 > 1
+02)--FilterExec: row_number() PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@0 > UInt64(1)
 03)----ProjectionExec: expr=[row_number() PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@1 as row_number() PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]
 04)------BoundedWindowAggExec: wdw=[row_number() PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING: Field { "row_number() PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING], mode=[Sorted]
 05)--------SortExec: expr=[dept@0 ASC NULLS LAST], preserve_partitioning=[false]
@@ -316,17 +316,17 @@ logical_plan
 09)----------------TableScan: users projection=[salary, dept]
 physical_plan
 01)ProjectionExec: expr=[dept@0 as dept, avg(users.salary) PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@1 as r]
-02)--FilterExec: avg(users.salary) PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@1 > 60000.000000
+02)--FilterExec: avg(users.salary) PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@1 > Decimal128(60000.000000,14,6)
 03)----ProjectionExec: expr=[dept@0 as dept, avg(users.salary) PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@2 as avg(users.salary) PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]
 04)------WindowAggExec: wdw=[avg(users.salary) PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING: Ok(Field { name: "avg(users.salary) PARTITION BY [users.dept] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING", data_type: Decimal128(14, 6), nullable: true }), frame: WindowFrame { units: Rows, start_bound: Preceding(UInt64(NULL)), end_bound: Following(UInt64(NULL)), is_causal: false }]
 05)--------SortExec: expr=[dept@0 ASC NULLS LAST], preserve_partitioning=[true]
 06)----------RepartitionExec: partitioning=Hash([dept@0], 4), input_partitions=4
-07)------------FilterExec: sum(users.salary)@2 > 20000.00, projection=[dept@0, salary@1]
+07)------------FilterExec: sum(users.salary)@2 > Decimal128(20000.00,20,2), projection=[dept@0, salary@1]
 08)--------------AggregateExec: mode=FinalPartitioned, gby=[dept@0 as dept, salary@1 as salary], aggr=[sum(users.salary)]
 09)----------------RepartitionExec: partitioning=Hash([dept@0, salary@1], 4), input_partitions=4
 10)------------------AggregateExec: mode=Partial, gby=[dept@1 as dept, salary@0 as salary], aggr=[sum(users.salary)]
 11)--------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-12)----------------------FilterExec: salary@0 > 5000.00
+12)----------------------FilterExec: salary@0 > Decimal128(5000.00,10,2)
 13)------------------------DataSourceExec: partitions=1, partition_sizes=[1]
 
 # plan with aggregate function
@@ -348,7 +348,7 @@ physical_plan
 01)SortPreservingMergeExec: [dept@0 ASC NULLS LAST]
 02)--SortExec: expr=[dept@0 ASC NULLS LAST], preserve_partitioning=[true]
 03)----ProjectionExec: expr=[dept@0 as dept, sum(users.salary)@1 as s]
-04)------FilterExec: rank() ORDER BY [sum(users.salary) DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 = 1, projection=[dept@0, sum(users.salary)@1]
+04)------FilterExec: rank() ORDER BY [sum(users.salary) DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 = UInt64(1), projection=[dept@0, sum(users.salary)@1]
 05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
 06)----------BoundedWindowAggExec: wdw=[rank() ORDER BY [sum(users.salary) DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "rank() ORDER BY [sum(users.salary) DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
 07)------------SortPreservingMergeExec: [sum(users.salary)@1 DESC]

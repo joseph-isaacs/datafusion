@@ -2734,7 +2734,7 @@ mod tests {
             .unwrap();
         // note pruning expression refers to row_count twice
         assert_eq!(
-            "c1_null_count@2 != row_count@3 AND c1_min@0 <= 100 AND 100 <= c1_max@1 AND c2_null_count@6 != row_count@3 AND c2_min@4 <= 200 AND 200 <= c2_max@5",
+            "c1_null_count@2 != row_count@3 AND c1_min@0 <= Int32(100) AND Int32(100) <= c1_max@1 AND c2_null_count@6 != row_count@3 AND c2_min@4 <= Int32(200) AND Int32(200) <= c2_max@5",
             p.predicate_expr.to_string()
         );
 
@@ -3030,8 +3030,7 @@ mod tests {
     #[test]
     fn row_group_predicate_eq() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr =
-            "c1_null_count@2 != row_count@3 AND c1_min@0 <= 1 AND 1 <= c1_max@1";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND c1_min@0 <= Int32(1) AND Int32(1) <= c1_max@1";
 
         // test column on the left
         let expr = col("c1").eq(lit(1));
@@ -3051,8 +3050,7 @@ mod tests {
     #[test]
     fn row_group_predicate_not_eq() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr =
-            "c1_null_count@2 != row_count@3 AND (c1_min@0 != 1 OR 1 != c1_max@1)";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND (c1_min@0 != Int32(1) OR Int32(1) != c1_max@1)";
 
         // test column on the left
         let expr = col("c1").not_eq(lit(1));
@@ -3072,7 +3070,7 @@ mod tests {
     #[test]
     fn row_group_predicate_gt() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_max@0 > 1";
+        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_max@0 > Int32(1)";
 
         // test column on the left
         let expr = col("c1").gt(lit(1));
@@ -3092,7 +3090,7 @@ mod tests {
     #[test]
     fn row_group_predicate_gt_eq() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_max@0 >= 1";
+        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_max@0 >= Int32(1)";
 
         // test column on the left
         let expr = col("c1").gt_eq(lit(1));
@@ -3111,7 +3109,7 @@ mod tests {
     #[test]
     fn row_group_predicate_lt() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 < 1";
+        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 < Int32(1)";
 
         // test column on the left
         let expr = col("c1").lt(lit(1));
@@ -3131,7 +3129,7 @@ mod tests {
     #[test]
     fn row_group_predicate_lt_eq() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 <= 1";
+        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 <= Int32(1)";
 
         // test column on the left
         let expr = col("c1").lt_eq(lit(1));
@@ -3156,7 +3154,7 @@ mod tests {
         ]);
         // test AND operator joining supported c1 < 1 expression and unsupported c2 > c3 expression
         let expr = col("c1").lt(lit(1)).and(col("c2").lt(col("c3")));
-        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 < 1";
+        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 < Int32(1)";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3172,7 +3170,7 @@ mod tests {
         ]);
         // test OR operator joining supported c1 < 1 expression and unsupported c2 % 2 = 0 expression
         let expr = col("c1").lt(lit(1)).or(col("c2").rem(lit(2)).eq(lit(0)));
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3183,7 +3181,7 @@ mod tests {
     #[test]
     fn row_group_predicate_not() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
 
         let expr = col("c1").not();
         let predicate_expr =
@@ -3381,7 +3379,7 @@ mod tests {
     #[test]
     fn row_group_predicate_lt_bool() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Boolean, false)]);
-        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 < true";
+        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 < Boolean(true)";
 
         // DF doesn't support arithmetic on boolean columns so
         // this predicate will error when evaluated
@@ -3404,7 +3402,7 @@ mod tests {
         let expr = col("c1")
             .lt(lit(1))
             .and(col("c2").eq(lit(2)).or(col("c2").eq(lit(3))));
-        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 < 1 AND (c2_null_count@5 != row_count@2 AND c2_min@3 <= 2 AND 2 <= c2_max@4 OR c2_null_count@5 != row_count@2 AND c2_min@3 <= 3 AND 3 <= c2_max@4)";
+        let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 < Int32(1) AND (c2_null_count@5 != row_count@2 AND c2_min@3 <= Int32(2) AND Int32(2) <= c2_max@4 OR c2_null_count@5 != row_count@2 AND c2_min@3 <= Int32(3) AND Int32(3) <= c2_max@4)";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut required_columns);
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3496,7 +3494,7 @@ mod tests {
             vec![lit(1), lit(2), lit(3)],
             false,
         ));
-        let expected_expr = "c1_null_count@2 != row_count@3 AND c1_min@0 <= 1 AND 1 <= c1_max@1 OR c1_null_count@2 != row_count@3 AND c1_min@0 <= 2 AND 2 <= c1_max@1 OR c1_null_count@2 != row_count@3 AND c1_min@0 <= 3 AND 3 <= c1_max@1";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND c1_min@0 <= Int32(1) AND Int32(1) <= c1_max@1 OR c1_null_count@2 != row_count@3 AND c1_min@0 <= Int32(2) AND Int32(2) <= c1_max@1 OR c1_null_count@2 != row_count@3 AND c1_min@0 <= Int32(3) AND Int32(3) <= c1_max@1";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3512,7 +3510,7 @@ mod tests {
         ]);
         // test c1 in()
         let expr = Expr::InList(InList::new(Box::new(col("c1")), vec![], false));
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3532,7 +3530,7 @@ mod tests {
             vec![lit(1), lit(2), lit(3)],
             true,
         ));
-        let expected_expr = "c1_null_count@2 != row_count@3 AND (c1_min@0 != 1 OR 1 != c1_max@1) AND c1_null_count@2 != row_count@3 AND (c1_min@0 != 2 OR 2 != c1_max@1) AND c1_null_count@2 != row_count@3 AND (c1_min@0 != 3 OR 3 != c1_max@1)";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND (c1_min@0 != Int32(1) OR Int32(1) != c1_max@1) AND c1_null_count@2 != row_count@3 AND (c1_min@0 != Int32(2) OR Int32(2) != c1_max@1) AND c1_null_count@2 != row_count@3 AND (c1_min@0 != Int32(3) OR Int32(3) != c1_max@1)";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3578,7 +3576,7 @@ mod tests {
         // test c1 in(1, 2) and c2 BETWEEN 4 AND 5
         let expr3 = expr1.and(expr2);
 
-        let expected_expr = "(c1_null_count@2 != row_count@3 AND c1_min@0 <= 1 AND 1 <= c1_max@1 OR c1_null_count@2 != row_count@3 AND c1_min@0 <= 2 AND 2 <= c1_max@1) AND c2_null_count@5 != row_count@3 AND c2_max@4 >= 4 AND c2_null_count@5 != row_count@3 AND c2_min@6 <= 5";
+        let expected_expr = "(c1_null_count@2 != row_count@3 AND c1_min@0 <= Int32(1) AND Int32(1) <= c1_max@1 OR c1_null_count@2 != row_count@3 AND c1_min@0 <= Int32(2) AND Int32(2) <= c1_max@1) AND c2_null_count@5 != row_count@3 AND c2_max@4 >= Int32(4) AND c2_null_count@5 != row_count@3 AND c2_min@6 <= Int32(5)";
         let predicate_expr =
             test_build_predicate_expression(&expr3, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3594,7 +3592,7 @@ mod tests {
         // always true
         let expr = col("c1").in_list((1..=21).map(lit).collect(), false);
 
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3622,13 +3620,13 @@ mod tests {
         // `true` (which is what the default cap produces).
         assert_ne!(
             predicate_expr.to_string(),
-            "true",
+            "Boolean(true)",
             "IN(25) with raised cap must rewrite into a statistics-based predicate, not fall through to `true`"
         );
         // Sanity: the rewritten predicate references per-value literals.
         assert!(
-            predicate_expr.to_string().contains(" <= 1 ")
-                && predicate_expr.to_string().contains(" <= 25 "),
+            predicate_expr.to_string().contains(" <= Int32(1) ")
+                && predicate_expr.to_string().contains(" <= Int32(25) "),
             "rewritten predicate should include per-value bounds for each IN entry, got: {predicate_expr}"
         );
         Ok(())
@@ -3648,7 +3646,7 @@ mod tests {
             rewriter.rewrite_predicate_to_statistics_predicate(&physical, &schema);
         assert_eq!(
             predicate_expr.to_string(),
-            "true",
+            "Boolean(true)",
             "cap=0 must skip IN rewrite even for small lists"
         );
         Ok(())
@@ -3673,7 +3671,7 @@ mod tests {
             .try_build(Arc::clone(&physical))?;
         assert_eq!(
             default_pp.predicate_expr().to_string(),
-            "true",
+            "Boolean(true)",
             "default cap must fall through to `true` for 25-item IN"
         );
 
@@ -3685,11 +3683,12 @@ mod tests {
             .try_build(physical)?;
         let raised_expr = raised_pp.predicate_expr().to_string();
         assert_ne!(
-            raised_expr, "true",
+            raised_expr, "Boolean(true)",
             "raised cap must produce a real statistics predicate for 25-item IN"
         );
         assert!(
-            raised_expr.contains(" <= 1 ") && raised_expr.contains(" <= 25 "),
+            raised_expr.contains(" <= Int32(1) ")
+                && raised_expr.contains(" <= Int32(25) "),
             "raised-cap predicate should include per-value bounds, got: {raised_expr}"
         );
         Ok(())
@@ -4318,7 +4317,10 @@ mod tests {
         )?;
         let per_value_expr = per_value.predicate_expr().to_string();
         assert!(!per_value_expr.contains("NOT_IN_SET_MAY_MATCH"));
-        assert!(per_value_expr.contains("c1_min@0 != a000 OR a000 != c1_max@1"));
+        assert!(
+            per_value_expr
+                .contains("c1_min@0 != Utf8(\"a000\") OR Utf8(\"a000\") != c1_max@1")
+        );
 
         // Containers 7 and 9 carry inverted and absent bounds, where the two
         // forms could diverge without the compact side matching the chain.
@@ -4357,7 +4359,7 @@ mod tests {
     #[test]
     fn row_group_predicate_cast_int_int() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= 1 AND 1 <= CAST(c1_max@1 AS Int64)";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= Int64(1) AND Int64(1) <= CAST(c1_max@1 AS Int64)";
 
         // test cast(c1 as int64) = 1
         // test column on the left
@@ -4373,7 +4375,7 @@ mod tests {
         assert_eq!(predicate_expr.to_string(), expected_expr);
 
         let expected_expr =
-            "c1_null_count@1 != row_count@2 AND TRY_CAST(c1_max@0 AS Int64) > 1";
+            "c1_null_count@1 != row_count@2 AND TRY_CAST(c1_max@0 AS Int64) > Int64(1)";
 
         // test column on the left
         let expr =
@@ -4395,7 +4397,7 @@ mod tests {
     #[test]
     fn row_group_predicate_cast_string_string() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Utf8View, false)]);
-        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Utf8) <= 1 AND 1 <= CAST(c1_max@1 AS Utf8)";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Utf8) <= Utf8(\"1\") AND Utf8(\"1\") <= CAST(c1_max@1 AS Utf8)";
 
         // test column on the left
         let expr = cast(col("c1"), DataType::Utf8)
@@ -4417,7 +4419,7 @@ mod tests {
     #[test]
     fn row_group_predicate_cast_string_int() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Utf8View, false)]);
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
 
         // test column on the left
         let expr = cast(col("c1"), DataType::Int32).eq(lit(ScalarValue::Int32(Some(1))));
@@ -4437,7 +4439,7 @@ mod tests {
     #[test]
     fn row_group_predicate_cast_int_string() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
 
         // test column on the left
         let expr = cast(col("c1"), DataType::Utf8)
@@ -4459,7 +4461,7 @@ mod tests {
     #[test]
     fn row_group_predicate_date_date() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Date32, false)]);
-        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Date64) <= 1970-01-01 AND 1970-01-01 <= CAST(c1_max@1 AS Date64)";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Date64) <= Date64(\"1970-01-01\") AND Date64(\"1970-01-01\") <= CAST(c1_max@1 AS Date64)";
 
         // test column on the left
         let expr =
@@ -4482,7 +4484,7 @@ mod tests {
     fn row_group_predicate_dict_string_date() -> Result<()> {
         // Test with Dictionary<UInt8, Utf8> for the literal
         let schema = Schema::new(vec![Field::new("c1", DataType::Date32, false)]);
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
 
         // test column on the left
         let expr = cast(
@@ -4514,7 +4516,7 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
             false,
         )]);
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
 
         // test column on the left
         let expr =
@@ -4546,8 +4548,7 @@ mod tests {
         let expr = col("c1").eq(lit(ScalarValue::Utf8(Some("test".to_string()))));
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
-        let expected_expr =
-            "c1_null_count@2 != row_count@3 AND c1_min@0 <= test AND test <= c1_max@1";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND c1_min@0 <= Utf8(\"test\") AND Utf8(\"test\") <= c1_max@1";
         assert_eq!(predicate_expr.to_string(), expected_expr);
 
         // Test with column cast to a dictionary with different key type
@@ -4558,7 +4559,7 @@ mod tests {
         .eq(lit(ScalarValue::Utf8(Some("test".to_string()))));
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
-        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Dictionary(UInt16, Utf8)) <= test AND test <= CAST(c1_max@1 AS Dictionary(UInt16, Utf8))";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Dictionary(UInt16, Utf8)) <= Utf8(\"test\") AND Utf8(\"test\") <= CAST(c1_max@1 AS Dictionary(UInt16, Utf8))";
         assert_eq!(predicate_expr.to_string(), expected_expr);
 
         Ok(())
@@ -4572,7 +4573,7 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Int32)),
             false,
         )]);
-        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= 123 AND 123 <= CAST(c1_max@1 AS Int64)";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= Int64(123) AND Int64(123) <= CAST(c1_max@1 AS Int64)";
 
         // Test with literal of a different type
         let expr =
@@ -4598,8 +4599,7 @@ mod tests {
             ),
             false,
         )]);
-        let expected_expr =
-            "c1_null_count@2 != row_count@3 AND c1_min@0 <= test AND test <= c1_max@1";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND c1_min@0 <= Utf8(\"test\") AND Utf8(\"test\") <= c1_max@1";
 
         // Test with a simple literal
         let expr = col("c1").eq(lit(ScalarValue::Utf8(Some("test".to_string()))));
@@ -4618,7 +4618,7 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Date32)),
             false,
         )]);
-        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Dictionary(UInt16, Date64)) <= 1970-01-01 AND 1970-01-01 <= CAST(c1_max@1 AS Dictionary(UInt16, Date64))";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Dictionary(UInt16, Date64)) <= Date64(\"1970-01-01\") AND Date64(\"1970-01-01\") <= CAST(c1_max@1 AS Dictionary(UInt16, Date64))";
 
         // Test with a cast to a different date type
         let expr = cast(
@@ -4636,7 +4636,7 @@ mod tests {
     #[test]
     fn row_group_predicate_date_string() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Utf8, false)]);
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
 
         // test column on the left
         let expr =
@@ -4658,7 +4658,7 @@ mod tests {
     #[test]
     fn row_group_predicate_string_date() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Date32, false)]);
-        let expected_expr = "true";
+        let expected_expr = "Boolean(true)";
 
         // test column on the left
         let expr = cast(col("c1"), DataType::Utf8)
@@ -4690,7 +4690,7 @@ mod tests {
             ],
             false,
         ));
-        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= 1 AND 1 <= CAST(c1_max@1 AS Int64) OR c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= 2 AND 2 <= CAST(c1_max@1 AS Int64) OR c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= 3 AND 3 <= CAST(c1_max@1 AS Int64)";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= Int64(1) AND Int64(1) <= CAST(c1_max@1 AS Int64) OR c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= Int64(2) AND Int64(2) <= CAST(c1_max@1 AS Int64) OR c1_null_count@2 != row_count@3 AND CAST(c1_min@0 AS Int64) <= Int64(3) AND Int64(3) <= CAST(c1_max@1 AS Int64)";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -4704,7 +4704,7 @@ mod tests {
             ],
             true,
         ));
-        let expected_expr = "c1_null_count@2 != row_count@3 AND (CAST(c1_min@0 AS Int64) != 1 OR 1 != CAST(c1_max@1 AS Int64)) AND c1_null_count@2 != row_count@3 AND (CAST(c1_min@0 AS Int64) != 2 OR 2 != CAST(c1_max@1 AS Int64)) AND c1_null_count@2 != row_count@3 AND (CAST(c1_min@0 AS Int64) != 3 OR 3 != CAST(c1_max@1 AS Int64))";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND (CAST(c1_min@0 AS Int64) != Int64(1) OR Int64(1) != CAST(c1_max@1 AS Int64)) AND c1_null_count@2 != row_count@3 AND (CAST(c1_min@0 AS Int64) != Int64(2) OR Int64(2) != CAST(c1_max@1 AS Int64)) AND c1_null_count@2 != row_count@3 AND (CAST(c1_min@0 AS Int64) != Int64(3) OR Int64(3) != CAST(c1_max@1 AS Int64))";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -6835,8 +6835,7 @@ mod tests {
             &schema,
             &mut RequiredColumns::new(),
         );
-        let expected =
-            "c1_null_count@2 != row_count@3 AND c1_min@0 <= a AND a <= c1_max@1";
+        let expected = "c1_null_count@2 != row_count@3 AND c1_min@0 <= Utf8(\"a\") AND Utf8(\"a\") <= c1_max@1";
         assert_eq!(res.to_string(), expected);
     }
 }

@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn test_display_and_sql() -> Result<()> {
         let expr = SqlSimilarToPattern::new(lit("a%"));
-        assert_eq!("sql_similar_to_regex(a%)", format!("{expr}"));
+        assert_eq!("sql_similar_to_regex(Utf8(\"a%\"))", format!("{expr}"));
         Ok(())
     }
 }

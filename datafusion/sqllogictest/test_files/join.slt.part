@@ -850,7 +850,7 @@ physical_plan
 01)ProjectionExec: expr=[emp_id@1 as emp_id, name@2 as name, dept_name@0 as dept_name]
 02)--NestedLoopJoinExec: join_type=Right, filter=join_proj_push_down_1@0, projection=[dept_name@0, emp_id@1, name@2]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
-04)----ProjectionExec: expr=[emp_id@0 as emp_id, name@1 as name, name@1 = Alice OR name@1 = Bob as join_proj_push_down_1]
+04)----ProjectionExec: expr=[emp_id@0 as emp_id, name@1 as name, name@1 = Utf8View("Alice") OR name@1 = Utf8View("Bob") as join_proj_push_down_1]
 05)------DataSourceExec: partitions=1, partition_sizes=[1]
 
 query ITT rowsort
@@ -927,7 +927,7 @@ JOIN department AS d
 ON (e.name = 'Alice' OR e.name = 'Bob');
 ----
 logical_plan
-01)Cross Join: 
+01)Cross Join:
 02)--SubqueryAlias: e
 03)----Filter: employees.name = Utf8View("Alice") OR employees.name = Utf8View("Bob")
 04)------TableScan: employees projection=[emp_id, name]
@@ -935,7 +935,7 @@ logical_plan
 06)----TableScan: department projection=[dept_name]
 physical_plan
 01)CrossJoinExec
-02)--FilterExec: name@1 = Alice OR name@1 = Bob
+02)--FilterExec: name@1 = Utf8View("Alice") OR name@1 = Utf8View("Bob")
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 04)--DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -982,10 +982,10 @@ logical_plan
 07)------SubqueryAlias: d
 08)--------TableScan: department projection=[emp_id, dept_name]
 physical_plan
-01)FilterExec: dept_name@2 != Engineering AND name@1 = Alice OR name@1 = Carol
+01)FilterExec: dept_name@2 != Utf8View("Engineering") AND name@1 = Utf8View("Alice") OR name@1 = Utf8View("Carol")
 02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 03)----HashJoinExec: mode=CollectLeft, join_type=Left, on=[(emp_id@0, emp_id@0)], projection=[emp_id@0, name@1, dept_name@3]
-04)------FilterExec: name@1 = Alice OR name@1 = Carol
+04)------FilterExec: name@1 = Utf8View("Alice") OR name@1 = Utf8View("Carol")
 05)--------DataSourceExec: partitions=1, partition_sizes=[1]
 06)------DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -1175,7 +1175,7 @@ logical_plan
 06)--------TableScan: t5 projection=[v0, v1, v2, v3, v4]
 07)----TableScan: t0 projection=[v0, v1]
 physical_plan
-01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(CAST(t1.v0 AS Float64)@6, v1@1)], filter=v1@1 + CAST(v0@0 AS Float64) > 0, projection=[v0@0, v1@1, v2@3, v3@4, v4@5, v0@7, v1@8]
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(CAST(t1.v0 AS Float64)@6, v1@1)], filter=v1@1 + CAST(v0@0 AS Float64) > Float64(0), projection=[v0@0, v1@1, v2@3, v3@4, v4@5, v0@7, v1@8]
 02)--CoalescePartitionsExec
 03)----ProjectionExec: expr=[v0@0 as v0, v1@1 as v1, v0@2 as v0, v2@3 as v2, v3@4 as v3, v4@5 as v4, CAST(v0@0 AS Float64) as CAST(t1.v0 AS Float64)]
 04)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
@@ -1373,7 +1373,7 @@ physical_plan
 04)--HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(CAST(f.a AS Int64)@1, col0@0)], projection=[col0@2, col1@3, a@0]
 05)----ProjectionExec: expr=[a@0 as a, CAST(a@0 AS Int64) as CAST(f.a AS Int64)]
 06)------DataSourceExec: partitions=1, partition_sizes=[1]
-07)----ProjectionExec: expr=[CAST(x@0 AS Int64) + 1 as col0, CAST(y@1 AS Int64) + 1 as col1]
+07)----ProjectionExec: expr=[CAST(x@0 AS Int64) + Int64(1) as col0, CAST(y@1 AS Int64) + Int64(1) as col1]
 08)------RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
 09)--------FilterExec: y@1 = x@0
 10)----------DataSourceExec: partitions=1, partition_sizes=[1]

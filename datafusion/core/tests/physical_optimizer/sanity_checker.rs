@@ -936,16 +936,16 @@ async fn test_union_with_sorts_and_constants() -> Result<()> {
     let plan_str = plan_str.trim();
     assert_snapshot!(
         plan_str,
-        @r"
+        @r#"
     SortPreservingMergeExec: [const_1@0 ASC NULLS LAST, const_2@1 ASC NULLS LAST, a@2 ASC NULLS LAST]
       UnionExec
         SortExec: expr=[a@2 ASC NULLS LAST], preserve_partitioning=[false]
-          ProjectionExec: expr=[foo as const_1, foo as const_2, a@0 as a]
+          ProjectionExec: expr=[Utf8("foo") as const_1, Utf8("foo") as const_2, a@0 as a]
             DataSourceExec: partitions=1, partition_sizes=[0]
         SortExec: expr=[a@2 ASC NULLS LAST], preserve_partitioning=[false]
-          ProjectionExec: expr=[foo as const_1, bar as const_2, a@0 as a]
+          ProjectionExec: expr=[Utf8("foo") as const_1, Utf8("bar") as const_2, a@0 as a]
             DataSourceExec: partitions=1, partition_sizes=[0]
-    "
+    "#
     );
 
     assert_sanity_check(&plan, true);

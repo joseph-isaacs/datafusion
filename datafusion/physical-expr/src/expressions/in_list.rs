@@ -1406,8 +1406,8 @@ mod tests {
         let expr = in_list(Arc::clone(&col_a), list, &false, &schema)?;
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         let display_string = expr.to_string();
-        assert_snapshot!(sql_string, @"a IN (a, b)");
-        assert_snapshot!(display_string, @"a@0 IN (SET) ([a, b])");
+        assert_snapshot!(sql_string, @"a IN ('a', 'b')");
+        assert_snapshot!(display_string, @r#"a@0 IN (SET) ([Utf8("a"), Utf8("b")])"#);
         Ok(())
     }
 
@@ -1422,8 +1422,8 @@ mod tests {
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         let display_string = expr.to_string();
 
-        assert_snapshot!(sql_string, @"a NOT IN (a, b)");
-        assert_snapshot!(display_string, @"a@0 NOT IN (SET) ([a, b])");
+        assert_snapshot!(sql_string, @"a NOT IN ('a', 'b')");
+        assert_snapshot!(display_string, @r#"a@0 NOT IN (SET) ([Utf8("a"), Utf8("b")])"#);
         Ok(())
     }
 
@@ -1437,8 +1437,8 @@ mod tests {
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         let display_string = expr.to_string();
 
-        assert_snapshot!(sql_string, @"a IN (a, b, NULL)");
-        assert_snapshot!(display_string, @"a@0 IN (SET) ([a, b, NULL])");
+        assert_snapshot!(sql_string, @"a IN ('a', 'b', NULL)");
+        assert_snapshot!(display_string, @r#"a@0 IN (SET) ([Utf8("a"), Utf8("b"), Utf8(NULL)])"#);
         Ok(())
     }
 
@@ -1451,8 +1451,8 @@ mod tests {
         let expr = in_list(Arc::clone(&col_a), list, &true, &schema)?;
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         let display_string = expr.to_string();
-        assert_snapshot!(sql_string, @"a NOT IN (a, b, NULL)");
-        assert_snapshot!(display_string, @"a@0 NOT IN (SET) ([a, b, NULL])");
+        assert_snapshot!(sql_string, @"a NOT IN ('a', 'b', NULL)");
+        assert_snapshot!(display_string, @r#"a@0 NOT IN (SET) ([Utf8("a"), Utf8("b"), Utf8(NULL)])"#);
         Ok(())
     }
 

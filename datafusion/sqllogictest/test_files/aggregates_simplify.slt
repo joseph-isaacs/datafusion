@@ -111,7 +111,7 @@ logical_plan
 03)----Aggregate: groupBy=[[]], aggr=[[sum(sum_simplify_t.column1), count(sum_simplify_t.column1)]]
 04)------TableScan: sum_simplify_t projection=[column1]
 physical_plan
-01)ProjectionExec: expr=[sum(sum_simplify_t.column1)@0 + count(sum_simplify_t.column1)@1 as sum(sum_simplify_t.column1 + Int64(1)), sum(sum_simplify_t.column1)@0 + 2 * count(sum_simplify_t.column1)@1 as sum(sum_simplify_t.column1 + Int64(2))]
+01)ProjectionExec: expr=[sum(sum_simplify_t.column1)@0 + count(sum_simplify_t.column1)@1 as sum(sum_simplify_t.column1 + Int64(1)), sum(sum_simplify_t.column1)@0 + Int64(2) * count(sum_simplify_t.column1)@1 as sum(sum_simplify_t.column1 + Int64(2))]
 02)--AggregateExec: mode=Single, gby=[], aggr=[sum(sum_simplify_t.column1), count(sum_simplify_t.column1)]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -130,7 +130,7 @@ logical_plan
 03)----Aggregate: groupBy=[[]], aggr=[[sum(sum_simplify_t.column1), count(sum_simplify_t.column1)]]
 04)------TableScan: sum_simplify_t projection=[column1]
 physical_plan
-01)ProjectionExec: expr=[sum(sum_simplify_t.column1)@0 + count(sum_simplify_t.column1)@1 as sum(Int64(1) + sum_simplify_t.column1), sum(sum_simplify_t.column1)@0 + 2 * count(sum_simplify_t.column1)@1 as sum(sum_simplify_t.column1 + Int64(2))]
+01)ProjectionExec: expr=[sum(sum_simplify_t.column1)@0 + count(sum_simplify_t.column1)@1 as sum(Int64(1) + sum_simplify_t.column1), sum(sum_simplify_t.column1)@0 + Int64(2) * count(sum_simplify_t.column1)@1 as sum(sum_simplify_t.column1 + Int64(2))]
 02)--AggregateExec: mode=Single, gby=[], aggr=[sum(sum_simplify_t.column1), count(sum_simplify_t.column1)]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -173,7 +173,7 @@ physical_plan
 05)--------AggregateExec: mode=FinalPartitioned, gby=[alias1@0 as alias1], aggr=[sum(__common_expr_1) as alias2]
 06)----------RepartitionExec: partitioning=Hash([alias1@0], 4), input_partitions=1
 07)------------AggregateExec: mode=Partial, gby=[__common_expr_1@0 as alias1], aggr=[sum(__common_expr_1) as alias2]
-08)--------------ProjectionExec: expr=[column1@0 + 1 as __common_expr_1]
+08)--------------ProjectionExec: expr=[column1@0 + Int64(1) as __common_expr_1]
 09)----------------DataSourceExec: partitions=1, partition_sizes=[1]
 
 # FILTER clauses with different aggregate arguments
@@ -231,7 +231,7 @@ logical_plan
 03)----TableScan: sum_simplify_t projection=[column1]
 physical_plan
 01)AggregateExec: mode=Single, gby=[], aggr=[sum(sum_simplify_t.column1 + Int64(1)) FILTER (WHERE sum_simplify_t.column1 > Int64(1)), sum(sum_simplify_t.column1 + Int64(1)) FILTER (WHERE sum_simplify_t.column1 > Int64(0))]
-02)--ProjectionExec: expr=[column1@0 + 1 as __common_expr_1, column1@0 as column1]
+02)--ProjectionExec: expr=[column1@0 + Int64(1) as __common_expr_1, column1@0 as column1]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 
 # volatile aggregate arguments
@@ -272,7 +272,7 @@ logical_plan
 physical_plan
 01)SortPreservingMergeExec: [column2@0 DESC NULLS LAST]
 02)--SortExec: expr=[column2@0 DESC NULLS LAST], preserve_partitioning=[true]
-03)----ProjectionExec: expr=[column2@0 as column2, sum(sum_simplify_t.column1)@1 + count(sum_simplify_t.column1)@2 as sum(sum_simplify_t.column1 + Int64(1)), sum(sum_simplify_t.column1)@1 + 2 * count(sum_simplify_t.column1)@2 as sum(sum_simplify_t.column1 + Int64(2))]
+03)----ProjectionExec: expr=[column2@0 as column2, sum(sum_simplify_t.column1)@1 + count(sum_simplify_t.column1)@2 as sum(sum_simplify_t.column1 + Int64(1)), sum(sum_simplify_t.column1)@1 + Int64(2) * count(sum_simplify_t.column1)@2 as sum(sum_simplify_t.column1 + Int64(2))]
 04)------AggregateExec: mode=FinalPartitioned, gby=[column2@0 as column2], aggr=[sum(sum_simplify_t.column1), count(sum_simplify_t.column1)]
 05)--------RepartitionExec: partitioning=Hash([column2@0], 4), input_partitions=1
 06)----------AggregateExec: mode=Partial, gby=[column2@1 as column2], aggr=[sum(sum_simplify_t.column1), count(sum_simplify_t.column1)]
@@ -326,7 +326,7 @@ logical_plan
 06)----------TableScan: tbl projection=[val]
 physical_plan
 01)ProjectionExec: expr=[arrow_typeof(sum(tbl.val + Int64(1))@0) as arrow_typeof(sum(tbl.val + Int64(1))), sum(tbl.val + Int64(1))@0 as sum(tbl.val + Int64(1)), sum(tbl.val + Int64(2))@1 as sum(tbl.val + Int64(2))]
-02)--ProjectionExec: expr=[sum(tbl.val)@0 + count(tbl.val)@1 as sum(tbl.val + Int64(1)), sum(tbl.val)@0 + 2 * count(tbl.val)@1 as sum(tbl.val + Int64(2))]
+02)--ProjectionExec: expr=[sum(tbl.val)@0 + count(tbl.val)@1 as sum(tbl.val + Int64(1)), sum(tbl.val)@0 + Int64(2) * count(tbl.val)@1 as sum(tbl.val + Int64(2))]
 03)----AggregateExec: mode=Single, gby=[], aggr=[sum(tbl.val), count(tbl.val)]
 04)------ProjectionExec: expr=[CAST(val@0 AS Int64) as __common_expr_2]
 05)--------DataSourceExec: partitions=1, partition_sizes=[2]
@@ -346,7 +346,7 @@ logical_plan
 03)----Aggregate: groupBy=[[]], aggr=[[sum(CAST(tbl.val AS UInt64)), count(tbl.val)]]
 04)------TableScan: tbl projection=[val]
 physical_plan
-01)ProjectionExec: expr=[__common_expr_1@0 + CAST(count(tbl.val)@1 AS Decimal128(20, 0)) as sum(tbl.val) + Int64(1) * count(tbl.val), __common_expr_1@0 + CAST(2 * count(tbl.val)@1 AS Decimal128(20, 0)) as sum(tbl.val) + Int64(2) * count(tbl.val)]
+01)ProjectionExec: expr=[__common_expr_1@0 + CAST(count(tbl.val)@1 AS Decimal128(20, 0)) as sum(tbl.val) + Int64(1) * count(tbl.val), __common_expr_1@0 + CAST(Int64(2) * count(tbl.val)@1 AS Decimal128(20, 0)) as sum(tbl.val) + Int64(2) * count(tbl.val)]
 02)--ProjectionExec: expr=[CAST(sum(tbl.val)@0 AS Decimal128(20, 0)) as __common_expr_1, count(tbl.val)@1 as count(tbl.val)]
 03)----AggregateExec: mode=Single, gby=[], aggr=[sum(tbl.val), count(tbl.val)]
 04)------DataSourceExec: partitions=1, partition_sizes=[2]

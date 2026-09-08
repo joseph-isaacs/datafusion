@@ -7373,7 +7373,7 @@ physical_plan
 07)------------AggregateExec: mode=Final, gby=[c2@0 as c2, c3@1 as c3], aggr=[]
 08)--------------CoalescePartitionsExec
 09)----------------AggregateExec: mode=Partial, gby=[c2@0 as c2, c3@1 as c3], aggr=[]
-10)------------------FilterExec: c3@1 >= 10 AND c3@1 <= 20
+10)------------------FilterExec: c3@1 >= Int16(10) AND c3@1 <= Int16(20)
 11)--------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 12)----------------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/testing/data/csv/aggregate_test_100_with_dates.csv]]}, projection=[c2, c3], file_type=csv, has_header=true
 
@@ -7447,7 +7447,7 @@ physical_plan
 02)--GlobalLimitExec: skip=0, fetch=3
 03)----AggregateExec: mode=Final, gby=[c2@0 as c2, c3@1 as c3, __grouping_id@2 as __grouping_id], aggr=[], lim=[3]
 04)------CoalescePartitionsExec
-05)--------AggregateExec: mode=Partial, gby=[(NULL as c2, NULL as c3), (c2@0 as c2, NULL as c3), (c2@0 as c2, c3@1 as c3)], aggr=[]
+05)--------AggregateExec: mode=Partial, gby=[(Int8(NULL) as c2, Int16(NULL) as c3), (c2@0 as c2, Int16(NULL) as c3), (c2@0 as c2, c3@1 as c3)], aggr=[]
 06)----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/testing/data/csv/aggregate_test_100_with_dates.csv]]}, projection=[c2, c3], file_type=csv, has_header=true
 
@@ -8241,7 +8241,7 @@ logical_plan
 01)Aggregate: groupBy=[[]], aggr=[[min(empty.col0)]]
 02)--TableScan: empty projection=[col0]
 physical_plan
-01)ProjectionExec: expr=[NULL as min(empty.col0)]
+01)ProjectionExec: expr=[Int32(NULL) as min(empty.col0)]
 02)--PlaceholderRowExec
 
 query TT
@@ -8251,7 +8251,7 @@ logical_plan
 01)Aggregate: groupBy=[[]], aggr=[[max(empty.col0)]]
 02)--TableScan: empty projection=[col0]
 physical_plan
-01)ProjectionExec: expr=[NULL as max(empty.col0)]
+01)ProjectionExec: expr=[Int32(NULL) as max(empty.col0)]
 02)--PlaceholderRowExec
 
 statement ok
@@ -8557,7 +8557,7 @@ logical_plan
 03)----Aggregate: groupBy=[[having_test.v1, having_test.v2]], aggr=[[max(having_test.v1)]]
 04)------TableScan: having_test projection=[v1, v2]
 physical_plan
-01)FilterExec: max(having_test.v1)@2 = 3, projection=[v1@0, v2@1]
+01)FilterExec: max(having_test.v1)@2 = Int32(3), projection=[v1@0, v2@1]
 02)--AggregateExec: mode=FinalPartitioned, gby=[v1@0 as v1, v2@1 as v2], aggr=[max(having_test.v1)]
 03)----RepartitionExec: partitioning=Hash([v1@0, v2@1], 4), input_partitions=1
 04)------AggregateExec: mode=Partial, gby=[v1@0 as v1, v2@1 as v2], aggr=[max(having_test.v1)]
@@ -8726,15 +8726,15 @@ physical_plan
 03)----RepartitionExec: partitioning=Hash([id@0], 4), input_partitions=5
 04)------AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[last_value(a.foo) ORDER BY [a.foo ASC NULLS LAST], sum(DISTINCT Int64(1))], ordering_mode=Sorted
 05)--------UnionExec
-06)----------ProjectionExec: expr=[1 as id, 2 as foo]
+06)----------ProjectionExec: expr=[Int64(1) as id, Int64(2) as foo]
 07)------------PlaceholderRowExec
-08)----------ProjectionExec: expr=[1 as id, 4 as foo]
+08)----------ProjectionExec: expr=[Int64(1) as id, Int64(4) as foo]
 09)------------PlaceholderRowExec
-10)----------ProjectionExec: expr=[1 as id, 5 as foo]
+10)----------ProjectionExec: expr=[Int64(1) as id, Int64(5) as foo]
 11)------------PlaceholderRowExec
-12)----------ProjectionExec: expr=[1 as id, 3 as foo]
+12)----------ProjectionExec: expr=[Int64(1) as id, Int64(3) as foo]
 13)------------PlaceholderRowExec
-14)----------ProjectionExec: expr=[1 as id, 2 as foo]
+14)----------ProjectionExec: expr=[Int64(1) as id, Int64(2) as foo]
 15)------------PlaceholderRowExec
 
 # SortExec is removed if it is coming after one-row producing AggregateExec's having an empty group by expression
@@ -8865,7 +8865,7 @@ logical_plan
 03)----TableScan: t projection=[]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(Int64(1)), count(Int64(1))@0 as count()]
-02)--ProjectionExec: expr=[2 as count(Int64(1))]
+02)--ProjectionExec: expr=[Int64(2) as count(Int64(1))]
 03)----PlaceholderRowExec
 
 query II
@@ -8882,7 +8882,7 @@ logical_plan
 03)----TableScan: t projection=[]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(Int64(1)), count(Int64(1))@0 as count(*)]
-02)--ProjectionExec: expr=[2 as count(Int64(1))]
+02)--ProjectionExec: expr=[Int64(2) as count(Int64(1))]
 03)----PlaceholderRowExec
 
 query II
@@ -8899,7 +8899,7 @@ logical_plan
 03)----TableScan: t projection=[]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(), count(Int64(1))@0 as count(*)]
-02)--ProjectionExec: expr=[2 as count(Int64(1))]
+02)--ProjectionExec: expr=[Int64(2) as count(Int64(1))]
 03)----PlaceholderRowExec
 
 query TT
@@ -9428,7 +9428,7 @@ logical_plan
 04)------Sort: stream_test.g ASC NULLS LAST, fetch=10000
 05)--------TableScan: stream_test projection=[g, x, y, i, b]
 physical_plan
-01)ProjectionExec: expr=[g@0 as g, count(Int64(1))@1 as count(*), sum(stream_test.x)@2 as sum(stream_test.x), avg(stream_test.x)@3 as avg(stream_test.x), avg(stream_test.x)@3 as mean(stream_test.x), min(stream_test.x)@4 as min(stream_test.x), max(stream_test.y)@5 as max(stream_test.y), bit_and(stream_test.i)@6 as bit_and(stream_test.i), bit_or(stream_test.i)@7 as bit_or(stream_test.i), bit_xor(stream_test.i)@8 as bit_xor(stream_test.i), bool_and(stream_test.b)@9 as bool_and(stream_test.b), bool_or(stream_test.b)@10 as bool_or(stream_test.b), median(stream_test.x)@11 as median(stream_test.x), 0 as grouping(stream_test.g), var(stream_test.x)@12 as var(stream_test.x), var(stream_test.x)@12 as var_samp(stream_test.x), var_pop(stream_test.x)@13 as var_pop(stream_test.x), var(stream_test.x)@12 as var_sample(stream_test.x), var_pop(stream_test.x)@13 as var_population(stream_test.x), stddev(stream_test.x)@14 as stddev(stream_test.x), stddev(stream_test.x)@14 as stddev_samp(stream_test.x), stddev_pop(stream_test.x)@15 as stddev_pop(stream_test.x)]
+01)ProjectionExec: expr=[g@0 as g, count(Int64(1))@1 as count(*), sum(stream_test.x)@2 as sum(stream_test.x), avg(stream_test.x)@3 as avg(stream_test.x), avg(stream_test.x)@3 as mean(stream_test.x), min(stream_test.x)@4 as min(stream_test.x), max(stream_test.y)@5 as max(stream_test.y), bit_and(stream_test.i)@6 as bit_and(stream_test.i), bit_or(stream_test.i)@7 as bit_or(stream_test.i), bit_xor(stream_test.i)@8 as bit_xor(stream_test.i), bool_and(stream_test.b)@9 as bool_and(stream_test.b), bool_or(stream_test.b)@10 as bool_or(stream_test.b), median(stream_test.x)@11 as median(stream_test.x), Int32(0) as grouping(stream_test.g), var(stream_test.x)@12 as var(stream_test.x), var(stream_test.x)@12 as var_samp(stream_test.x), var_pop(stream_test.x)@13 as var_pop(stream_test.x), var(stream_test.x)@12 as var_sample(stream_test.x), var_pop(stream_test.x)@13 as var_population(stream_test.x), stddev(stream_test.x)@14 as stddev(stream_test.x), stddev(stream_test.x)@14 as stddev_samp(stream_test.x), stddev_pop(stream_test.x)@15 as stddev_pop(stream_test.x)]
 02)--AggregateExec: mode=Single, gby=[g@0 as g], aggr=[count(Int64(1)), sum(stream_test.x), avg(stream_test.x), min(stream_test.x), max(stream_test.y), bit_and(stream_test.i), bit_or(stream_test.i), bit_xor(stream_test.i), bool_and(stream_test.b), bool_or(stream_test.b), median(stream_test.x), var(stream_test.x), var_pop(stream_test.x), stddev(stream_test.x), stddev_pop(stream_test.x)], ordering_mode=Sorted
 03)----SortExec: TopK(fetch=10000), expr=[g@0 ASC NULLS LAST], preserve_partitioning=[false]
 04)------DataSourceExec: partitions=1, partition_sizes=[1]

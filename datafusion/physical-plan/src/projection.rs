@@ -2356,9 +2356,9 @@ mod tests {
         assert_eq!(pushed_filters.len(), 2);
 
         // "b" (output index 0) -> "a" (input index 0)
-        let expected_filter1 = "a@0 > 5";
+        let expected_filter1 = "a@0 > Int32(5)";
         // "a" (output index 1) -> "b" (input index 1)
-        let expected_filter2 = "b@1 < 10";
+        let expected_filter2 = "b@1 < Int32(10)";
 
         assert_eq!(format!("{}", pushed_filters[0].predicate), expected_filter1);
         assert_eq!(format!("{}", pushed_filters[1].predicate), expected_filter2);
@@ -2421,9 +2421,9 @@ mod tests {
         let pushed_filters = &description.parent_filters()[0];
         assert_eq!(pushed_filters.len(), 2);
         // "x" -> "a" (index 0)
-        let expected_filter1 = "a@0 > 5";
+        let expected_filter1 = "a@0 > Int32(5)";
         // "b" -> "b" (index 1)
-        let expected_filter2 = "b@1 < 10";
+        let expected_filter2 = "b@1 < Int32(10)";
 
         assert_eq!(format!("{}", pushed_filters[0].predicate), expected_filter1);
         assert_eq!(format!("{}", pushed_filters[1].predicate), expected_filter2);
@@ -2474,7 +2474,10 @@ mod tests {
         // expand to `a + 1 > 10`
         let pushed_filters = &description.parent_filters()[0];
         assert!(matches!(pushed_filters[0].discriminant, PushedDown::Yes));
-        assert_eq!(format!("{}", pushed_filters[0].predicate), "a@0 + 1 > 10");
+        assert_eq!(
+            format!("{}", pushed_filters[0].predicate),
+            "a@0 + Int32(1) > Int32(10)"
+        );
 
         Ok(())
     }
@@ -2518,7 +2521,7 @@ mod tests {
         // The column shouldn't be found in the alias map, so it remains unchanged with its index
         assert_eq!(
             format!("{}", pushed_filters[0].predicate),
-            "unknown_col@1 > 5"
+            "unknown_col@1 > Int32(5)"
         );
 
         Ok(())
@@ -2564,7 +2567,7 @@ mod tests {
         ));
         // Initial state should be lit(true)
         let current = dynamic_filter.current()?;
-        assert_eq!(format!("{current}"), "true");
+        assert_eq!(format!("{current}"), "Boolean(true)");
 
         let dyn_phy_expr: Arc<dyn PhysicalExpr> = Arc::clone(&dynamic_filter) as _;
 
@@ -2589,12 +2592,12 @@ mod tests {
 
         // Now it should be a > 5
         let current = dynamic_filter.current()?;
-        assert_eq!(format!("{current}"), "a@0 > 5");
+        assert_eq!(format!("{current}"), "a@0 > Int32(5)");
 
         // Check currently pushed_filters is b - 1 > 5 (because b - 1 is projected as a)
         assert_eq!(
             format!("{}", pushed_filters.predicate),
-            "DynamicFilter [ b@0 - 1 > 5 ]"
+            "DynamicFilter [ b@0 - Int32(1) > Int32(5) ]"
         );
 
         Ok(())

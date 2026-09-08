@@ -987,9 +987,9 @@ fn test_join_after_projection() -> Result<()> {
 
     assert_snapshot!(
         actual,
-        @r"
+        @"
     ProjectionExec: expr=[c@2 as c_from_left, b@1 as b_from_left, a@0 as a_from_left, a@5 as a_from_right, c@7 as c_from_right]
-      SymmetricHashJoinExec: mode=SinglePartition, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - 1 + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
+      SymmetricHashJoinExec: mode=SinglePartition, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - Int32(1) + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
     "
@@ -1005,8 +1005,8 @@ fn test_join_after_projection() -> Result<()> {
 
     assert_snapshot!(
         actual,
-        @r"
-    SymmetricHashJoinExec: mode=SinglePartition, join_type=Inner, on=[(b_from_left@1, c_from_right@1)], filter=b_left_inter@0 - 1 + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
+        @"
+    SymmetricHashJoinExec: mode=SinglePartition, join_type=Inner, on=[(b_from_left@1, c_from_right@1)], filter=b_left_inter@0 - Int32(1) + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[c@2 as c_from_left, b@1 as b_from_left, a@0 as a_from_left], file_type=csv, has_header=false
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[a@0 as a_from_right, c@2 as c_from_right], file_type=csv, has_header=false
     "
@@ -1114,9 +1114,9 @@ fn test_join_after_required_projection() -> Result<()> {
 
     assert_snapshot!(
         actual,
-        @r"
+        @"
     ProjectionExec: expr=[a@5 as a, b@6 as b, c@7 as c, d@8 as d, e@9 as e, a@0 as a, b@1 as b, c@2 as c, d@3 as d, e@4 as e]
-      SymmetricHashJoinExec: mode=SinglePartition, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - 1 + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
+      SymmetricHashJoinExec: mode=SinglePartition, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - Int32(1) + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
     "
@@ -1132,9 +1132,9 @@ fn test_join_after_required_projection() -> Result<()> {
 
     assert_snapshot!(
         actual,
-        @r"
+        @"
     ProjectionExec: expr=[a@5 as a, b@6 as b, c@7 as c, d@8 as d, e@9 as e, a@0 as a, b@1 as b, c@2 as c, d@3 as d, e@4 as e]
-      SymmetricHashJoinExec: mode=SinglePartition, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - 1 + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
+      SymmetricHashJoinExec: mode=SinglePartition, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - Int32(1) + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
     "
@@ -1287,9 +1287,9 @@ fn test_hash_join_after_projection() -> Result<()> {
     let actual = initial.trim();
     assert_snapshot!(
         actual,
-        @r"
+        @"
     ProjectionExec: expr=[c@2 as c_from_left, b@1 as b_from_left, a@0 as a_from_left, c@7 as c_from_right]
-      HashJoinExec: mode=Auto, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - 1 + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
+      HashJoinExec: mode=Auto, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - Int32(1) + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
     "
@@ -1305,9 +1305,9 @@ fn test_hash_join_after_projection() -> Result<()> {
     // HashJoinExec only returns result after projection. Because there are some alias columns in the projection, the ProjectionExec is not removed.
     assert_snapshot!(
         actual,
-        @r"
+        @"
     ProjectionExec: expr=[c@0 as c_from_left, b@1 as b_from_left, a@2 as a_from_left, c@3 as c_from_right]
-      HashJoinExec: mode=Auto, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - 1 + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2, projection=[c@2, b@1, a@0, c@7]
+      HashJoinExec: mode=Auto, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - Int32(1) + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2, projection=[c@2, b@1, a@0, c@7]
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
     "
@@ -1333,8 +1333,8 @@ fn test_hash_join_after_projection() -> Result<()> {
     // Comparing to the previous result, this projection don't have alias columns either change the order of output fields. So the ProjectionExec is removed.
     assert_snapshot!(
         actual,
-        @r"
-    HashJoinExec: mode=Auto, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - 1 + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2, projection=[a@0, b@1, c@2, c@7]
+        @"
+    HashJoinExec: mode=Auto, join_type=Inner, on=[(b@1, c@2)], filter=b_left_inter@0 - Int32(1) + a_right_inter@1 <= a_right_inter@1 + c_left_inter@2, projection=[a@0, b@1, c@2, c@7]
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
     "
@@ -1796,9 +1796,9 @@ fn test_filter_with_embedded_projection_after_projection() -> Result<()> {
     let actual = initial.trim();
     assert_snapshot!(
         actual,
-        @r"
+        @"
     ProjectionExec: expr=[a@0 as a, b@1 as b]
-      FilterExec: a@0 > 0, projection=[a@0, b@1, c@2]
+      FilterExec: a@0 > Int32(0), projection=[a@0, b@1, c@2]
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
     "
     );
@@ -1812,8 +1812,8 @@ fn test_filter_with_embedded_projection_after_projection() -> Result<()> {
     let actual = after_optimize_string.trim();
     assert_snapshot!(
         actual,
-        @r"
-    FilterExec: a@0 > 0
+        @"
+    FilterExec: a@0 > Int32(0)
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b], file_type=csv, has_header=false
     "
     );
@@ -1852,9 +1852,9 @@ fn test_filter_with_embedded_projection_after_renaming_projection() -> Result<()
     let actual = initial.trim();
     assert_snapshot!(
         actual,
-        @r"
+        @"
     ProjectionExec: expr=[a@0 as x, b@1 as y]
-      FilterExec: b@1 > 10, projection=[a@0, b@1, c@2, d@3]
+      FilterExec: b@1 > Int32(10), projection=[a@0, b@1, c@2, d@3]
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=csv, has_header=false
     "
     );
@@ -1867,8 +1867,8 @@ fn test_filter_with_embedded_projection_after_renaming_projection() -> Result<()
     let actual = after_optimize_string.trim();
     assert_snapshot!(
         actual,
-        @r"
-    FilterExec: y@1 > 10
+        @"
+    FilterExec: y@1 > Int32(10)
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[a@0 as x, b@1 as y], file_type=csv, has_header=false
     "
     );

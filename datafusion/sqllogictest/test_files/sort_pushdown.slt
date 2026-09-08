@@ -155,7 +155,7 @@ logical_plan
 03)----TableScan: multi_rg_sorted projection=[id, category, value], partial_filters=[multi_rg_sorted.category = Utf8View("alpha") OR multi_rg_sorted.category = Utf8View("gamma")]
 physical_plan
 01)SortExec: TopK(fetch=5), expr=[id@0 DESC], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/multi_rg_sorted.parquet]]}, projection=[id, category, value], file_type=parquet, predicate=(category@1 = alpha OR category@1 = gamma) AND DynamicFilter [ empty ], sort_order_for_reorder=[id@0 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible, pruning_predicate=category_null_count@2 != row_count@3 AND category_min@0 <= alpha AND alpha <= category_max@1 OR category_null_count@2 != row_count@3 AND category_min@0 <= gamma AND gamma <= category_max@1, required_guarantees=[category in (alpha, gamma)]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/multi_rg_sorted.parquet]]}, projection=[id, category, value], file_type=parquet, predicate=(category@1 = Utf8View("alpha") OR category@1 = Utf8View("gamma")) AND DynamicFilter [ empty ], sort_order_for_reorder=[id@0 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible, pruning_predicate=category_null_count@2 != row_count@3 AND category_min@0 <= Utf8View("alpha") AND Utf8View("alpha") <= category_max@1 OR category_null_count@2 != row_count@3 AND category_min@0 <= Utf8View("gamma") AND Utf8View("gamma") <= category_max@1, required_guarantees=[category in (alpha, gamma)]
 
 # Verify the results are correct despite reverse scanning with row selection
 # Expected: gamma values (6, 5) then alpha values (2, 1), in DESC order by id
@@ -381,7 +381,7 @@ logical_plan
 03)----TableScan: timeseries_parquet projection=[timeframe, period_end, value], partial_filters=[timeseries_parquet.timeframe = Utf8View("quarterly")]
 physical_plan
 01)SortExec: TopK(fetch=2), expr=[period_end@1 DESC], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], file_type=parquet, predicate=timeframe@0 = quarterly AND DynamicFilter [ empty ], sort_order_for_reorder=[period_end@1 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible, pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= quarterly AND quarterly <= timeframe_max@1, required_guarantees=[timeframe in (quarterly)]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], file_type=parquet, predicate=timeframe@0 = Utf8View("quarterly") AND DynamicFilter [ empty ], sort_order_for_reorder=[period_end@1 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible, pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= Utf8View("quarterly") AND Utf8View("quarterly") <= timeframe_max@1, required_guarantees=[timeframe in (quarterly)]
 
 # Test 2.2: Verify the results are correct
 query TIR
@@ -404,7 +404,7 @@ logical_plan
 01)Sort: timeseries_parquet.period_end ASC NULLS LAST, fetch=2
 02)--Filter: timeseries_parquet.timeframe = Utf8View("quarterly")
 03)----TableScan: timeseries_parquet projection=[timeframe, period_end, value], partial_filters=[timeseries_parquet.timeframe = Utf8View("quarterly")]
-physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], limit=2, output_ordering=[timeframe@0 ASC NULLS LAST, period_end@1 ASC NULLS LAST], file_type=parquet, predicate=timeframe@0 = quarterly, pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= quarterly AND quarterly <= timeframe_max@1, required_guarantees=[timeframe in (quarterly)]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], limit=2, output_ordering=[timeframe@0 ASC NULLS LAST, period_end@1 ASC NULLS LAST], file_type=parquet, predicate=timeframe@0 = Utf8View("quarterly"), pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= Utf8View("quarterly") AND Utf8View("quarterly") <= timeframe_max@1, required_guarantees=[timeframe in (quarterly)]
 
 # Test 2.4: Verify ASC results
 query TIR
@@ -458,7 +458,7 @@ logical_plan
 03)----TableScan: timeseries_parquet projection=[timeframe, period_end, value], partial_filters=[timeseries_parquet.timeframe = Utf8View("quarterly")]
 physical_plan
 01)SortExec: TopK(fetch=2), expr=[period_end@1 DESC], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], output_ordering=[timeframe@0 ASC NULLS LAST, period_end@1 ASC NULLS LAST], file_type=parquet, predicate=timeframe@0 = quarterly AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= quarterly AND quarterly <= timeframe_max@1, required_guarantees=[timeframe in (quarterly)]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], output_ordering=[timeframe@0 ASC NULLS LAST, period_end@1 ASC NULLS LAST], file_type=parquet, predicate=timeframe@0 = Utf8View("quarterly") AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= Utf8View("quarterly") AND Utf8View("quarterly") <= timeframe_max@1, required_guarantees=[timeframe in (quarterly)]
 
 # Results should still be correct
 query TIR
@@ -491,7 +491,7 @@ logical_plan
 03)----TableScan: timeseries_parquet projection=[timeframe, period_end, value], partial_filters=[timeseries_parquet.timeframe = Utf8View("daily") OR timeseries_parquet.timeframe = Utf8View("weekly")]
 physical_plan
 01)SortExec: TopK(fetch=3), expr=[period_end@1 DESC], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], file_type=parquet, predicate=(timeframe@0 = daily OR timeframe@0 = weekly) AND DynamicFilter [ empty ], sort_order_for_reorder=[period_end@1 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible, pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= daily AND daily <= timeframe_max@1 OR timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= weekly AND weekly <= timeframe_max@1, required_guarantees=[timeframe in (daily, weekly)]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], file_type=parquet, predicate=(timeframe@0 = Utf8View("daily") OR timeframe@0 = Utf8View("weekly")) AND DynamicFilter [ empty ], sort_order_for_reorder=[period_end@1 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible, pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= Utf8View("daily") AND Utf8View("daily") <= timeframe_max@1 OR timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= Utf8View("weekly") AND Utf8View("weekly") <= timeframe_max@1, required_guarantees=[timeframe in (daily, weekly)]
 
 # Test 2.9: Complex case - literal constant in sort expression itself
 # The literal 'constant' is ignored in sort analysis
@@ -511,7 +511,7 @@ logical_plan
 03)----TableScan: timeseries_parquet projection=[timeframe, period_end, value], partial_filters=[timeseries_parquet.timeframe = Utf8View("monthly")]
 physical_plan
 01)SortExec: TopK(fetch=2), expr=[period_end@1 DESC], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], file_type=parquet, predicate=timeframe@0 = monthly AND DynamicFilter [ empty ], sort_order_for_reorder=[period_end@1 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible, pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= monthly AND monthly <= timeframe_max@1, required_guarantees=[timeframe in (monthly)]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], file_type=parquet, predicate=timeframe@0 = Utf8View("monthly") AND DynamicFilter [ empty ], sort_order_for_reorder=[period_end@1 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible, pruning_predicate=timeframe_null_count@2 != row_count@3 AND timeframe_min@0 <= Utf8View("monthly") AND Utf8View("monthly") <= timeframe_max@1, required_guarantees=[timeframe in (monthly)]
 
 # Verify results
 query TIR
@@ -540,7 +540,7 @@ logical_plan
 03)----TableScan: timeseries_parquet projection=[timeframe, period_end, value], partial_filters=[timeseries_parquet.period_end = Int32(2)]
 physical_plan
 01)SortExec: expr=[timeframe@0 DESC], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], file_type=parquet, predicate=period_end@1 = 2, sort_order_for_reorder=[timeframe@0 DESC], reverse_row_groups=true, pruning_predicate=period_end_null_count@2 != row_count@3 AND period_end_min@0 <= 2 AND 2 <= period_end_max@1, required_guarantees=[period_end in (2)]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timeseries_sorted.parquet]]}, projection=[timeframe, period_end, value], file_type=parquet, predicate=period_end@1 = Int32(2), sort_order_for_reorder=[timeframe@0 DESC], reverse_row_groups=true, pruning_predicate=period_end_null_count@2 != row_count@3 AND period_end_min@0 <= Int32(2) AND Int32(2) <= period_end_max@1, required_guarantees=[period_end in (2)]
 
 # Cleanup
 statement ok
@@ -625,8 +625,8 @@ logical_plan
 01)Sort: date_trunc(Utf8("day"), timestamp_parquet.ts) DESC NULLS FIRST, fetch=3
 02)--TableScan: timestamp_parquet projection=[id, ts, volume, price]
 physical_plan
-01)SortExec: TopK(fetch=3), expr=[date_trunc(day, ts@1) DESC], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timestamp_sorted.parquet]]}, projection=[id, ts, volume, price], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[date_trunc(day, ts@1) DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible
+01)SortExec: TopK(fetch=3), expr=[date_trunc(Utf8("day"), ts@1) DESC], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/timestamp_sorted.parquet]]}, projection=[id, ts, volume, price], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[date_trunc(Utf8("day"), ts@1) DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible
 
 # Verify results (descending day)
 query IPIR
@@ -711,8 +711,8 @@ logical_plan
 01)Sort: date_trunc(Utf8("month"), multi_month_parquet.ts) DESC NULLS FIRST, multi_month_parquet.ts DESC NULLS FIRST, fetch=2
 02)--TableScan: multi_month_parquet projection=[id, ts, volume, price]
 physical_plan
-01)SortExec: TopK(fetch=2), expr=[date_trunc(month, ts@1) DESC, ts@1 DESC], preserve_partitioning=[false]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/multi_month_sorted.parquet]]}, projection=[id, ts, volume, price], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[date_trunc(month, ts@1) DESC, ts@1 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible
+01)SortExec: TopK(fetch=2), expr=[date_trunc(Utf8("month"), ts@1) DESC, ts@1 DESC], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/multi_month_sorted.parquet]]}, projection=[id, ts, volume, price], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[date_trunc(Utf8("month"), ts@1) DESC, ts@1 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible
 
 query IPIR
 SELECT * FROM multi_month_parquet
@@ -895,7 +895,7 @@ logical_plan
 03)----TableScan: agg_expr_parquet projection=[x, y, v]
 physical_plan
 01)SortExec: expr=[x@0 ASC NULLS LAST, agg_expr_parquet.y % Int64(2)@1 ASC NULLS LAST], preserve_partitioning=[false]
-02)--AggregateExec: mode=Single, gby=[x@0 as x, CAST(y@1 AS Int64) % 2 as agg_expr_parquet.y % Int64(2)], aggr=[sum(agg_expr_parquet.v)], ordering_mode=PartiallySorted([0])
+02)--AggregateExec: mode=Single, gby=[x@0 as x, CAST(y@1 AS Int64) % Int64(2) as agg_expr_parquet.y % Int64(2)], aggr=[sum(agg_expr_parquet.v)], ordering_mode=PartiallySorted([0])
 03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/agg_expr_sorted.parquet]]}, projection=[x, y, v], output_ordering=[x@0 ASC NULLS LAST, y@1 ASC NULLS LAST], file_type=parquet
 
 # Expected output pattern from ORDER BY [x, bucket]:
@@ -1016,7 +1016,7 @@ logical_plan
 02)--Aggregate: groupBy=[[agg_expr_parquet.x]], aggr=[[sum(CAST(agg_expr_parquet.v AS Int64))]]
 03)----TableScan: agg_expr_parquet projection=[x, v]
 physical_plan
-01)SortExec: expr=[CAST(x@0 AS Int64) + 1 DESC], preserve_partitioning=[false]
+01)SortExec: expr=[CAST(x@0 AS Int64) + Int64(1) DESC], preserve_partitioning=[false]
 02)--AggregateExec: mode=Single, gby=[x@0 as x], aggr=[sum(agg_expr_parquet.v)], ordering_mode=Sorted
 03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/agg_expr_sorted.parquet]]}, projection=[x, v], output_ordering=[x@0 ASC NULLS LAST], file_type=parquet
 
@@ -1042,7 +1042,7 @@ logical_plan
 02)--Aggregate: groupBy=[[agg_expr_parquet.x]], aggr=[[sum(CAST(agg_expr_parquet.v AS Int64))]]
 03)----TableScan: agg_expr_parquet projection=[x, v]
 physical_plan
-01)SortExec: expr=[2 * CAST(x@0 AS Int64) ASC NULLS LAST], preserve_partitioning=[false]
+01)SortExec: expr=[Int64(2) * CAST(x@0 AS Int64) ASC NULLS LAST], preserve_partitioning=[false]
 02)--AggregateExec: mode=Single, gby=[x@0 as x], aggr=[sum(agg_expr_parquet.v)], ordering_mode=Sorted
 03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/agg_expr_sorted.parquet]]}, projection=[x, v], output_ordering=[x@0 ASC NULLS LAST], file_type=parquet
 

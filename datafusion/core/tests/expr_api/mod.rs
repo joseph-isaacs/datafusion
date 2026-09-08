@@ -311,13 +311,13 @@ async fn test_aggregate_ext_null_treatment() {
 async fn test_create_physical_expr() {
     // create_physical_expr does not simplify the expression
     // 1 + 1
-    create_expr_test(lit(1i32) + lit(2i32), "1 + 2");
+    create_expr_test(lit(1i32) + lit(2i32), "Int32(1) + Int32(2)");
     // However, you can run the simplifier before creating the physical
     // expression. This mimics what delta.rs and other non-sql libraries do to
     // create predicates
     //
     // 1 + 1
-    create_simplified_expr_test(lit(1i32) + lit(2i32), "3");
+    create_simplified_expr_test(lit(1i32) + lit(2i32), "Int32(3)");
 }
 
 #[test]
@@ -347,20 +347,26 @@ async fn test_create_physical_expr_coercion() {
     // string/int comparisons cast the string side to the numeric type.
     //
     // string column vs int literal: id (Utf8) is cast to Int32
-    create_expr_test(col("id").eq(lit(1i32)), "CAST(id@0 AS Int32) = 1");
-    create_expr_test(lit(1i32).eq(col("id")), "1 = CAST(id@0 AS Int32)");
+    create_expr_test(col("id").eq(lit(1i32)), "CAST(id@0 AS Int32) = Int32(1)");
+    create_expr_test(lit(1i32).eq(col("id")), "Int32(1) = CAST(id@0 AS Int32)");
     // int column vs string literal: the string literal is cast to Int64
-    create_expr_test(col("i").eq(lit("202410")), "i@1 = CAST(202410 AS Int64)");
-    create_expr_test(lit("202410").eq(col("i")), "CAST(202410 AS Int64) = i@1");
+    create_expr_test(
+        col("i").eq(lit("202410")),
+        "i@1 = CAST(Utf8(\"202410\") AS Int64)",
+    );
+    create_expr_test(
+        lit("202410").eq(col("i")),
+        "CAST(Utf8(\"202410\") AS Int64) = i@1",
+    );
     // The simplifier operates on the logical expression before type
     // coercion adds the CAST, so the output is unchanged.
     create_simplified_expr_test(
         col("i").eq(lit("202410")),
-        "i@1 = CAST(202410 AS Int64)",
+        "i@1 = CAST(Utf8(\"202410\") AS Int64)",
     );
     create_simplified_expr_test(
         lit("202410").eq(col("i")),
-        "i@1 = CAST(202410 AS Int64)",
+        "i@1 = CAST(Utf8(\"202410\") AS Int64)",
     );
 }
 

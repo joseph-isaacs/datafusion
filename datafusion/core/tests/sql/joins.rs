@@ -71,8 +71,8 @@ async fn join_change_in_planner() -> Result<()> {
 
     assert_snapshot!(
         actual,
-        @r"
-    SymmetricHashJoinExec: mode=Partitioned, join_type=Full, on=[(a2@1, a2@1)], filter=CAST(a1@0 AS Int64) > CAST(a1@1 AS Int64) + 3 AND CAST(a1@0 AS Int64) < CAST(a1@1 AS Int64) + 10
+        @"
+    SymmetricHashJoinExec: mode=Partitioned, join_type=Full, on=[(a2@1, a2@1)], filter=CAST(a1@0 AS Int64) > CAST(a1@1 AS Int64) + Int64(3) AND CAST(a1@0 AS Int64) < CAST(a1@1 AS Int64) + Int64(10)
       RepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=1, maintains_sort_order=true
         StreamingTableExec: partition_sizes=1, projection=[a1, a2], infinite_source=true, output_ordering=[a1@0 ASC NULLS LAST]
       RepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=1, maintains_sort_order=true
@@ -129,8 +129,8 @@ async fn join_no_order_on_filter() -> Result<()> {
 
     assert_snapshot!(
         actual,
-        @r"
-    SymmetricHashJoinExec: mode=Partitioned, join_type=Full, on=[(a2@1, a2@1)], filter=CAST(a3@0 AS Int64) > CAST(a3@1 AS Int64) + 3 AND CAST(a3@0 AS Int64) < CAST(a3@1 AS Int64) + 10
+        @"
+    SymmetricHashJoinExec: mode=Partitioned, join_type=Full, on=[(a2@1, a2@1)], filter=CAST(a3@0 AS Int64) > CAST(a3@1 AS Int64) + Int64(3) AND CAST(a3@0 AS Int64) < CAST(a3@1 AS Int64) + Int64(10)
       RepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=1, maintains_sort_order=true
         StreamingTableExec: partition_sizes=1, projection=[a1, a2, a3], infinite_source=true, output_ordering=[a1@0 ASC NULLS LAST]
       RepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=1, maintains_sort_order=true
@@ -168,8 +168,8 @@ async fn join_change_in_planner_without_sort() -> Result<()> {
 
     assert_snapshot!(
         actual,
-        @r"
-    SymmetricHashJoinExec: mode=Partitioned, join_type=Full, on=[(a2@1, a2@1)], filter=CAST(a1@0 AS Int64) > CAST(a1@1 AS Int64) + 3 AND CAST(a1@0 AS Int64) < CAST(a1@1 AS Int64) + 10
+        @"
+    SymmetricHashJoinExec: mode=Partitioned, join_type=Full, on=[(a2@1, a2@1)], filter=CAST(a1@0 AS Int64) > CAST(a1@1 AS Int64) + Int64(3) AND CAST(a1@0 AS Int64) < CAST(a1@1 AS Int64) + Int64(10)
       RepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=1
         StreamingTableExec: partition_sizes=1, projection=[a1, a2], infinite_source=true
       RepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=1

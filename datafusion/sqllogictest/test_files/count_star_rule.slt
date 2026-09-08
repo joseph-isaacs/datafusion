@@ -36,7 +36,7 @@ logical_plan
 03)----SubqueryAlias: t
 04)------EmptyRelation: rows=1
 physical_plan
-01)ProjectionExec: expr=[1 as count()]
+01)ProjectionExec: expr=[Int64(1) as count()]
 02)--PlaceholderRowExec
 
 query TT
@@ -63,7 +63,7 @@ logical_plan
 04)------TableScan: t1 projection=[a]
 physical_plan
 01)ProjectionExec: expr=[a@0 as a, count(Int64(1))@1 as cnt]
-02)--FilterExec: count(Int64(1))@1 > 0
+02)--FilterExec: count(Int64(1))@1 > Int64(0)
 03)----AggregateExec: mode=FinalPartitioned, gby=[a@0 as a], aggr=[count(Int64(1))]
 04)------RepartitionExec: partitioning=Hash([a@0], 4), input_partitions=1
 05)--------AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[count(Int64(1))]

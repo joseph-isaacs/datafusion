@@ -40,7 +40,7 @@ physical_plan
 02)--UnnestExec
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 04)------ProjectionExec: expr=[column2@0 as __unnest_placeholder(v.column2)]
-05)--------FilterExec: column1@0 = 2, projection=[column2@1]
+05)--------FilterExec: column1@0 = Int64(2), projection=[column2@1]
 06)----------DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I
@@ -55,7 +55,7 @@ explain select uc2 from (select unnest(column2) as uc2, column1 from v) where uc
 ----
 physical_plan
 01)ProjectionExec: expr=[__unnest_placeholder(v.column2,depth=1)@0 as uc2]
-02)--FilterExec: __unnest_placeholder(v.column2,depth=1)@0 > 3
+02)--FilterExec: __unnest_placeholder(v.column2,depth=1)@0 > Int64(3)
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 04)------UnnestExec
 05)--------ProjectionExec: expr=[column2@0 as __unnest_placeholder(v.column2)]
@@ -73,11 +73,11 @@ explain select uc2, column1 from  (select unnest(column2) as uc2, column1 from v
 ----
 physical_plan
 01)ProjectionExec: expr=[__unnest_placeholder(v.column2,depth=1)@0 as uc2, column1@1 as column1]
-02)--FilterExec: __unnest_placeholder(v.column2,depth=1)@0 > 3
+02)--FilterExec: __unnest_placeholder(v.column2,depth=1)@0 > Int64(3)
 03)----UnnestExec
 04)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 05)--------ProjectionExec: expr=[column2@1 as __unnest_placeholder(v.column2), column1@0 as column1]
-06)----------FilterExec: column1@0 = 2
+06)----------FilterExec: column1@0 = Int64(2)
 07)------------DataSourceExec: partitions=1, partition_sizes=[1]
 
 query II
@@ -93,7 +93,7 @@ explain select uc2, column1 from  (select unnest(column2) as uc2, column1 from v
 ----
 physical_plan
 01)ProjectionExec: expr=[__unnest_placeholder(v.column2,depth=1)@0 as uc2, column1@1 as column1]
-02)--FilterExec: __unnest_placeholder(v.column2,depth=1)@0 > 3 OR column1@1 = 2
+02)--FilterExec: __unnest_placeholder(v.column2,depth=1)@0 > Int64(3) OR column1@1 = Int64(2)
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 04)------UnnestExec
 05)--------ProjectionExec: expr=[column2@1 as __unnest_placeholder(v.column2), column1@0 as column1]
@@ -116,9 +116,9 @@ explain select * from (select column1, unnest(column2) as o from d) where o['a']
 ----
 physical_plan
 01)ProjectionExec: expr=[column1@0 as column1, __unnest_placeholder(d.column2,depth=1)@1 as o]
-02)--FilterExec: __datafusion_extracted_1@0 = 1, projection=[column1@1, __unnest_placeholder(d.column2,depth=1)@2]
+02)--FilterExec: __datafusion_extracted_1@0 = Int64(1), projection=[column1@1, __unnest_placeholder(d.column2,depth=1)@2]
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-04)------ProjectionExec: expr=[get_field(__unnest_placeholder(d.column2,depth=1)@1, a) as __datafusion_extracted_1, column1@0 as column1, __unnest_placeholder(d.column2,depth=1)@1 as __unnest_placeholder(d.column2,depth=1)]
+04)------ProjectionExec: expr=[get_field(__unnest_placeholder(d.column2,depth=1)@1, Utf8("a")) as __datafusion_extracted_1, column1@0 as column1, __unnest_placeholder(d.column2,depth=1)@1 as __unnest_placeholder(d.column2,depth=1)]
 05)--------UnnestExec
 06)----------ProjectionExec: expr=[column1@0 as column1, column2@1 as __unnest_placeholder(d.column2)]
 07)------------DataSourceExec: partitions=1, partition_sizes=[1]
@@ -139,7 +139,7 @@ explain select * from (select unnest(column1) from d) where "d.column1.b" > 5;
 ----
 physical_plan
 01)ProjectionExec: expr=[__unnest_placeholder(d.column1).a@0 as d.column1.a, __unnest_placeholder(d.column1).b@1 as d.column1.b]
-02)--FilterExec: __unnest_placeholder(d.column1).b@1 > 5
+02)--FilterExec: __unnest_placeholder(d.column1).b@1 > Int64(5)
 03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 04)------UnnestExec
 05)--------ProjectionExec: expr=[column1@0 as __unnest_placeholder(d.column1)]

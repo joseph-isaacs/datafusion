@@ -957,7 +957,7 @@ logical_plan
 01)Projection: select_between_data.c1 >= Int64(2) AND select_between_data.c1 <= Int64(3) AS select_between_data.c1 BETWEEN Int64(2) AND Int64(3)
 02)--TableScan: select_between_data projection=[c1]
 physical_plan
-01)ProjectionExec: expr=[c1@0 >= 2 AND c1@0 <= 3 as select_between_data.c1 BETWEEN Int64(2) AND Int64(3)]
+01)ProjectionExec: expr=[c1@0 >= Int64(2) AND c1@0 <= Int64(3) as select_between_data.c1 BETWEEN Int64(2) AND Int64(3)]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # regression test: full i64 BETWEEN bounds should not overflow
@@ -1451,7 +1451,7 @@ logical_plan
 01)Sort: annotated_data_finite2.a ASC NULLS LAST
 02)--Projection: annotated_data_finite2.a, annotated_data_finite2.b, Int64(2)
 03)----TableScan: annotated_data_finite2 projection=[a, b]
-physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[a, b, 2 as Int64(2)], output_ordering=[a@0 ASC NULLS LAST, b@1 ASC NULLS LAST], file_type=csv, has_header=true
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[a, b, Int64(2) as Int64(2)], output_ordering=[a@0 ASC NULLS LAST, b@1 ASC NULLS LAST], file_type=csv, has_header=true
 
 # source is ordered by a,b,c
 # when filter result is constant for column a
@@ -1469,7 +1469,7 @@ logical_plan
 03)----TableScan: annotated_data_finite2 projection=[a0, a, b, c, d], partial_filters=[annotated_data_finite2.a = Int32(0)]
 physical_plan
 01)SortPreservingMergeExec: [b@2 ASC NULLS LAST, c@3 ASC NULLS LAST]
-02)--FilterExec: a@1 = 0
+02)--FilterExec: a@1 = Int32(0)
 03)----RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1, maintains_sort_order=true
 04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_ordering=[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST, c@3 ASC NULLS LAST], file_type=csv, has_header=true
 
@@ -1489,7 +1489,7 @@ logical_plan
 03)----TableScan: annotated_data_finite2 projection=[a0, a, b, c, d], partial_filters=[annotated_data_finite2.a = Int32(0), annotated_data_finite2.b = Int32(0)]
 physical_plan
 01)SortPreservingMergeExec: [c@3 ASC NULLS LAST]
-02)--FilterExec: a@1 = 0 AND b@2 = 0
+02)--FilterExec: a@1 = Int32(0) AND b@2 = Int32(0)
 03)----RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1, maintains_sort_order=true
 04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_ordering=[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST, c@3 ASC NULLS LAST], file_type=csv, has_header=true
 
@@ -1509,7 +1509,7 @@ logical_plan
 03)----TableScan: annotated_data_finite2 projection=[a0, a, b, c, d], partial_filters=[annotated_data_finite2.a = Int32(0), annotated_data_finite2.b = Int32(0)]
 physical_plan
 01)SortPreservingMergeExec: [b@2 ASC NULLS LAST, c@3 ASC NULLS LAST]
-02)--FilterExec: a@1 = 0 AND b@2 = 0
+02)--FilterExec: a@1 = Int32(0) AND b@2 = Int32(0)
 03)----RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1, maintains_sort_order=true
 04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_ordering=[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST, c@3 ASC NULLS LAST], file_type=csv, has_header=true
 
@@ -1529,7 +1529,7 @@ logical_plan
 03)----TableScan: annotated_data_finite2 projection=[a0, a, b, c, d], partial_filters=[annotated_data_finite2.a = Int32(0), annotated_data_finite2.b = Int32(0)]
 physical_plan
 01)SortPreservingMergeExec: [a@1 ASC NULLS LAST, b@2 ASC NULLS LAST, c@3 ASC NULLS LAST]
-02)--FilterExec: a@1 = 0 AND b@2 = 0
+02)--FilterExec: a@1 = Int32(0) AND b@2 = Int32(0)
 03)----RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1, maintains_sort_order=true
 04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_ordering=[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST, c@3 ASC NULLS LAST], file_type=csv, has_header=true
 
@@ -1550,7 +1550,7 @@ logical_plan
 physical_plan
 01)SortPreservingMergeExec: [c@3 ASC NULLS LAST]
 02)--SortExec: expr=[c@3 ASC NULLS LAST], preserve_partitioning=[true]
-03)----FilterExec: a@1 = 0 OR b@2 = 0
+03)----FilterExec: a@1 = Int32(0) OR b@2 = Int32(0)
 04)------RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1, maintains_sort_order=true
 05)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_ordering=[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST, c@3 ASC NULLS LAST], file_type=csv, has_header=true
 
@@ -1623,8 +1623,8 @@ logical_plan
 02)--Projection: t.x / Int64(2) AS __common_expr_1
 03)----TableScan: t projection=[x]
 physical_plan
-01)ProjectionExec: expr=[__common_expr_1@0 as t.x / Int64(2), __common_expr_1@0 + 1 as t.x / Int64(2) + Int64(1)]
-02)--ProjectionExec: expr=[x@0 / 2 as __common_expr_1]
+01)ProjectionExec: expr=[__common_expr_1@0 as t.x / Int64(2), __common_expr_1@0 + Int64(1) as t.x / Int64(2) + Int64(1)]
+02)--ProjectionExec: expr=[x@0 / Int64(2) as __common_expr_1]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 
 query II
@@ -1680,7 +1680,7 @@ logical_plan
 01)Projection: Int64(1) AS coalesce(Int64(1),t.y / t.x), Int64(2) AS coalesce(Int64(2),t.y / t.x)
 02)--TableScan: t projection=[]
 physical_plan
-01)ProjectionExec: expr=[1 as coalesce(Int64(1),t.y / t.x), 2 as coalesce(Int64(2),t.y / t.x)]
+01)ProjectionExec: expr=[Int64(1) as coalesce(Int64(1),t.y / t.x), Int64(2) as coalesce(Int64(2),t.y / t.x)]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1691,8 +1691,8 @@ logical_plan
 02)--Projection: t.y > Int32(0) AS __common_expr_1, t.x, t.y
 03)----TableScan: t projection=[x, y]
 physical_plan
-01)ProjectionExec: expr=[__common_expr_1@0 AND 1 / CAST(y@2 AS Int64) < 1 as t.y > Int64(0) AND Int64(1) / t.y < Int64(1), x@1 > 0 AND __common_expr_1@0 AND 1 / CAST(y@2 AS Int64) < 1 / CAST(x@1 AS Int64) as t.x > Int64(0) AND t.y > Int64(0) AND Int64(1) / t.y < Int64(1) / t.x]
-02)--ProjectionExec: expr=[y@1 > 0 as __common_expr_1, x@0 as x, y@1 as y]
+01)ProjectionExec: expr=[__common_expr_1@0 AND Int64(1) / CAST(y@2 AS Int64) < Int64(1) as t.y > Int64(0) AND Int64(1) / t.y < Int64(1), x@1 > Int32(0) AND __common_expr_1@0 AND Int64(1) / CAST(y@2 AS Int64) < Int64(1) / CAST(x@1 AS Int64) as t.x > Int64(0) AND t.y > Int64(0) AND Int64(1) / t.y < Int64(1) / t.x]
+02)--ProjectionExec: expr=[y@1 > Int32(0) as __common_expr_1, x@0 as x, y@1 as y]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1703,8 +1703,8 @@ logical_plan
 02)--Projection: t.y = Int32(0) AS __common_expr_1, t.x, t.y
 03)----TableScan: t projection=[x, y]
 physical_plan
-01)ProjectionExec: expr=[__common_expr_1@0 OR 1 / CAST(y@2 AS Int64) < 1 as t.y = Int64(0) OR Int64(1) / t.y < Int64(1), x@1 = 0 OR __common_expr_1@0 OR 1 / CAST(y@2 AS Int64) < 1 / CAST(x@1 AS Int64) as t.x = Int64(0) OR t.y = Int64(0) OR Int64(1) / t.y < Int64(1) / t.x]
-02)--ProjectionExec: expr=[y@1 = 0 as __common_expr_1, x@0 as x, y@1 as y]
+01)ProjectionExec: expr=[__common_expr_1@0 OR Int64(1) / CAST(y@2 AS Int64) < Int64(1) as t.y = Int64(0) OR Int64(1) / t.y < Int64(1), x@1 = Int32(0) OR __common_expr_1@0 OR Int64(1) / CAST(y@2 AS Int64) < Int64(1) / CAST(x@1 AS Int64) as t.x = Int64(0) OR t.y = Int64(0) OR Int64(1) / t.y < Int64(1) / t.x]
+02)--ProjectionExec: expr=[y@1 = Int32(0) as __common_expr_1, x@0 as x, y@1 as y]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 
 query II

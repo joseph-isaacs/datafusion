@@ -326,7 +326,7 @@ mod tests {
         let formatted = arrow::util::pretty::pretty_format_batches(&plan)
             .unwrap()
             .to_string();
-        assert!(formatted.contains("FilterExec: id@0 = 1"));
+        assert!(formatted.contains("FilterExec: id@0 = Int32(1)"));
         Ok(())
     }
 

@@ -1374,7 +1374,7 @@ logical_plan
 01)Filter: t1.c >= Date32("2024-01-01") AND t1.c < Date32("2025-01-01")
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 >= 2024-01-01 AND c@0 < 2025-01-01
+01)FilterExec: c@0 >= Date32("2024-01-01") AND c@0 < Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1384,7 +1384,7 @@ logical_plan
 01)Filter: t1.c < Date32("2024-01-01") OR t1.c >= Date32("2025-01-01")
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 < 2024-01-01 OR c@0 >= 2025-01-01
+01)FilterExec: c@0 < Date32("2024-01-01") OR c@0 >= Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1394,7 +1394,7 @@ logical_plan
 01)Filter: t1.c >= Date32("2025-01-01")
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 >= 2025-01-01
+01)FilterExec: c@0 >= Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1404,7 +1404,7 @@ logical_plan
 01)Filter: t1.c < Date32("2024-01-01")
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 < 2024-01-01
+01)FilterExec: c@0 < Date32("2024-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1414,7 +1414,7 @@ logical_plan
 01)Filter: t1.c >= Date32("2024-01-01")
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 >= 2024-01-01
+01)FilterExec: c@0 >= Date32("2024-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1424,7 +1424,7 @@ logical_plan
 01)Filter: t1.c < Date32("2025-01-01")
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 < 2025-01-01
+01)FilterExec: c@0 < Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1434,7 +1434,7 @@ logical_plan
 01)Filter: t1.c IS NOT NULL AND t1.c >= Date32("2024-01-01") AND t1.c < Date32("2025-01-01")
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 IS NOT NULL AND c@0 >= 2024-01-01 AND c@0 < 2025-01-01
+01)FilterExec: c@0 IS NOT NULL AND c@0 >= Date32("2024-01-01") AND c@0 < Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1444,7 +1444,7 @@ logical_plan
 01)Filter: t1.c < Date32("2024-01-01") OR t1.c >= Date32("2025-01-01") OR t1.c IS NULL
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 < 2024-01-01 OR c@0 >= 2025-01-01 OR c@0 IS NULL
+01)FilterExec: c@0 < Date32("2024-01-01") OR c@0 >= Date32("2025-01-01") OR c@0 IS NULL
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1454,7 +1454,7 @@ logical_plan
 01)Filter: t1.c >= Date32("1990-01-01") AND t1.c < Date32("1991-01-01") OR t1.c >= Date32("2024-01-01") AND t1.c < Date32("2025-01-01")
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 >= 1990-01-01 AND c@0 < 1991-01-01 OR c@0 >= 2024-01-01 AND c@0 < 2025-01-01
+01)FilterExec: c@0 >= Date32("1990-01-01") AND c@0 < Date32("1991-01-01") OR c@0 >= Date32("2024-01-01") AND c@0 < Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Simple optimizations, column on RHS
@@ -1513,7 +1513,7 @@ logical_plan
 01)Filter: date_part(Utf8("QUARTER"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(QUARTER, c@0) = 2024
+01)FilterExec: date_part(Utf8("QUARTER"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1523,7 +1523,7 @@ logical_plan
 01)Filter: date_part(Utf8("MONTH"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(MONTH, c@0) = 2024
+01)FilterExec: date_part(Utf8("MONTH"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1533,7 +1533,7 @@ logical_plan
 01)Filter: date_part(Utf8("WEEK"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(WEEK, c@0) = 2024
+01)FilterExec: date_part(Utf8("WEEK"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1543,7 +1543,7 @@ logical_plan
 01)Filter: date_part(Utf8("DAY"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(DAY, c@0) = 2024
+01)FilterExec: date_part(Utf8("DAY"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1553,7 +1553,7 @@ logical_plan
 01)Filter: date_part(Utf8("HOUR"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(HOUR, c@0) = 2024
+01)FilterExec: date_part(Utf8("HOUR"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1563,7 +1563,7 @@ logical_plan
 01)Filter: date_part(Utf8("MINUTE"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(MINUTE, c@0) = 2024
+01)FilterExec: date_part(Utf8("MINUTE"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1573,7 +1573,7 @@ logical_plan
 01)Filter: date_part(Utf8("SECOND"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(SECOND, c@0) = 2024
+01)FilterExec: date_part(Utf8("SECOND"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1583,7 +1583,7 @@ logical_plan
 01)Filter: date_part(Utf8("MILLISECOND"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(MILLISECOND, c@0) = 2024
+01)FilterExec: date_part(Utf8("MILLISECOND"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1593,7 +1593,7 @@ logical_plan
 01)Filter: date_part(Utf8("MICROSECOND"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(MICROSECOND, c@0) = 2024
+01)FilterExec: date_part(Utf8("MICROSECOND"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1603,7 +1603,7 @@ logical_plan
 01)Filter: date_part(Utf8("NANOSECOND"), t1.c) = Int64(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(NANOSECOND, c@0) = 2024
+01)FilterExec: date_part(Utf8("NANOSECOND"), c@0) = Int64(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1613,7 +1613,7 @@ logical_plan
 01)Filter: date_part(Utf8("DOW"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(DOW, c@0) = 2024
+01)FilterExec: date_part(Utf8("DOW"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1623,7 +1623,7 @@ logical_plan
 01)Filter: date_part(Utf8("DOY"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(DOY, c@0) = 2024
+01)FilterExec: date_part(Utf8("DOY"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1633,7 +1633,7 @@ logical_plan
 01)Filter: date_part(Utf8("EPOCH"), t1.c) = Float64(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(EPOCH, c@0) = 2024
+01)FilterExec: date_part(Utf8("EPOCH"), c@0) = Float64(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1643,7 +1643,7 @@ logical_plan
 01)Filter: date_part(Utf8("ISODOW"), t1.c) = Int32(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: date_part(ISODOW, c@0) = 2024
+01)FilterExec: date_part(Utf8("ISODOW"), c@0) = Int32(2024)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Simple optimize different datatypes
@@ -1732,7 +1732,7 @@ logical_plan
 01)Filter: t2.c1_date32 >= Date32("2024-01-01") AND t2.c1_date32 < Date32("2025-01-01")
 02)--TableScan: t2 projection=[c1_date32]
 physical_plan
-01)FilterExec: c1_date32@0 >= 2024-01-01 AND c1_date32@0 < 2025-01-01
+01)FilterExec: c1_date32@0 >= Date32("2024-01-01") AND c1_date32@0 < Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1742,7 +1742,7 @@ logical_plan
 01)Filter: t2.c1_date32 < Date32("2024-01-01") OR t2.c1_date32 >= Date32("2025-01-01")
 02)--TableScan: t2 projection=[c1_date32]
 physical_plan
-01)FilterExec: c1_date32@0 < 2024-01-01 OR c1_date32@0 >= 2025-01-01
+01)FilterExec: c1_date32@0 < Date32("2024-01-01") OR c1_date32@0 >= Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1752,7 +1752,7 @@ logical_plan
 01)Filter: t2.c2_ts_sec >= TimestampNanosecond(1735689600000000000, None)
 02)--TableScan: t2 projection=[c2_ts_sec]
 physical_plan
-01)FilterExec: c2_ts_sec@0 >= 1735689600000000000
+01)FilterExec: c2_ts_sec@0 >= TimestampNanosecond(1735689600000000000, None)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1762,7 +1762,7 @@ logical_plan
 01)Filter: t2.c3_ts_mili < TimestampNanosecond(1704067200000000000, None)
 02)--TableScan: t2 projection=[c3_ts_mili]
 physical_plan
-01)FilterExec: c3_ts_mili@0 < 1704067200000000000
+01)FilterExec: c3_ts_mili@0 < TimestampNanosecond(1704067200000000000, None)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1772,7 +1772,7 @@ logical_plan
 01)Filter: t2.c4_ts_micro >= TimestampNanosecond(1704067200000000000, None)
 02)--TableScan: t2 projection=[c4_ts_micro]
 physical_plan
-01)FilterExec: c4_ts_micro@0 >= 1704067200000000000
+01)FilterExec: c4_ts_micro@0 >= TimestampNanosecond(1704067200000000000, None)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1782,7 +1782,7 @@ logical_plan
 01)Filter: t2.c5_ts_nano < TimestampNanosecond(1735689600000000000, None)
 02)--TableScan: t2 projection=[c5_ts_nano]
 physical_plan
-01)FilterExec: c5_ts_nano@0 < 1735689600000000000
+01)FilterExec: c5_ts_nano@0 < TimestampNanosecond(1735689600000000000, None)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1792,7 +1792,7 @@ logical_plan
 01)Filter: t2.c1_date32 IS NOT NULL AND t2.c1_date32 >= Date32("2024-01-01") AND t2.c1_date32 < Date32("2025-01-01")
 02)--TableScan: t2 projection=[c1_date32]
 physical_plan
-01)FilterExec: c1_date32@0 IS NOT NULL AND c1_date32@0 >= 2024-01-01 AND c1_date32@0 < 2025-01-01
+01)FilterExec: c1_date32@0 IS NOT NULL AND c1_date32@0 >= Date32("2024-01-01") AND c1_date32@0 < Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -1802,7 +1802,7 @@ logical_plan
 01)Filter: t2.c1_date32 < Date32("2024-01-01") OR t2.c1_date32 >= Date32("2025-01-01") OR t2.c1_date32 IS NULL
 02)--TableScan: t2 projection=[c1_date32]
 physical_plan
-01)FilterExec: c1_date32@0 < 2024-01-01 OR c1_date32@0 >= 2025-01-01 OR c1_date32@0 IS NULL
+01)FilterExec: c1_date32@0 < Date32("2024-01-01") OR c1_date32@0 >= Date32("2025-01-01") OR c1_date32@0 IS NULL
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Preimage with timestamp with America/New_York timezone
@@ -1837,7 +1837,7 @@ logical_plan
 01)Filter: t3.c1_ts_tz >= TimestampNanosecond(1704085200000000000, Some("America/New_York")) AND t3.c1_ts_tz < TimestampNanosecond(1735707600000000000, Some("America/New_York"))
 02)--TableScan: t3 projection=[c1_ts_tz]
 physical_plan
-01)FilterExec: c1_ts_tz@0 >= 1704085200000000000 AND c1_ts_tz@0 < 1735707600000000000
+01)FilterExec: c1_ts_tz@0 >= TimestampNanosecond(1704085200000000000, Some("America/New_York")) AND c1_ts_tz@0 < TimestampNanosecond(1735707600000000000, Some("America/New_York"))
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 statement ok
@@ -1857,5 +1857,5 @@ logical_plan
 01)Filter: t1.c >= Date32("2024-01-01") AND t1.c < Date32("2025-01-01")
 02)--TableScan: t1 projection=[c]
 physical_plan
-01)FilterExec: c@0 >= 2024-01-01 AND c@0 < 2025-01-01
+01)FilterExec: c@0 >= Date32("2024-01-01") AND c@0 < Date32("2025-01-01")
 02)--DataSourceExec: partitions=1, partition_sizes=[1]

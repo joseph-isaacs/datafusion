@@ -30,7 +30,7 @@ logical_plan
 01)Filter: a.c0 < Int32(1)
 02)--TableScan: a projection=[c0]
 physical_plan
-01)FilterExec: c0@0 < 1
+01)FilterExec: c0@0 < Int32(1)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 ##
@@ -48,7 +48,7 @@ logical_plan
 01)Filter: a.c0 < Int32(1)
 02)--TableScan: a projection=[c0]
 physical_plan
-01)FilterExec: c0@0 < 1
+01)FilterExec: c0@0 < Int32(1)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 statement ok
@@ -70,7 +70,7 @@ logical_plan
 01)Filter: a.c0 < Int32(1)
 02)--TableScan: a projection=[c0]
 physical_plan
-01)FilterExec: c0@0 < 1
+01)FilterExec: c0@0 < Int32(1)
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 

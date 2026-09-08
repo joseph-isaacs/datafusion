@@ -128,7 +128,7 @@ query TT
 EXPLAIN ANALYZE SELECT * FROM rg_count_size_only WHERE id >= 0;
 ----
 Plan with Metrics
-01)FilterExec: id@0 >= 0<slt:ignore>
+01)FilterExec: id@0 >= Int64(0)<slt:ignore>
 02)--DataSourceExec: <slt:ignore>row_groups_pruned_statistics=5 total<slt:ignore>
 
 # Both limits set: the byte limit also flushes the sub-1000-row remainders that
@@ -149,7 +149,7 @@ query TT
 EXPLAIN ANALYZE SELECT * FROM rg_count_size_and_bytes WHERE id >= 0;
 ----
 Plan with Metrics
-01)FilterExec: id@0 >= 0<slt:ignore>
+01)FilterExec: id@0 >= Int64(0)<slt:ignore>
 02)--DataSourceExec: <slt:ignore>row_groups_pruned_statistics=8 total<slt:ignore>
 
 # Byte limit drives alone: the row-count limit is far larger than the data, so
@@ -170,7 +170,7 @@ query TT
 EXPLAIN ANALYZE SELECT * FROM rg_count_bytes_only WHERE id >= 0;
 ----
 Plan with Metrics
-01)FilterExec: id@0 >= 0<slt:ignore>
+01)FilterExec: id@0 >= Int64(0)<slt:ignore>
 02)--DataSourceExec: <slt:ignore>row_groups_pruned_statistics=4 total<slt:ignore>
 
 statement ok

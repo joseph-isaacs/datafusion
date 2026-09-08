@@ -335,10 +335,10 @@ fn pushes_global_limit_exec_through_projection_exec() -> Result<()> {
     let initial = format_plan(&global_limit);
     insta::assert_snapshot!(
         initial,
-        @r"
+        @"
     GlobalLimitExec: skip=0, fetch=5
       ProjectionExec: expr=[c1@0 as c1, c2@1 as c2, c3@2 as c3]
-        FilterExec: c3@2 > 0
+        FilterExec: c3@2 > Int32(0)
           StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
     "
     );
@@ -349,9 +349,9 @@ fn pushes_global_limit_exec_through_projection_exec() -> Result<()> {
     let optimized = format_plan(&after_optimize);
     insta::assert_snapshot!(
         optimized,
-        @r"
+        @"
     ProjectionExec: expr=[c1@0 as c1, c2@1 as c2, c3@2 as c3]
-      FilterExec: c3@2 > 0, fetch=5
+      FilterExec: c3@2 > Int32(0), fetch=5
         StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
     "
     );
@@ -418,10 +418,10 @@ fn keeps_pushed_local_limit_exec_when_there_are_multiple_input_partitions() -> R
     let initial = format_plan(&global_limit);
     insta::assert_snapshot!(
         initial,
-        @r"
+        @"
     GlobalLimitExec: skip=0, fetch=5
       CoalescePartitionsExec
-        FilterExec: c3@2 > 0
+        FilterExec: c3@2 > Int32(0)
           RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
             StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
     "
@@ -433,9 +433,9 @@ fn keeps_pushed_local_limit_exec_when_there_are_multiple_input_partitions() -> R
     let optimized = format_plan(&after_optimize);
     insta::assert_snapshot!(
         optimized,
-        @r"
+        @"
     CoalescePartitionsExec: fetch=5
-      FilterExec: c3@2 > 0, fetch=5
+      FilterExec: c3@2 > Int32(0), fetch=5
         RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
           StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
     "
@@ -704,8 +704,8 @@ fn no_limit_preserves_plan_identity() -> Result<()> {
     let optimized = format_plan(&optimized);
     insta::assert_snapshot!(
         optimized,
-        @r"
-    FilterExec: c3@2 > 0
+        @"
+    FilterExec: c3@2 > Int32(0)
       HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c1@0, c1@0)]
         EmptyExec
         EmptyExec

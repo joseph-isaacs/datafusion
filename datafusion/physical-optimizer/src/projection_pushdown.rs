@@ -474,11 +474,11 @@ mod test {
             JoinType::Inner,
         )?;
 
-        assert_snapshot!(optimized_plan, @r"
+        assert_snapshot!(optimized_plan, @"
         NestedLoopJoinExec: join_type=Inner, filter=join_proj_push_down_1@0 > join_proj_push_down_2@1, projection=[a@0, x@2]
-          ProjectionExec: expr=[a@0 as a, a@0 + 1 as join_proj_push_down_1]
+          ProjectionExec: expr=[a@0 as a, a@0 + Int32(1) as join_proj_push_down_1]
             EmptyExec
-          ProjectionExec: expr=[x@0 as x, x@0 + 1 as join_proj_push_down_2]
+          ProjectionExec: expr=[x@0 as x, x@0 + Int32(1) as join_proj_push_down_2]
             EmptyExec
         ");
         Ok(())
@@ -503,11 +503,11 @@ mod test {
             JoinType::Inner,
         )?;
 
-        assert_snapshot!(optimized_plan, @r"
-        NestedLoopJoinExec: join_type=Inner, filter=false AND join_proj_push_down_1@0 > join_proj_push_down_2@1, projection=[a@0, x@2]
-          ProjectionExec: expr=[a@0 as a, a@0 + 1 as join_proj_push_down_1]
+        assert_snapshot!(optimized_plan, @"
+        NestedLoopJoinExec: join_type=Inner, filter=Boolean(false) AND join_proj_push_down_1@0 > join_proj_push_down_2@1, projection=[a@0, x@2]
+          ProjectionExec: expr=[a@0 as a, a@0 + Int32(1) as join_proj_push_down_1]
             EmptyExec
-          ProjectionExec: expr=[x@0 as x, x@0 + 1 as join_proj_push_down_2]
+          ProjectionExec: expr=[x@0 as x, x@0 + Int32(1) as join_proj_push_down_2]
             EmptyExec
         ");
         Ok(())
@@ -592,11 +592,11 @@ mod test {
             JoinType::LeftSemi,
         )?;
 
-        assert_snapshot!(left_semi_join_plan, @r"
+        assert_snapshot!(left_semi_join_plan, @"
         NestedLoopJoinExec: join_type=LeftSemi, filter=join_proj_push_down_1@0 > join_proj_push_down_2@1, projection=[a@0]
-          ProjectionExec: expr=[a@0 as a, a@0 + 1 as join_proj_push_down_1]
+          ProjectionExec: expr=[a@0 as a, a@0 + Int32(1) as join_proj_push_down_1]
             EmptyExec
-          ProjectionExec: expr=[x@0 as x, x@0 + 1 as join_proj_push_down_2]
+          ProjectionExec: expr=[x@0 as x, x@0 + Int32(1) as join_proj_push_down_2]
             EmptyExec
         ");
         Ok(())
@@ -613,11 +613,11 @@ mod test {
             a_plus_one_greater_than_x_plus_one,
             JoinType::RightSemi,
         )?;
-        assert_snapshot!(right_semi_join_plan, @r"
+        assert_snapshot!(right_semi_join_plan, @"
         NestedLoopJoinExec: join_type=RightSemi, filter=join_proj_push_down_1@0 > join_proj_push_down_2@1, projection=[x@0]
-          ProjectionExec: expr=[a@0 as a, a@0 + 1 as join_proj_push_down_1]
+          ProjectionExec: expr=[a@0 as a, a@0 + Int32(1) as join_proj_push_down_1]
             EmptyExec
-          ProjectionExec: expr=[x@0 as x, x@0 + 1 as join_proj_push_down_2]
+          ProjectionExec: expr=[x@0 as x, x@0 + Int32(1) as join_proj_push_down_2]
             EmptyExec
         ");
         Ok(())

@@ -2761,13 +2761,13 @@ mod tests {
         let display_string = expr.to_string();
         assert_eq!(
             display_string,
-            "CASE WHEN a@0 = foo THEN 123.3 ELSE TRY_CAST(999 AS Float64) END"
+            "CASE WHEN a@0 = Utf8(\"foo\") THEN Float64(123.3) ELSE TRY_CAST(Int32(999) AS Float64) END"
         );
 
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         assert_eq!(
             sql_string,
-            "CASE WHEN a = foo THEN 123.3 ELSE TRY_CAST(999 AS Float64) END"
+            "CASE WHEN a = 'foo' THEN 123.3 ELSE TRY_CAST(999 AS Float64) END"
         );
 
         Ok(())
