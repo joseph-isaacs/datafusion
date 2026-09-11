@@ -133,7 +133,17 @@ impl ScalarUDFImpl for ArrayLength {
     }
 
     fn placement(&self, args: &[ExpressionPlacement]) -> ExpressionPlacement {
-        if args[0].should_push_to_leaves() {
+        let pushable = match args {
+            [array] => array.should_push_to_leaves(),
+            [array, dimension] => {
+                array.should_push_to_leaves()
+                    && (dimension.should_push_to_leaves()
+                        || matches!(dimension, ExpressionPlacement::Literal))
+            }
+            _ => false,
+        };
+
+        if pushable {
             ExpressionPlacement::MoveTowardsLeafNodes
         } else {
             ExpressionPlacement::KeepInPlace
@@ -252,6 +262,29 @@ mod tests {
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::Field;
     use datafusion_common::config::ConfigOptions;
+
+    #[test]
+    fn array_length_placement() {
+        use datafusion_expr::{col, lit};
+
+        let array_length = array_length_udf();
+
+        assert_eq!(
+            array_length.call(vec![col("a")]).placement(),
+            ExpressionPlacement::MoveTowardsLeafNodes,
+        );
+        assert_eq!(
+            array_length.call(vec![col("a"), lit(1i64)]).placement(),
+            ExpressionPlacement::MoveTowardsLeafNodes,
+        );
+
+        // Do not drag a costly dimension expression down with the array.
+        let dimension = datafusion_functions::string::btrim().call(vec![col("d")]);
+        assert_eq!(
+            array_length.call(vec![col("a"), dimension]).placement(),
+            ExpressionPlacement::KeepInPlace,
+        );
+    }
 
     fn check_slices(array: &dyn Array, expected: &UInt64Array) -> Result<()> {
         let udf = ArrayLength::new();
