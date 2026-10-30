@@ -1268,6 +1268,18 @@ impl FileScanConfig {
         let filter_may_change_row_count = self.file_source.filter().is_some()
             && self.statistics.num_rows != Precision::Exact(0);
         if filter_may_change_row_count {
+            // Estimate the pushed-down filter's selectivity as `FilterExec` would.
+            if let Some(filter) = self.file_source.filter()
+                && let Ok(stats) =
+                    datafusion_physical_plan::filter::FilterExec::statistics_helper(
+                        self.file_source.table_schema().table_schema(),
+                        self.statistics.clone(),
+                        &filter,
+                        20,
+                    )
+            {
+                return stats;
+            }
             self.statistics.clone().to_inexact()
         } else {
             self.statistics.clone()

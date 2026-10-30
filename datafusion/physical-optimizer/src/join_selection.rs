@@ -125,17 +125,18 @@ fn supports_collect_by_thresholds(
         return false;
     };
 
-    // Stats use `Precision<T>` to represent stats, where `Absent` means unknown.
-    // `Exact(0)` and `Inexact(0)` are both valid stats, and we should not treat
-    // them as unknown, `Absent` will return None (this is in regards to why
-    // `!=0` is not checked)
-    if let Some(byte_size) = stats.total_byte_size.get_value() {
-        *byte_size < threshold_byte_size
-    } else if let Some(num_rows) = stats.num_rows.get_value() {
-        *num_rows < threshold_num_rows
-    } else {
-        false
-    }
+    // `Absent` stats are unknown; `Exact(0)` and `Inexact(0)` are valid sizes.
+    // Either known limit is enough: a byte size alone must not veto a build side
+    // the row limit accepts.
+    let by_bytes = stats
+        .total_byte_size
+        .get_value()
+        .is_some_and(|b| *b < threshold_byte_size);
+    let by_rows = stats
+        .num_rows
+        .get_value()
+        .is_some_and(|r| *r < threshold_num_rows);
+    by_bytes || by_rows
 }
 
 impl PhysicalOptimizerRule for JoinSelection {

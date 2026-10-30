@@ -332,7 +332,7 @@ impl FilterExec {
     ///
     /// A contradictory predicate (e.g. `a = 1 AND a = 2`) yields zero rows and
     /// empty-column statistics.
-    pub(crate) fn statistics_helper(
+    pub fn statistics_helper(
         schema: &SchemaRef,
         input_stats: Statistics,
         predicate: &Arc<dyn PhysicalExpr>,
