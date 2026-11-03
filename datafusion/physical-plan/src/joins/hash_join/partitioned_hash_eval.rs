@@ -13,6 +13,8 @@ use arrow::{
 };
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::{create_hashes, with_hashes};
+
+use crate::joins::hash_join::exact_keys::exact_key_hashes;
 use datafusion_common::{Result, internal_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_expr_common::dyn_eq::DynHash;
@@ -416,7 +418,23 @@ impl HashTableLookupExpr {
         let mut partition_ids = Vec::with_capacity(num_rows);
         router.route(keys, maps.len(), &mut partition_ids)?;
 
-        with_hashes(keys, self.random_state.random_state(), |hashes| {
+        // All partitions of a join are built alike, so they agree on whether
+        // their keys are hashed exactly.
+        let mut exact = None;
+        for map in maps.iter().flatten() {
+            let Map::HashMap(map) = map.as_ref() else {
+                return internal_err!(
+                    "routed lookups only support hash table partitions"
+                );
+            };
+            let map_exact = map.exact_keys();
+            if *exact.get_or_insert(map_exact) != map_exact {
+                return internal_err!(
+                    "routed lookup partitions disagree on exact key hashing"
+                );
+            }
+        }
+        let probe = |hashes: &[u64]| -> Result<BooleanArray> {
             // Counting sort of the rows by partition, so each table is probed
             // once per batch over a contiguous run of its rows' hashes.
             let mut starts = vec![0usize; maps.len() + 1];
@@ -456,9 +474,25 @@ impl HashTableLookupExpr {
                 }
             }
             Ok(BooleanArray::new(matched.finish(), None))
-        })
+        };
+        if exact == Some(true) {
+            let mut hashes = vec![0; num_rows];
+            exact_key_hashes(keys, &mut hashes)?;
+            Ok(mask_null_keys(probe(&hashes)?, keys))
+        } else {
+            with_hashes(keys, self.random_state.random_state(), probe)
+        }
     }
 }
+/// Exact key hashes give NULL keys an arbitrary hash: report them as not
+/// contained, as the seeded hash does for a build side without NULL keys.
+fn mask_null_keys(contained: BooleanArray, keys: &[ArrayRef]) -> BooleanArray {
+    match keys.first().and_then(|k| k.logical_nulls()) {
+        Some(nulls) => BooleanArray::new(contained.values() & nulls.inner(), None),
+        None => contained,
+    }
+}
+
 impl std::fmt::Debug for HashTableLookupExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let cols = self
@@ -558,6 +592,13 @@ impl PhysicalExpr for HashTableLookupExpr {
 
         match &self.lookup {
             Lookup::Single(map) => match map.as_ref() {
+                // Hash the way the table was built, see `exact_keys`.
+                Map::HashMap(map) if map.exact_keys() => {
+                    let mut hashes = vec![0; batch.num_rows()];
+                    exact_key_hashes(&join_keys, &mut hashes)?;
+                    let array = mask_null_keys(map.contain_hashes(&hashes), &join_keys);
+                    Ok(ColumnarValue::Array(Arc::new(array)))
+                }
                 Map::HashMap(map) => {
                     with_hashes(&join_keys, self.random_state.random_state(), |hashes| {
                         let array = map.contain_hashes(hashes);
@@ -1115,18 +1156,27 @@ mod tests {
     }
 
     /// A hash table of `keys`, hashed with `random_state` as the build side
-    /// hashes them.
-    fn hash_table(keys: &ArrayRef, random_state: &SeededRandomState) -> Result<Arc<Map>> {
+    /// hashes them, or with exact key hashes.
+    fn hash_table(
+        keys: &ArrayRef,
+        random_state: &SeededRandomState,
+        exact: bool,
+    ) -> Result<Arc<Map>> {
         use crate::joins::join_hash_map::JoinHashMapType;
         let mut hashes = vec![0; keys.len()];
-        create_hashes([keys], random_state.random_state(), &mut hashes)?;
+        if exact {
+            exact_key_hashes(std::slice::from_ref(keys), &mut hashes)?;
+        } else {
+            create_hashes([keys], random_state.random_state(), &mut hashes)?;
+        }
         let mut map = JoinHashMapU32::with_capacity(keys.len());
+        map.set_exact_keys(exact);
         map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
         Ok(Arc::new(Map::HashMap(Box::new(map))))
     }
 
     /// One randomly generated scenario, see [`routed_lookup_fuzz`].
-    fn run_routed_lookup_scenario(seed: u64) -> Result<()> {
+    fn run_routed_lookup_scenario(seed: u64, exact: bool) -> Result<()> {
         use crate::repartition::{BatchPartitioner, REPARTITION_RANDOM_STATE};
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
@@ -1141,10 +1191,14 @@ mod tests {
             .map(|_| rng.random_bool(0.9).then(|| rng.random_range(-80..80)))
             .collect();
         let context = format!(
-            "seed {seed}: {num_partitions} partitions, {} build rows, {} probe rows",
+            "seed {seed}, exact {exact}: {num_partitions} partitions, {} build rows, {} probe rows",
             build.len(),
             probe.len()
         );
+        let expected: BooleanArray = probe
+            .iter()
+            .map(|p| Some(p.is_some_and(|v| build.contains(&v))))
+            .collect();
 
         let column: PhysicalExprRef = Arc::new(Column::new("a", 0));
         let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
@@ -1166,7 +1220,8 @@ mod tests {
         .partition(
             RecordBatch::try_new(schema, vec![Arc::clone(&build)])?,
             |partition, batch| {
-                maps[partition] = Some(hash_table(batch.column(0), &random_state)?);
+                maps[partition] =
+                    Some(hash_table(batch.column(0), &random_state, exact)?);
                 Ok(())
             },
         )?;
@@ -1183,16 +1238,13 @@ mod tests {
             vec![column],
             random_state.clone(),
             None,
-            vec![Some(hash_table(&build, &random_state)?)],
+            vec![Some(hash_table(&build, &random_state, exact)?)],
             "single".to_string(),
             None,
         )?;
 
-        assert_eq!(
-            lookup(&routed, &probe)?,
-            lookup(&single, &probe)?,
-            "{context}"
-        );
+        assert_eq!(lookup(&routed, &probe)?, expected, "routed, {context}");
+        assert_eq!(lookup(&single, &probe)?, expected, "single, {context}");
         Ok(())
     }
 
@@ -1215,7 +1267,8 @@ mod tests {
         let iterations = env_u64("DATAFUSION_ROUTED_LOOKUP_FUZZ_ITERATIONS", 256);
         // `saturating_add` so a replay seed near `u64::MAX` cannot overflow.
         for seed in first_seed..first_seed.saturating_add(iterations) {
-            run_routed_lookup_scenario(seed)?;
+            run_routed_lookup_scenario(seed, false)?;
+            run_routed_lookup_scenario(seed, true)?;
         }
         Ok(())
     }

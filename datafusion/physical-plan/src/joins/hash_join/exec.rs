@@ -18,6 +18,7 @@ use crate::filter_pushdown::{
 };
 use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
+use crate::joins::hash_join::exact_keys::{exact_key_hashes, supports_exact_keys};
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::not_in::{NotIn, NotInBuild};
 use crate::joins::hash_join::shared_bounds::{
@@ -32,7 +33,8 @@ use crate::joins::key_range_bitmap::KeyRangeBitmap;
 use crate::joins::probe_completion::{Completion, ProbeCompletion};
 use crate::joins::utils::{
     OnceAsync, OnceFut, asymmetric_join_output_partitioning, emits_unmatched_left_rows,
-    is_existence_join, reorder_output_after_swap, swap_join_projection, update_hash,
+    is_existence_join, matchable_join_keys, reorder_output_after_swap,
+    swap_join_projection, update_hash,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
 use crate::metrics::{Count, MetricBuilder, MetricCategory};
@@ -2907,6 +2909,31 @@ impl BuildSideState {
     }
 }
 
+/// Like [`update_hash`] for a build side, but hashes the single integer key
+/// with [`exact_key_hashes`] so the map can skip key comparisons.
+fn insert_exact_keys(
+    on: &[PhysicalExprRef],
+    batch: &RecordBatch,
+    hash_map: &mut dyn JoinHashMapType,
+    offset: usize,
+    hashes_buffer: &mut [u64],
+    null_equality: NullEquality,
+) -> Result<()> {
+    let keys_values = evaluate_expressions_to_arrays(on, batch)?;
+    exact_key_hashes(&keys_values, hashes_buffer)?;
+    hash_map.extend_zero(batch.num_rows());
+    let valid_keys = matchable_join_keys(&keys_values, null_equality);
+    let hash_values_iter = hashes_buffer
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| valid_keys.as_ref().is_none_or(|nulls| nulls.is_valid(*i)))
+        .map(|(i, val)| (i + offset, val));
+    // Reversed like `update_hash` with `fifo_hashmap`, so smaller row indices
+    // end up on top of the chains.
+    hash_map.update_from_iter(Box::new(hash_values_iter.rev()), 0);
+    Ok(())
+}
+
 /// Removes the join key pairs implied by the pairs before them.
 ///
 /// The pair `(l, r)` is redundant when an earlier kept pair `(kl, kr)` has
@@ -3285,6 +3312,16 @@ fn build_in_memory(
         // `u64` indice variant
         // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
         let mut hashmap = new_join_hashmap(num_rows, &mut reservation, metrics)?;
+        // Prepared builds are shared with joins planned later, and null-aware
+        // joins probe the map with their own hashes: keep the seeded hash.
+        let key_types = on_left
+            .iter()
+            .map(|key| key.data_type(schema))
+            .collect::<Result<Vec<_>>>()?;
+        let exact_keys = !prepared
+            && not_in.is_none()
+            && supports_exact_keys(&key_types, null_equality);
+        hashmap.set_exact_keys(exact_keys);
 
         let scratch_reservation = reservation.new_empty();
         if prepared {
@@ -3306,17 +3343,28 @@ fn build_in_memory(
             offset -= batch.num_rows();
             hashes_buffer.clear();
             hashes_buffer.resize(batch.num_rows(), 0);
-            update_hash(
-                on_left,
-                batch,
-                &mut *hashmap,
-                offset,
-                random_state,
-                &mut hashes_buffer,
-                0,
-                true,
-                null_equality,
-            )?;
+            if exact_keys {
+                insert_exact_keys(
+                    on_left,
+                    batch,
+                    &mut *hashmap,
+                    offset,
+                    &mut hashes_buffer,
+                    null_equality,
+                )?;
+            } else {
+                update_hash(
+                    on_left,
+                    batch,
+                    &mut *hashmap,
+                    offset,
+                    random_state,
+                    &mut hashes_buffer,
+                    0,
+                    true,
+                    null_equality,
+                )?;
+            }
         }
 
         hj_t_index = stats::elapsed(t);
@@ -3463,6 +3511,7 @@ fn build_in_memory(
     if stats::enabled() {
         let (map_kind, distinct) = match map.as_ref() {
             Map::ArrayMap(a) => ("array_map", a.num_of_distinct_key()),
+            Map::HashMap(h) if h.exact_keys() => ("exact_hash_map", h.len()),
             Map::HashMap(h) => ("hash_map", h.len()),
         };
         let key_nulls: usize = left_values.iter().map(|v| v.null_count()).sum();
@@ -3619,7 +3668,7 @@ mod tests {
     };
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
+    use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr, Literal};
     use datafusion_physical_expr::{
         EquivalenceProperties, PhysicalSortExpr, RangePartitioning, SplitPoint,
     };
@@ -11820,6 +11869,88 @@ mod tests {
             .with_null_aware_value_keys(if null_aware { 2 } else { 1 })
             .build()?;
         assert_eq!(join.on().len(), 2);
+        Ok(())
+    }
+
+    /// The keys of `left.a`/`right.b`, as is (exact hashing applies) or cast
+    /// to `Float64` (seeded hashing and key comparison).
+    fn exact_test_on(
+        left: &Arc<dyn ExecutionPlan>,
+        right: &Arc<dyn ExecutionPlan>,
+        cast: bool,
+    ) -> Result<JoinOn> {
+        let key =
+            |name: &str, plan: &Arc<dyn ExecutionPlan>| -> Result<PhysicalExprRef> {
+                let col: PhysicalExprRef =
+                    Arc::new(Column::new_with_schema(name, &plan.schema())?);
+                Ok(if cast {
+                    Arc::new(CastExpr::new(col, DataType::Float64, None))
+                } else {
+                    col
+                })
+            };
+        Ok(vec![(key("a", left)?, key("b", right)?)])
+    }
+
+    /// A single integer key joined through the hash map (perfect hash join
+    /// off) skips key comparisons, so it must produce exactly what the seeded
+    /// hash with key comparison produces, for every join type, with NULL,
+    /// duplicate and negative keys, and probe keys missing from the build side.
+    #[rstest]
+    #[tokio::test]
+    async fn exact_integer_keys_match_seeded_hash(
+        #[values(
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::LeftSemi,
+            JoinType::RightSemi,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+            JoinType::LeftMark,
+            JoinType::RightMark
+        )]
+        join_type: JoinType,
+        #[values(1, 3, 8192)] batch_size: usize,
+    ) -> Result<()> {
+        let left = build_table_two_cols(
+            (
+                "a",
+                &vec![Some(1), Some(-2), None, Some(1), Some(i32::MIN), Some(7)],
+            ),
+            (
+                "c",
+                &vec![Some(10), Some(20), Some(30), Some(40), Some(50), Some(60)],
+            ),
+        );
+        let right = build_table_two_cols(
+            (
+                "b",
+                &vec![Some(1), None, Some(-2), Some(i32::MIN), Some(8), Some(1)],
+            ),
+            (
+                "d",
+                &vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+            ),
+        );
+        let mut outputs = vec![];
+        for cast in [false, true] {
+            let join = join(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                exact_test_on(&left, &right, cast)?,
+                &join_type,
+                NullEquality::NullEqualsNothing,
+            )?;
+            let task_ctx = prepare_task_ctx(batch_size, false);
+            let batches = common::collect(join.execute(0, task_ctx)?).await?;
+            outputs.push(batches_to_sort_string(&batches));
+        }
+        assert_eq!(
+            outputs[0], outputs[1],
+            "{join_type:?}, batch size {batch_size}"
+        );
         Ok(())
     }
 }
