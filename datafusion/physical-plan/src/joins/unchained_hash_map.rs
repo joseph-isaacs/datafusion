@@ -12,16 +12,20 @@
 //!
 //! 1. **Count**: count the rows of each bucket, selected by the top bits of
 //!    the hash, and take a prefix sum.
-//! 2. **Scatter**: write each row's hash and index into dense arrays grouped
-//!    by bucket, so the candidates of a probe are contiguous in memory rather
-//!    than spread over a linked chain.
+//! 2. **Scatter**: write each row's `(hash, index)` entry into one dense
+//!    array grouped by bucket, so the candidates of a probe are contiguous in
+//!    memory rather than spread over a linked chain.
 //! 3. **Directory**: for each bucket, store its start offset in the upper 48
 //!    bits of a `u64` and a 16 bit Bloom filter of the bucket's hashes in the
 //!    lower 16 bits. Most probes that find no match are rejected by the filter
-//!    without touching the dense arrays.
+//!    without touching the entry array.
+//!
+//! Probes run in batches: the directory entries of a batch of probe rows are
+//! loaded and their buckets prefetched before any bucket is scanned, so the
+//! cache misses of different probe rows overlap.
 //!
 //! ```text
-//!  directory (2^k + 1 entries)        hashes / rows (one entry per build row)
+//!  directory (2^k + 1 entries)        entries: (hash, row), one per build row
 //!  ┌───────────────┬───────┐          ┌──────┬──────┬──────┬──────┬──────┐
 //!  │ start = 0     │ tag   │ ───────▶ │ h0   │ h0   │ h3   │ h7   │ ...  │
 //!  ├───────────────┼───────┤          ├──────┼──────┼──────┼──────┼──────┤
@@ -105,6 +109,30 @@ fn num_buckets(num_rows: usize) -> Option<usize> {
     num_rows.max(2).checked_next_power_of_two()
 }
 
+/// Number of probe rows whose directory entries are loaded, and whose buckets
+/// are prefetched, before any of their buckets is scanned.
+const PROBE_BATCH: usize = 64;
+
+/// A build row: its hash and its index in the build batch.
+#[derive(Clone, Copy, Default)]
+struct Entry<T> {
+    hash: u64,
+    row: T,
+}
+
+/// Hints the CPU to load the cache line holding `entry`.
+#[inline(always)]
+fn prefetch<T>(entry: *const Entry<T>) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching never faults, even for an invalid address.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(entry.cast());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = entry;
+}
+
 /// Unchained build side hash table, see the [module docs](self).
 ///
 /// # Public Only for Internal Use:
@@ -115,20 +143,20 @@ fn num_buckets(num_rows: usize) -> Option<usize> {
 #[doc(hidden)]
 pub struct UnchainedJoinHashMap<T: RowIndex> {
     /// Hashes of the inserted rows in insertion order, emptied by `finalize`.
+    /// Staged apart from `staged_rows` to keep the peak memory of the build
+    /// low: unlike an `Entry`, the pair has no padding.
     staged_hashes: Vec<u64>,
     /// Indices of the inserted rows in insertion order, emptied by `finalize`.
     staged_rows: Vec<T>,
     /// Bytes of staging memory sized by `with_capacity`, released by `finalize`.
     staging_size: usize,
-    /// `directory[b] >> 16` is the offset of bucket `b` in `hashes` and `rows`,
-    /// the low 16 bits are the Bloom filter of the bucket's hashes. The last
-    /// entry holds the total row count, so bucket `b` ends at the offset of
+    /// `directory[b] >> 16` is the offset of bucket `b` in `entries`, the low
+    /// 16 bits are the Bloom filter of the bucket's hashes. The last entry
+    /// holds the total row count, so bucket `b` ends at the offset of
     /// `directory[b + 1]`.
     directory: Vec<u64>,
-    /// Row hashes grouped by bucket.
-    hashes: Vec<u64>,
-    /// Row indices, parallel to `hashes`.
-    rows: Vec<T>,
+    /// Build rows grouped by bucket.
+    entries: Vec<Entry<T>>,
     /// `hash >> shift` is the bucket of `hash`.
     shift: u32,
     /// Number of distinct hash values.
@@ -142,17 +170,17 @@ pub type UnchainedJoinHashMapU32 = UnchainedJoinHashMap<u32>;
 pub type UnchainedJoinHashMapU64 = UnchainedJoinHashMap<u64>;
 
 impl<T: RowIndex> UnchainedJoinHashMap<T> {
-    const ROW_SIZE: usize = size_of::<u64>() + size_of::<T>();
+    const STAGED_ROW_SIZE: usize = size_of::<u64>() + size_of::<T>();
+    const ROW_SIZE: usize = size_of::<Entry<T>>();
 
     /// Creates a map that buffers up to `cap` rows without reallocating.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             staged_hashes: Vec::with_capacity(cap),
             staged_rows: Vec::with_capacity(cap),
-            staging_size: cap * Self::ROW_SIZE,
+            staging_size: cap * Self::STAGED_ROW_SIZE,
             directory: Vec::new(),
-            hashes: Vec::new(),
-            rows: Vec::new(),
+            entries: Vec::new(),
             shift: 63,
             distinct: 0,
             finalized: false,
@@ -169,26 +197,40 @@ impl<T: RowIndex> UnchainedJoinHashMap<T> {
             .and_then(|entries| entries.checked_mul(size_of::<u64>()))
             .ok_or_else(overflow)?;
         num_rows
-            .checked_mul(Self::ROW_SIZE)
-            .and_then(|rows| rows.checked_mul(2))
+            .checked_mul(Self::STAGED_ROW_SIZE + Self::ROW_SIZE)
             .and_then(|rows| rows.checked_add(directory))
             .and_then(|total| total.checked_add(size_of::<Self>()))
             .ok_or_else(overflow)
     }
 
-    /// Returns the range of `hashes` and `rows` that may contain `hash`, or
-    /// `None` if the Bloom filter rules it out.
+    /// Returns the range of `entries` that may contain `hash`. The range is
+    /// empty if the Bloom filter rules `hash` out.
     #[inline(always)]
-    fn candidates(&self, hash: u64) -> Option<(usize, usize)> {
+    fn candidates(&self, hash: u64) -> (usize, usize) {
         let bucket = (hash >> self.shift) as usize;
         let entry = self.directory[bucket];
+        let next = self.directory[bucket + 1];
         let tag = tag(hash);
-        if entry & tag != tag {
-            return None;
-        }
         let start = (entry >> TAG_BITS) as usize;
-        let end = (self.directory[bucket + 1] >> TAG_BITS) as usize;
-        Some((start, end))
+        let end = (next >> TAG_BITS) as usize;
+        // Branch free, so the directory loads of a batch overlap.
+        let end = if entry & tag == tag { end } else { start };
+        (start, end)
+    }
+
+    /// Fills `ranges` with the candidates of each hash in `hashes`, and
+    /// prefetches the first entry of each non-empty range.
+    #[inline(always)]
+    fn candidates_batch(&self, hashes: &[u64], ranges: &mut [(usize, usize)]) {
+        for (range, &hash) in ranges.iter_mut().zip(hashes) {
+            *range = self.candidates(hash);
+        }
+        let base = self.entries.as_ptr();
+        for &(start, end) in ranges[..hashes.len()].iter() {
+            if start < end {
+                prefetch(base.wrapping_add(start));
+            }
+        }
     }
 
     #[inline(always)]
@@ -211,20 +253,20 @@ impl<T: RowIndex> UnchainedJoinHashMap<T> {
         for &hash in &self.staged_hashes {
             directory[(hash >> shift) as usize + 1] += 1;
         }
-        for b in 1..=buckets {
-            directory[b] += directory[b - 1];
+        let mut sum = 0;
+        for end in &mut directory[1..] {
+            sum += *end;
+            *end = sum;
         }
 
         // Scatter: fill each bucket from its end in insertion order, which
         // leaves the rows in reverse insertion order and `directory[b + 1]`
         // at the start of bucket `b`.
-        let mut hashes = vec![0u64; num_rows];
-        let mut rows = vec![T::default(); num_rows];
+        let mut entries = vec![Entry::default(); num_rows];
         for (&hash, &row) in self.staged_hashes.iter().zip(&self.staged_rows) {
             let end = &mut directory[(hash >> shift) as usize + 1];
             *end -= 1;
-            hashes[*end as usize] = hash;
-            rows[*end as usize] = row;
+            entries[*end as usize] = Entry { hash, row };
         }
         self.staged_hashes = Vec::new();
         self.staged_rows = Vec::new();
@@ -238,20 +280,19 @@ impl<T: RowIndex> UnchainedJoinHashMap<T> {
             let end = directory[b + 1] as usize;
             let mut bloom = 0;
             for i in start..end {
-                bloom |= tag(hashes[i]);
-                if !hashes[start..i].contains(&hashes[i]) {
+                let hash = entries[i].hash;
+                bloom |= tag(hash);
+                if !entries[start..i].iter().any(|e| e.hash == hash) {
                     distinct += 1;
                 }
             }
             directory[b] = ((start as u64) << TAG_BITS) | bloom;
         }
         directory[buckets] <<= TAG_BITS;
-        debug_assert!(directory.iter().all(|e| e >> TAG_BITS <= num_rows as u64));
         debug_assert_eq!(directory[buckets] & TAG_MASK, 0);
 
         self.directory = directory;
-        self.hashes = hashes;
-        self.rows = rows;
+        self.entries = entries;
         self.distinct = distinct;
     }
 }
@@ -259,7 +300,7 @@ impl<T: RowIndex> UnchainedJoinHashMap<T> {
 impl<T: RowIndex> Debug for UnchainedJoinHashMap<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("UnchainedJoinHashMap")
-            .field("rows", &self.rows.len())
+            .field("rows", &self.entries.len())
             .field("buckets", &self.directory.len().saturating_sub(1))
             .field("distinct", &self.distinct)
             .finish()
@@ -310,12 +351,11 @@ impl<T: RowIndex> JoinHashMapType for UnchainedJoinHashMap<T> {
         let mut input_indices = vec![];
         let mut match_indices = vec![];
         for (row, &hash) in iter {
-            if let Some((start, end)) = self.candidates(hash) {
-                for i in start..end {
-                    if self.hashes[i] == hash {
-                        input_indices.push(row as u32);
-                        match_indices.push(self.rows[i].to_u64());
-                    }
+            let (start, end) = self.candidates(hash);
+            for entry in &self.entries[start..end] {
+                if entry.hash == hash {
+                    input_indices.push(row as u32);
+                    match_indices.push(entry.row.to_u64());
                 }
             }
         }
@@ -323,7 +363,11 @@ impl<T: RowIndex> JoinHashMapType for UnchainedJoinHashMap<T> {
     }
 
     /// A `MidChain { next, .. }` offset is the 1-based position in the dense
-    /// row arrays at which the scan of the probe row's bucket resumes.
+    /// entry array at which the scan of the probe row's bucket resumes.
+    ///
+    /// Probe rows are processed in batches of [`PROBE_BATCH`]: the directory
+    /// entries of the whole batch are loaded and its buckets prefetched first,
+    /// so their cache misses overlap, and then the buckets are scanned.
     fn get_matched_indices_with_limit_offset(
         &self,
         hash_values: &[u64],
@@ -337,53 +381,64 @@ impl<T: RowIndex> JoinHashMapType for UnchainedJoinHashMap<T> {
         input_indices.clear();
         match_indices.clear();
 
+        let num_probe_rows = hash_values.len();
         let mut remaining = limit;
-        let (mut row, mut resume) = match offset {
+        let (mut batch_start, mut resume) = match offset {
             AtRow { row } => (row, None),
             MidChain { row, next } => (row, Some(next as usize - 1)),
         };
-        let num_probe_rows = hash_values.len();
-        while row < num_probe_rows {
-            // NULL keys cannot match any build row. A resumed row has already
-            // passed this check.
-            let skip =
-                resume.is_none() && valid_keys.is_some_and(|valid| valid.is_null(row));
-            if !skip {
-                let hash = hash_values[row];
-                if let Some((start, end)) = self.candidates(hash) {
-                    let mut i = resume.unwrap_or(start);
-                    while i < end {
-                        if self.hashes[i] == hash {
-                            if remaining == 0 {
-                                return Some(MidChain {
-                                    row,
-                                    next: i as u64 + 1,
-                                });
-                            }
-                            input_indices.push(row as u32);
-                            match_indices.push(self.rows[i].to_u64());
-                            remaining -= 1;
+        let mut ranges = [(0usize, 0usize); PROBE_BATCH];
+
+        while batch_start < num_probe_rows {
+            let batch_end = (batch_start + PROBE_BATCH).min(num_probe_rows);
+            let batch = &hash_values[batch_start..batch_end];
+            self.candidates_batch(batch, &mut ranges);
+
+            for (k, (&hash, &(start, end))) in batch.iter().zip(&ranges).enumerate() {
+                let row = batch_start + k;
+                // A resumed row has already passed the NULL check.
+                let start = match resume.take() {
+                    Some(next) => next,
+                    // NULL keys cannot match any build row.
+                    None if valid_keys.is_some_and(|valid| valid.is_null(row)) => {
+                        continue;
+                    }
+                    None => start,
+                };
+                for (i, entry) in self.entries[start..end].iter().enumerate() {
+                    if entry.hash == hash {
+                        if remaining == 0 {
+                            return Some(MidChain {
+                                row,
+                                next: (start + i) as u64 + 1,
+                            });
                         }
-                        i += 1;
+                        input_indices.push(row as u32);
+                        match_indices.push(entry.row.to_u64());
+                        remaining -= 1;
                     }
                 }
+                if remaining == 0 {
+                    let next = row + 1;
+                    return (next < num_probe_rows).then_some(AtRow { row: next });
+                }
             }
-            resume = None;
-            row += 1;
-            if remaining == 0 {
-                return (row < num_probe_rows).then_some(AtRow { row });
-            }
+            batch_start = batch_end;
         }
         None
     }
 
     fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray {
         self.assert_finalized();
-        let buffer = BooleanBuffer::collect_bool(hash_values.len(), |i| {
-            let hash = hash_values[i];
-            self.candidates(hash)
-                .is_some_and(|(start, end)| self.hashes[start..end].contains(&hash))
-        });
+        let mut ranges = [(0usize, 0usize); PROBE_BATCH];
+        let mut found = Vec::with_capacity(hash_values.len());
+        for batch in hash_values.chunks(PROBE_BATCH) {
+            self.candidates_batch(batch, &mut ranges);
+            found.extend(batch.iter().zip(&ranges).map(|(&hash, &(start, end))| {
+                self.entries[start..end].iter().any(|e| e.hash == hash)
+            }));
+        }
+        let buffer = BooleanBuffer::collect_bool(found.len(), |i| found[i]);
         BooleanArray::new(buffer, None)
     }
 
