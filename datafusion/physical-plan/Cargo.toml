@@ -81,6 +81,7 @@ datafusion-proto-models = { workspace = true, optional = true }
 futures = { workspace = true }
 half = { workspace = true }
 hashbrown = { workspace = true }
+hashbrown-pipelined = { path = "../../vendor/hashbrown-pipelined" }
 indexmap = { workspace = true }
 itertools = { workspace = true, features = ["use_std"] }
 log = { workspace = true }

@@ -16,6 +16,7 @@
 # under the License.
 
 [workspace]
+exclude = ["vendor/hashbrown-pipelined"]
 members = [
     "datafusion/common",
     "datafusion/common-runtime",

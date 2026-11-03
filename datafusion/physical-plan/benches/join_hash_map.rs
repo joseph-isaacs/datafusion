@@ -10,6 +10,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use datafusion_physical_plan::joins::join_hash_map::{
     JoinHashMapType, JoinHashMapU32, ProbeOffset,
 };
+use datafusion_physical_plan::joins::pipelined_hash_map::PipelinedJoinHashMapU32;
 use datafusion_physical_plan::joins::unchained_hash_map::UnchainedJoinHashMapU32;
 use std::hint::black_box;
 
@@ -45,6 +46,12 @@ fn hashes(build_rows: usize, dups: usize, hit_percent: u64) -> (Vec<u64>, Vec<u6
 
 fn build_chained(build: &[u64]) -> JoinHashMapU32 {
     let mut map = JoinHashMapU32::with_capacity(build.len());
+    map.update_from_iter(Box::new(build.iter().enumerate().rev()), 0);
+    map
+}
+
+fn build_pipelined(build: &[u64]) -> PipelinedJoinHashMapU32 {
+    let mut map = PipelinedJoinHashMapU32::with_capacity(build.len());
     map.update_from_iter(Box::new(build.iter().enumerate().rev()), 0);
     map
 }
@@ -109,6 +116,11 @@ fn bench(c: &mut Criterion) {
 
         let chained = build_chained(&build);
         let unchained = build_unchained(&build);
+        let pipelined = build_pipelined(&build);
+        assert_eq!(
+            probe(&chained, &probe_hashes),
+            probe(&pipelined, &probe_hashes)
+        );
         assert_eq!(
             probe(&chained, &probe_hashes),
             probe(&unchained, &probe_hashes)
@@ -120,11 +132,17 @@ fn bench(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("chained", &name), |b| {
             b.iter(|| probe(&chained, black_box(&probe_hashes)))
         });
+        group.bench_function(BenchmarkId::new("pipelined", &name), |b| {
+            b.iter(|| probe(&pipelined, black_box(&probe_hashes)))
+        });
         group.bench_function(BenchmarkId::new("unchained", &name), |b| {
             b.iter(|| probe(&unchained, black_box(&probe_hashes)))
         });
         group.bench_function(BenchmarkId::new("chained_contains", &name), |b| {
             b.iter(|| chained.contain_hashes(black_box(&probe_hashes)))
+        });
+        group.bench_function(BenchmarkId::new("pipelined_contains", &name), |b| {
+            b.iter(|| pipelined.contain_hashes(black_box(&probe_hashes)))
         });
         group.bench_function(BenchmarkId::new("unchained_contains", &name), |b| {
             b.iter(|| unchained.contain_hashes(black_box(&probe_hashes)))
