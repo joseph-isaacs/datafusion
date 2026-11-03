@@ -20,13 +20,15 @@
 use std::{fmt::Display, hash::Hash, sync::Arc};
 
 use arrow::{
-    array::{ArrayRef, UInt64Array},
+    array::{ArrayRef, BooleanArray, UInt64Array},
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
 use datafusion_common::Result;
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::{create_hashes, with_hashes};
+
+use crate::joins::hash_join::exact_keys::exact_key_hashes;
 #[cfg(feature = "proto")]
 use datafusion_common::internal_err;
 use datafusion_expr::ColumnarValue;
@@ -344,6 +346,15 @@ impl Display for HashTableLookupExpr {
     }
 }
 
+/// Exact key hashes give NULL keys an arbitrary hash: report them as not
+/// contained, as the seeded hash does for a build side without NULL keys.
+fn mask_null_keys(contained: BooleanArray, keys: &[ArrayRef]) -> BooleanArray {
+    match keys.first().and_then(|k| k.logical_nulls()) {
+        Some(nulls) => BooleanArray::new(contained.values() & nulls.inner(), None),
+        None => contained,
+    }
+}
+
 impl PhysicalExpr for HashTableLookupExpr {
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         self.on_columns.iter().collect()
@@ -374,6 +385,13 @@ impl PhysicalExpr for HashTableLookupExpr {
         let join_keys = evaluate_columns(&self.on_columns, batch)?;
 
         match self.map.as_ref() {
+            // Hash the way the table was built, see `exact_keys`.
+            Map::HashMap(map) if map.exact_keys() => {
+                let mut hashes = vec![0; batch.num_rows()];
+                exact_key_hashes(&join_keys, &mut hashes)?;
+                let array = mask_null_keys(map.contain_hashes(&hashes), &join_keys);
+                Ok(ColumnarValue::Array(Arc::new(array)))
+            }
             Map::HashMap(map) => {
                 with_hashes(&join_keys, self.random_state.random_state(), |hashes| {
                     let array = map.contain_hashes(hashes);
