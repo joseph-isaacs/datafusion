@@ -32,6 +32,7 @@ use crate::filter_pushdown::{
 };
 use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
+use crate::joins::hash_join::exact_keys::{exact_key_hashes, supports_exact_keys};
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::shared_bounds::{
     ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
@@ -41,8 +42,8 @@ use crate::joins::hash_join::stream::{
 };
 use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 use crate::joins::utils::{
-    OnceAsync, OnceFut, asymmetric_join_output_partitioning, reorder_output_after_swap,
-    swap_join_projection, update_hash,
+    OnceAsync, OnceFut, asymmetric_join_output_partitioning, matchable_join_keys,
+    reorder_output_after_swap, swap_join_projection, update_hash,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
 use crate::metrics::{Count, MetricBuilder, MetricCategory};
@@ -1522,6 +1523,7 @@ impl ExecutionPlan for HashJoinExec {
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
+                    self.null_aware,
                     array_map_created_count,
                 ))
             })?,
@@ -1542,6 +1544,7 @@ impl ExecutionPlan for HashJoinExec {
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
+                    self.null_aware,
                     array_map_created_count,
                 ))
             }
@@ -2248,6 +2251,30 @@ fn should_collect_min_max_for_perfect_hash(
     Ok(ArrayMap::is_supported_type(&data_type))
 }
 
+/// Like [`update_hash`] for a build side, but hashes the single integer key
+/// with [`exact_key_hashes`] so the map can skip key comparisons.
+fn insert_exact_keys(
+    on: &[PhysicalExprRef],
+    batch: &RecordBatch,
+    hash_map: &mut dyn JoinHashMapType,
+    offset: usize,
+    hashes_buffer: &mut [u64],
+    null_equality: NullEquality,
+) -> Result<()> {
+    let keys_values = evaluate_expressions_to_arrays(on, batch)?;
+    exact_key_hashes(&keys_values, hashes_buffer)?;
+    hash_map.extend_zero(batch.num_rows());
+    let valid_keys = matchable_join_keys(&keys_values, null_equality);
+    let hash_values_iter = hashes_buffer
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| valid_keys.as_ref().is_none_or(|nulls| nulls.is_valid(*i)))
+        .map(|(i, val)| (i + offset, val));
+    // Reversed like `update_hash` with `fifo_hashmap`.
+    hash_map.update_from_iter(Box::new(hash_values_iter.rev()), 0);
+    Ok(())
+}
+
 /// Collects all batches from the left (build) side stream and creates a hash map for joining.
 ///
 /// This function is responsible for:
@@ -2288,6 +2315,7 @@ async fn collect_left_input(
     should_compute_dynamic_filters: bool,
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
+    null_aware: bool,
     array_map_created_count: Count,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
@@ -2388,6 +2416,15 @@ async fn collect_left_input(
                 Box::new(JoinHashMapU32::with_capacity(num_rows))
             };
 
+            // Null-aware joins keep the seeded hash.
+            let key_types = on_left
+                .iter()
+                .map(|key| key.data_type(&schema))
+                .collect::<Result<Vec<_>>>()?;
+            let exact_keys =
+                !null_aware && supports_exact_keys(&key_types, null_equality);
+            hashmap.set_exact_keys(exact_keys);
+
             let mut hashes_buffer = Vec::new();
             let mut offset = 0;
 
@@ -2397,17 +2434,28 @@ async fn collect_left_input(
             for batch in batches_iter.clone() {
                 hashes_buffer.clear();
                 hashes_buffer.resize(batch.num_rows(), 0);
-                update_hash(
-                    &on_left,
-                    batch,
-                    &mut *hashmap,
-                    offset,
-                    &random_state,
-                    &mut hashes_buffer,
-                    0,
-                    true,
-                    null_equality,
-                )?;
+                if exact_keys {
+                    insert_exact_keys(
+                        &on_left,
+                        batch,
+                        &mut *hashmap,
+                        offset,
+                        &mut hashes_buffer,
+                        null_equality,
+                    )?;
+                } else {
+                    update_hash(
+                        &on_left,
+                        batch,
+                        &mut *hashmap,
+                        offset,
+                        &random_state,
+                        &mut hashes_buffer,
+                        0,
+                        true,
+                        null_equality,
+                    )?;
+                }
                 offset += batch.num_rows();
             }
 
@@ -2545,7 +2593,7 @@ mod tests {
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
+    use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr, Literal};
     use datafusion_physical_expr::{
         EquivalenceProperties, PhysicalSortExpr, RangePartitioning, SplitPoint,
     };
@@ -7480,6 +7528,88 @@ mod tests {
             return Ok(());
         };
         assert_eq!(join.on().len(), 2);
+        Ok(())
+    }
+
+    /// The keys of `left.a`/`right.b`, as is (exact hashing applies) or cast
+    /// to `Float64` (seeded hashing and key comparison).
+    fn exact_test_on(
+        left: &Arc<dyn ExecutionPlan>,
+        right: &Arc<dyn ExecutionPlan>,
+        cast: bool,
+    ) -> Result<JoinOn> {
+        let key =
+            |name: &str, plan: &Arc<dyn ExecutionPlan>| -> Result<PhysicalExprRef> {
+                let col: PhysicalExprRef =
+                    Arc::new(Column::new_with_schema(name, &plan.schema())?);
+                Ok(if cast {
+                    Arc::new(CastExpr::new(col, DataType::Float64, None))
+                } else {
+                    col
+                })
+            };
+        Ok(vec![(key("a", left)?, key("b", right)?)])
+    }
+
+    /// A single integer key joined through the hash map (perfect hash join
+    /// off) skips key comparisons, so it must produce exactly what the seeded
+    /// hash with key comparison produces, for every join type, with NULL,
+    /// duplicate and negative keys, and probe keys missing from the build side.
+    #[rstest]
+    #[tokio::test]
+    async fn exact_integer_keys_match_seeded_hash(
+        #[values(
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::LeftSemi,
+            JoinType::RightSemi,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+            JoinType::LeftMark,
+            JoinType::RightMark
+        )]
+        join_type: JoinType,
+        #[values(1, 3, 8192)] batch_size: usize,
+    ) -> Result<()> {
+        let left = build_table_two_cols(
+            (
+                "a",
+                &vec![Some(1), Some(-2), None, Some(1), Some(i32::MIN), Some(7)],
+            ),
+            (
+                "c",
+                &vec![Some(10), Some(20), Some(30), Some(40), Some(50), Some(60)],
+            ),
+        );
+        let right = build_table_two_cols(
+            (
+                "b",
+                &vec![Some(1), None, Some(-2), Some(i32::MIN), Some(8), Some(1)],
+            ),
+            (
+                "d",
+                &vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+            ),
+        );
+        let mut outputs = vec![];
+        for cast in [false, true] {
+            let join = join(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                exact_test_on(&left, &right, cast)?,
+                &join_type,
+                NullEquality::NullEqualsNothing,
+            )?;
+            let task_ctx = prepare_task_ctx(batch_size, false);
+            let batches = common::collect(join.execute(0, task_ctx)?).await?;
+            outputs.push(batches_to_sort_string(&batches));
+        }
+        assert_eq!(
+            outputs[0], outputs[1],
+            "{join_type:?}, batch size {batch_size}"
+        );
         Ok(())
     }
 }

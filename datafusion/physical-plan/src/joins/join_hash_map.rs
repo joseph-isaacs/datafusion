@@ -139,6 +139,17 @@ pub trait JoinHashMapType: Send + Sync {
 
     /// Returns the number of entries in the join hash map.
     fn len(&self) -> usize;
+
+    /// Whether rows were inserted with exact key hashes (see
+    /// `hash_join::exact_keys`): equal hashes then imply equal keys, so a
+    /// lookup's candidates need no key comparison, and every lookup must hash
+    /// its keys the same way.
+    fn exact_keys(&self) -> bool {
+        false
+    }
+
+    /// Marks the map as holding exact key hashes. Call before inserting rows.
+    fn set_exact_keys(&mut self, _exact: bool) {}
 }
 
 pub struct JoinHashMapU32 {
@@ -146,18 +157,25 @@ pub struct JoinHashMapU32 {
     map: HashTable<(u64, u32)>,
     // Stores indices in chained list data structure
     next: Vec<u32>,
+    // Whether hashes are exact keys, see `JoinHashMapType::exact_keys`
+    exact_keys: bool,
 }
 
 impl JoinHashMapU32 {
     #[cfg(test)]
     pub(crate) fn new(map: HashTable<(u64, u32)>, next: Vec<u32>) -> Self {
-        Self { map, next }
+        Self {
+            map,
+            next,
+            exact_keys: false,
+        }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             map: HashTable::with_capacity(cap),
             next: vec![0; cap],
+            exact_keys: false,
         }
     }
 }
@@ -219,6 +237,14 @@ impl JoinHashMapType for JoinHashMapU32 {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn exact_keys(&self) -> bool {
+        self.exact_keys
+    }
+
+    fn set_exact_keys(&mut self, exact: bool) {
+        self.exact_keys = exact;
+    }
 }
 
 pub struct JoinHashMapU64 {
@@ -226,18 +252,25 @@ pub struct JoinHashMapU64 {
     map: HashTable<(u64, u64)>,
     // Stores indices in chained list data structure
     next: Vec<u64>,
+    // Whether hashes are exact keys, see `JoinHashMapType::exact_keys`
+    exact_keys: bool,
 }
 
 impl JoinHashMapU64 {
     #[cfg(test)]
     pub(crate) fn new(map: HashTable<(u64, u64)>, next: Vec<u64>) -> Self {
-        Self { map, next }
+        Self {
+            map,
+            next,
+            exact_keys: false,
+        }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             map: HashTable::with_capacity(cap),
             next: vec![0; cap],
+            exact_keys: false,
         }
     }
 }
@@ -298,6 +331,14 @@ impl JoinHashMapType for JoinHashMapU64 {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn exact_keys(&self) -> bool {
+        self.exact_keys
+    }
+
+    fn set_exact_keys(&mut self, exact: bool) {
+        self.exact_keys = exact;
     }
 }
 
