@@ -26,7 +26,9 @@ use crate::joins::hash_join::shared_bounds::{
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
+use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 use crate::joins::key_range_bitmap::KeyRangeBitmap;
+use crate::joins::pipelined_hash_map::PipelinedJoinHashMapU32;
 use crate::joins::probe_completion::{Completion, ProbeCompletion};
 use crate::joins::unchained_hash_map::{
     UnchainedJoinHashMapU32, UnchainedJoinHashMapU64,
@@ -71,7 +73,7 @@ use datafusion_common::float_semantics::normalize_floats;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::utils::memory::{
-    RecordBatchMemoryCounter, get_record_batch_memory_size,
+    RecordBatchMemoryCounter, estimate_memory_size, get_record_batch_memory_size,
 };
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
@@ -2918,17 +2920,69 @@ pub(super) fn new_join_hashmap(
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
 ) -> Result<Box<dyn JoinHashMapType>> {
-    if num_rows > u32::MAX as usize {
-        let estimated_size = UnchainedJoinHashMapU64::estimate_memory_size(num_rows)?;
-        reservation.try_grow(estimated_size)?;
-        metrics.build_mem_used.add(estimated_size);
-        Ok(Box::new(UnchainedJoinHashMapU64::with_capacity(num_rows)))
-    } else {
-        let estimated_size = UnchainedJoinHashMapU32::estimate_memory_size(num_rows)?;
-        reservation.try_grow(estimated_size)?;
-        metrics.build_mem_used.add(estimated_size);
-        Ok(Box::new(UnchainedJoinHashMapU32::with_capacity(num_rows)))
-    }
+    let wide = num_rows > u32::MAX as usize;
+    let (estimated_size, map): (usize, Box<dyn JoinHashMapType>) =
+        match (join_hash_map_kind(), wide) {
+            (JoinHashMapKind::Unchained, true) => (
+                UnchainedJoinHashMapU64::estimate_memory_size(num_rows)?,
+                Box::new(UnchainedJoinHashMapU64::with_capacity(num_rows)),
+            ),
+            (JoinHashMapKind::Unchained, false) => (
+                UnchainedJoinHashMapU32::estimate_memory_size(num_rows)?,
+                Box::new(UnchainedJoinHashMapU32::with_capacity(num_rows)),
+            ),
+            (_, true) => (
+                chained_memory_size::<u64>(num_rows, size_of::<JoinHashMapU64>())?,
+                Box::new(JoinHashMapU64::with_capacity(num_rows)),
+            ),
+            (JoinHashMapKind::Chained, false) => (
+                chained_memory_size::<u32>(num_rows, size_of::<JoinHashMapU32>())?,
+                Box::new(JoinHashMapU32::with_capacity(num_rows)),
+            ),
+            (JoinHashMapKind::Pipelined, false) => (
+                chained_memory_size::<u32>(
+                    num_rows,
+                    size_of::<PipelinedJoinHashMapU32>(),
+                )?,
+                Box::new(PipelinedJoinHashMapU32::with_capacity(num_rows)),
+            ),
+        };
+    reservation.try_grow(estimated_size)?;
+    metrics.build_mem_used.add(estimated_size);
+    Ok(map)
+}
+
+/// Build side hash map implementation, chosen by the experimental
+/// `DATAFUSION_JOIN_HASH_MAP` environment variable: `chained` (the hashbrown
+/// based `JoinHashMapU32`), `pipelined` (the same on the prefetching hashbrown
+/// fork) or `unchained` (the default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinHashMapKind {
+    Chained,
+    Pipelined,
+    Unchained,
+}
+
+fn join_hash_map_kind() -> JoinHashMapKind {
+    static KIND: OnceLock<JoinHashMapKind> = OnceLock::new();
+    *KIND.get_or_init(
+        || match std::env::var("DATAFUSION_JOIN_HASH_MAP").as_deref() {
+            Ok("chained") => JoinHashMapKind::Chained,
+            Ok("pipelined") => JoinHashMapKind::Pipelined,
+            _ => JoinHashMapKind::Unchained,
+        },
+    )
+}
+
+/// Memory of a chained hashbrown map with `T` row indices for `num_rows` rows,
+/// the estimate used before the unchained map.
+fn chained_memory_size<T>(num_rows: usize, fixed_size: usize) -> Result<usize> {
+    estimate_memory_size::<(u64, T)>(num_rows, fixed_size)?
+        // Each build row also owns an index in the duplicate-key chain.
+        .checked_add(num_rows * size_of::<T>())
+        .ok_or_else(|| {
+            datafusion_common::exec_datafusion_err!("Hash join table size overflow")
+        })
 }
 
 /// Finishes a map created by [`new_join_hashmap`] and releases its build-time
@@ -3414,7 +3468,6 @@ fn build_in_memory(
 mod tests {
     use super::*;
     use crate::joins::hash_join::not_in::{NotInOutput, NotInScope};
-    use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 
     fn assert_phj_used(metrics: &MetricsSet, use_phj: bool) {
         if use_phj {
