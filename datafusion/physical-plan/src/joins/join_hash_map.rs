@@ -7,6 +7,7 @@
 //! ["on" values] to a list of indices with this key's value.
 
 use std::fmt::{self, Debug};
+use std::marker::PhantomData;
 use std::ops::Sub;
 
 use arrow::array::BooleanArray;
@@ -455,25 +456,86 @@ where
     }
 }
 
-/// How many rows ahead of the current insert to load. Far enough to hide a
-/// DRAM access behind the inserts in between, near enough that the loaded
+/// How many rows ahead of the current insert to prefetch. Far enough to hide a
+/// DRAM access behind the inserts in between, near enough that the prefetched
 /// lines are still cached when their row is reached.
 const PREFETCH_DISTANCE: usize = 16;
 
-/// Loads the control byte and, if occupied, the bucket at the home position of
-/// `hash` in `map`, so that a later insert or lookup of `hash` finds them in
-/// cache. The loads are independent of the work that follows, so an
-/// out-of-order CPU overlaps their cache misses with it.
+/// Prefetches the memory that inserting or looking up a hash in a
+/// [`HashTable`] touches first: the control byte group and the bucket at the
+/// hash's home position.
 ///
-/// A probe for `hash` starts at bucket `hash & (num_buckets - 1)` in the
-/// current `hashbrown`. Were that to change, the loads would touch unrelated
-/// buckets: only performance would suffer.
-#[inline(always)]
-fn touch_home_bucket<T: Copy>(map: &HashTable<(u64, T)>, hash: u64) {
-    let pos = (hash as usize) & (map.num_buckets() - 1);
-    if let Some(&(bucket_hash, _)) = map.get_bucket(pos) {
-        std::hint::black_box(bucket_hash);
+/// `HashTable` has no prefetch API, so the addresses are derived from its
+/// current layout: buckets are stored in reverse order just before the control
+/// bytes, bucket `i` at `data_end - (i + 1)`, and a probe for `hash` starts at
+/// position `hash & (num_buckets - 1)`. The address of an occupied bucket and
+/// its index give `data_end`. If a later `hashbrown` changes the layout, the
+/// prefetches miss and only performance suffers: a prefetch is a hint that
+/// never faults, whatever the address.
+struct BucketPrefetcher<E> {
+    /// Address of the end of the bucket array, also the start of the control
+    /// bytes. `None` until an occupied bucket is seen.
+    data_end: Option<usize>,
+    bucket_mask: usize,
+    _bucket: PhantomData<E>,
+}
+
+impl<E> BucketPrefetcher<E> {
+    fn new(map: &HashTable<E>) -> Self {
+        let mut prefetcher = Self {
+            data_end: None,
+            bucket_mask: 0,
+            _bucket: PhantomData,
+        };
+        if let Some(index) = map.iter_buckets().next() {
+            let bucket = map.get_bucket(index).expect("index of an occupied bucket");
+            let bucket_addr = std::ptr::from_ref(bucket).addr();
+            prefetcher.anchor(bucket_addr, index, map.num_buckets());
+        }
+        prefetcher
     }
+
+    /// Re-derives the table layout from the address of the occupied bucket at
+    /// `index`. Call after every insert that may have grown the table.
+    #[inline(always)]
+    fn anchor(&mut self, bucket_addr: usize, index: usize, num_buckets: usize) {
+        self.data_end = Some(bucket_addr + (index + 1) * size_of::<E>());
+        self.bucket_mask = num_buckets - 1;
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        if let Some(data_end) = self.data_end {
+            let pos = (hash as usize) & self.bucket_mask;
+            prefetch_read(data_end.wrapping_add(pos));
+            prefetch_read(data_end.wrapping_sub((pos + 1) * size_of::<E>()));
+        }
+    }
+}
+
+/// Hints the CPU to load the cache line holding `addr`. Never faults.
+#[inline(always)]
+fn prefetch_read(addr: usize) {
+    let ptr: *const i8 = std::ptr::without_provenance(addr);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `prefetch` does not access memory and cannot fault, even for an
+    // invalid address.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(ptr);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm` does not access memory and cannot fault, even for an
+    // invalid address.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
 }
 
 fn insert_rows<T, const REVERSE: bool>(
@@ -489,6 +551,7 @@ where
     <T as TryFrom<usize>>::Error: Debug,
 {
     let len = hash_values.len();
+    let mut prefetcher = BucketPrefetcher::new(map);
     let mut chained = false;
     for k in 0..len {
         let i = if REVERSE { len - 1 - k } else { k };
@@ -498,7 +561,7 @@ where
             Some(i + PREFETCH_DISTANCE).filter(|&j| j < len)
         };
         if let Some(j) = ahead {
-            touch_home_bucket(map, hash_values[j]);
+            prefetcher.prefetch(hash_values[j]);
         }
         if valid_keys.is_some_and(|valid| valid.is_null(i)) {
             continue;
@@ -518,7 +581,14 @@ where
                 chained = true;
             }
             Vacant(vacant) => {
-                vacant.insert((hash_value, value));
+                let inserted = vacant.insert((hash_value, value));
+                let bucket_addr = std::ptr::from_ref(inserted.get()).addr();
+                let index = inserted.bucket_index();
+                prefetcher.anchor(
+                    bucket_addr,
+                    index,
+                    inserted.into_table().num_buckets(),
+                );
             }
         }
     }
