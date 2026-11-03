@@ -2362,18 +2362,13 @@ pub fn update_hash(
     // Unmatchable NULL-key rows are filtered out below.
     let valid_keys = matchable_join_keys(&keys_values, null_equality);
 
-    // Updating JoinHashMap from hash values iterator
-    let hash_values_iter = hash_values
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| valid_keys.as_ref().is_none_or(|nulls| nulls.is_valid(*i)))
-        .map(|(i, val)| (i + offset, val));
-
-    if fifo_hashmap {
-        hash_map.update_from_iter(Box::new(hash_values_iter.rev()), deleted_offset);
-    } else {
-        hash_map.update_from_iter(Box::new(hash_values_iter), deleted_offset);
-    }
+    hash_map.update_from_hashes(
+        hash_values,
+        valid_keys.as_ref(),
+        offset,
+        deleted_offset,
+        fifo_hashmap,
+    );
 
     Ok(())
 }
