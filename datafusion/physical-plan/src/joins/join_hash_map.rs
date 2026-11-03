@@ -124,6 +124,22 @@ pub trait JoinHashMapType: Send + Sync {
         deleted_offset: usize,
     );
 
+    /// Inserts build rows `offset..offset + hash_values.len()`, where row
+    /// `offset + i` has hash `hash_values[i]`. Rows marked NULL in
+    /// `valid_keys` are skipped. With `reverse`, rows are inserted last to
+    /// first, so the lowest row index ends up at the head of each chain.
+    ///
+    /// Prefer this over [`Self::update_from_iter`]: the insert loop runs over
+    /// plain slices instead of a boxed iterator.
+    fn update_from_hashes(
+        &mut self,
+        hash_values: &[u64],
+        valid_keys: Option<&NullBuffer>,
+        offset: usize,
+        deleted_offset: usize,
+        reverse: bool,
+    );
+
     fn get_matched_indices<'a>(
         &self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
@@ -195,6 +211,25 @@ impl JoinHashMapType for JoinHashMapU32 {
     ) {
         self.chained |=
             update_from_iter::<u32>(&mut self.map, &mut self.next, iter, deleted_offset);
+    }
+
+    fn update_from_hashes(
+        &mut self,
+        hash_values: &[u64],
+        valid_keys: Option<&NullBuffer>,
+        offset: usize,
+        deleted_offset: usize,
+        reverse: bool,
+    ) {
+        self.chained |= update_from_hashes::<u32>(
+            &mut self.map,
+            &mut self.next,
+            hash_values,
+            valid_keys,
+            offset,
+            deleted_offset,
+            reverse,
+        );
     }
 
     fn get_matched_indices<'a>(
@@ -283,6 +318,25 @@ impl JoinHashMapType for JoinHashMapU64 {
             update_from_iter::<u64>(&mut self.map, &mut self.next, iter, deleted_offset);
     }
 
+    fn update_from_hashes(
+        &mut self,
+        hash_values: &[u64],
+        valid_keys: Option<&NullBuffer>,
+        offset: usize,
+        deleted_offset: usize,
+        reverse: bool,
+    ) {
+        self.chained |= update_from_hashes::<u64>(
+            &mut self.map,
+            &mut self.next,
+            hash_values,
+            valid_keys,
+            offset,
+            deleted_offset,
+            reverse,
+        );
+    }
+
     fn get_matched_indices<'a>(
         &self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
@@ -362,6 +416,80 @@ where
             }
             Vacant(vacant_entry) => {
                 vacant_entry.insert((hash_value, T::try_from(row + 1).unwrap()));
+            }
+        }
+    }
+    chained
+}
+
+/// Inserts build rows `offset..offset + hash_values.len()` into `map` and
+/// `next`, where row `offset + i` has hash `hash_values[i]`. Rows that are NULL
+/// in `valid_keys` are skipped. With `reverse`, rows are inserted last to first,
+/// so the lowest row index ends up at the head of each chain.
+///
+/// Returns `true` if any row was chained onto an existing hash value.
+pub fn update_from_hashes<T>(
+    map: &mut HashTable<(u64, T)>,
+    next: &mut [T],
+    hash_values: &[u64],
+    valid_keys: Option<&NullBuffer>,
+    offset: usize,
+    deleted_offset: usize,
+    reverse: bool,
+) -> bool
+where
+    T: Copy + TryFrom<usize>,
+    <T as TryFrom<usize>>::Error: Debug,
+{
+    if reverse {
+        insert_rows::<T, true>(map, next, hash_values, valid_keys, offset, deleted_offset)
+    } else {
+        insert_rows::<T, false>(
+            map,
+            next,
+            hash_values,
+            valid_keys,
+            offset,
+            deleted_offset,
+        )
+    }
+}
+
+fn insert_rows<T, const REVERSE: bool>(
+    map: &mut HashTable<(u64, T)>,
+    next: &mut [T],
+    hash_values: &[u64],
+    valid_keys: Option<&NullBuffer>,
+    offset: usize,
+    deleted_offset: usize,
+) -> bool
+where
+    T: Copy + TryFrom<usize>,
+    <T as TryFrom<usize>>::Error: Debug,
+{
+    let len = hash_values.len();
+    let mut chained = false;
+    for k in 0..len {
+        let i = if REVERSE { len - 1 - k } else { k };
+        if valid_keys.is_some_and(|valid| valid.is_null(i)) {
+            continue;
+        }
+        let hash_value = hash_values[i];
+        let row = offset + i;
+        let value = T::try_from(row + 1).unwrap();
+        match map.entry(
+            hash_value,
+            |&(hash, _)| hash == hash_value,
+            |&(hash, _)| hash,
+        ) {
+            Occupied(mut occupied) => {
+                let (_, head) = occupied.get_mut();
+                next[row - deleted_offset] = *head;
+                *head = value;
+                chained = true;
+            }
+            Vacant(vacant) => {
+                vacant.insert((hash_value, value));
             }
         }
     }
