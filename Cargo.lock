@@ -2534,6 +2534,7 @@ dependencies = [
 name = "datafusion-physical-plan"
 version = "56.0.0-dev"
 dependencies = [
+ "allocator-api2",
  "arrow",
  "arrow-data",
  "arrow-ipc",
