@@ -26,9 +26,11 @@ use crate::joins::hash_join::shared_bounds::{
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
-use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 use crate::joins::key_range_bitmap::KeyRangeBitmap;
 use crate::joins::probe_completion::{Completion, ProbeCompletion};
+use crate::joins::unchained_hash_map::{
+    UnchainedJoinHashMapU32, UnchainedJoinHashMapU64,
+};
 use crate::joins::utils::{
     OnceAsync, OnceFut, asymmetric_join_output_partitioning, emits_unmatched_left_rows,
     is_existence_join, reorder_output_after_swap, swap_join_projection, update_hash,
@@ -69,7 +71,7 @@ use datafusion_common::float_semantics::normalize_floats;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::utils::memory::{
-    RecordBatchMemoryCounter, estimate_memory_size, get_record_batch_memory_size,
+    RecordBatchMemoryCounter, get_record_batch_memory_size,
 };
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
@@ -2905,41 +2907,38 @@ fn is_perfect_hash_join_candidate(
     Ok(ArrayMap::is_supported_type(&data_type))
 }
 
+/// Creates the build side hash table for `num_rows` rows and reserves its
+/// peak memory, see
+/// [`UnchainedJoinHashMap::estimate_memory_size`](crate::joins::unchained_hash_map::UnchainedJoinHashMap::estimate_memory_size).
+///
+/// Once every row is inserted the caller must call
+/// [`JoinHashMapType::finalize`] and shrink `reservation` by its result.
 pub(super) fn new_join_hashmap(
     num_rows: usize,
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
 ) -> Result<Box<dyn JoinHashMapType>> {
-    let fixed_size_u32 = size_of::<JoinHashMapU32>();
-    let fixed_size_u64 = size_of::<JoinHashMapU64>();
-
     if num_rows > u32::MAX as usize {
-        let estimated_hashtable_size =
-            estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?
-                // Each build row also owns an index in the duplicate-key chain.
-                .checked_add(num_rows * size_of::<u64>())
-                .ok_or_else(|| {
-                    datafusion_common::exec_datafusion_err!(
-                        "Hash join table size overflow"
-                    )
-                })?;
-        reservation.try_grow(estimated_hashtable_size)?;
-        metrics.build_mem_used.add(estimated_hashtable_size);
-        Ok(Box::new(JoinHashMapU64::with_capacity(num_rows)))
+        let estimated_size = UnchainedJoinHashMapU64::estimate_memory_size(num_rows)?;
+        reservation.try_grow(estimated_size)?;
+        metrics.build_mem_used.add(estimated_size);
+        Ok(Box::new(UnchainedJoinHashMapU64::with_capacity(num_rows)))
     } else {
-        let estimated_hashtable_size =
-            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?
-                // Each build row also owns an index in the duplicate-key chain.
-                .checked_add(num_rows * size_of::<u32>())
-                .ok_or_else(|| {
-                    datafusion_common::exec_datafusion_err!(
-                        "Hash join table size overflow"
-                    )
-                })?;
-        reservation.try_grow(estimated_hashtable_size)?;
-        metrics.build_mem_used.add(estimated_hashtable_size);
-        Ok(Box::new(JoinHashMapU32::with_capacity(num_rows)))
+        let estimated_size = UnchainedJoinHashMapU32::estimate_memory_size(num_rows)?;
+        reservation.try_grow(estimated_size)?;
+        metrics.build_mem_used.add(estimated_size);
+        Ok(Box::new(UnchainedJoinHashMapU32::with_capacity(num_rows)))
     }
+}
+
+/// Finishes a map created by [`new_join_hashmap`] and releases its build-time
+/// scratch memory from `reservation`. `build_mem_used` keeps the peak.
+pub(super) fn finalize_join_hashmap(
+    map: &mut dyn JoinHashMapType,
+    reservation: &mut MemoryReservation,
+) {
+    let released = map.finalize();
+    reservation.shrink(released.min(reservation.size()));
 }
 
 /// Estimates the memory newly allocated for `array`'s share of a concatenated
@@ -3187,6 +3186,8 @@ fn build_in_memory(
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
+    // Build-time scratch memory of the hash map, released once the build is done.
+    let mut hash_map_scratch = 0;
     let (join_hash_map, batch, left_values) = if let Some((min_val, max_val)) =
         array_map_key_range(
             bounds.as_ref(),
@@ -3249,6 +3250,9 @@ fn build_in_memory(
                 null_equality,
             )?;
         }
+        // The staging memory stays reserved until the build is complete, see
+        // below.
+        hash_map_scratch = hashmap.finalize();
 
         // Merge all batches into a single batch, so we can directly index into the arrays
         let batch = if prepared {
@@ -3387,6 +3391,8 @@ fn build_in_memory(
         )?;
     }
 
+    reservation.shrink(hash_map_scratch);
+
     let data = JoinLeftData {
         build: Arc::new(JoinBuildData {
             map,
@@ -3408,6 +3414,7 @@ fn build_in_memory(
 mod tests {
     use super::*;
     use crate::joins::hash_join::not_in::{NotInOutput, NotInScope};
+    use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 
     fn assert_phj_used(metrics: &MetricsSet, use_phj: bool) {
         if use_phj {
@@ -3513,9 +3520,7 @@ mod tests {
         use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 
         let rows = 1024;
-        let buckets =
-            estimate_memory_size::<(u32, u64)>(rows, size_of::<JoinHashMapU32>())?;
-        let bytes = buckets + rows * size_of::<u32>();
+        let bytes = UnchainedJoinHashMapU32::estimate_memory_size(rows)?;
         for (limit, succeeds) in [(bytes - 1, false), (bytes, true)] {
             let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
             let mut reservation = MemoryConsumer::new("row indices").register(&pool);
@@ -8206,8 +8211,7 @@ mod tests {
         let map = if use_perfect_hash_join_as_possible {
             ArrayMap::estimate_memory_size(0, num_rows as u64 - 1, build_rows)
         } else {
-            estimate_memory_size::<(u32, u64)>(build_rows, size_of::<JoinHashMapU32>())?
-                + build_rows * size_of::<u32>()
+            UnchainedJoinHashMapU32::estimate_memory_size(build_rows)?
         };
 
         for (limit, fits) in [(map + inputs * 3 / 2, false), (map + inputs * 3, true)] {
@@ -8274,10 +8278,7 @@ mod tests {
         let map = if use_perfect_hash_join_as_possible {
             ArrayMap::estimate_memory_size(1, num_rows as u64, num_rows as usize)
         } else {
-            estimate_memory_size::<(u32, u64)>(
-                num_rows as usize,
-                size_of::<JoinHashMapU32>(),
-            )? + num_rows as usize * size_of::<u32>()
+            UnchainedJoinHashMapU32::estimate_memory_size(num_rows as usize)?
         };
 
         for (computed_key, limit, fits) in [

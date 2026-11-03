@@ -54,6 +54,7 @@ mod join_filter;
 #[doc(hidden)]
 pub mod join_hash_map;
 pub mod key_range_bitmap;
+pub mod unchained_hash_map;
 
 use array_map::ArrayMap;
 use utils::JoinHashMapType;

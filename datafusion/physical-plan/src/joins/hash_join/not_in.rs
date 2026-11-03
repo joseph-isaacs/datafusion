@@ -40,7 +40,9 @@ use datafusion_physical_expr_common::datum::apply_cmp;
 
 use crate::joins::PartitionMode;
 use crate::joins::SharedBitmapBuilder;
-use crate::joins::hash_join::exec::{JoinLeftData, new_join_hashmap};
+use crate::joins::hash_join::exec::{
+    JoinLeftData, finalize_join_hashmap, new_join_hashmap,
+};
 use crate::joins::join_hash_map::ProbeOffset::{AtRow, MidChain};
 use crate::joins::join_hash_map::{JoinHashMapType, ProbeOffset};
 use crate::joins::probe_completion::ProbeSideSummary;
@@ -622,6 +624,7 @@ fn correlated_row_state(
             true,
             NullEquality::NullEqualsNothing,
         )?;
+        finalize_join_hashmap(&mut *scope_map, reservation);
         Some(scope_map)
     };
 
@@ -648,6 +651,7 @@ fn correlated_row_state(
         let mut hashes_buffer = vec![0; null_rows];
         create_hashes(&scope_values, random_state, &mut hashes_buffer)?;
         map.update_from_iter(Box::new(hashes_buffer.iter().enumerate().rev()), 0);
+        finalize_join_hashmap(&mut *map, reservation);
         Some(map)
     };
     Ok((

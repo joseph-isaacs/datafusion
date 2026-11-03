@@ -30,9 +30,11 @@ use hashbrown::hash_table::Entry::{Occupied, Vacant};
 pub enum ProbeOffset {
     /// Resume at probe row `row`, from the head of its chain.
     AtRow { row: usize },
-    /// Resume in the middle of probe row `row`'s chain, where `next` is the
-    /// 1-based index of the next build row in the chain. `next` is never `0`,
-    /// the end-of-chain marker.
+    /// Resume in the middle of probe row `row`'s matches. `next` is a 1-based
+    /// position whose meaning is defined by the map that returned it: for the
+    /// chained maps the index of the next build row in the chain, for
+    /// [`UnchainedJoinHashMap`](crate::joins::unchained_hash_map::UnchainedJoinHashMap)
+    /// the next position in its bucket. `next` is never `0`.
     MidChain { row: usize, next: u64 },
 }
 
@@ -143,6 +145,16 @@ pub trait JoinHashMapType: Send + Sync {
         input_indices: &mut Vec<u32>,
         match_indices: &mut Vec<u64>,
     ) -> Option<ProbeOffset>;
+
+    /// Finishes the build: must be called once all rows have been inserted
+    /// with [`Self::update_from_iter`] and before the first lookup. Further
+    /// calls are no-ops.
+    ///
+    /// Returns the bytes of build-time scratch memory released, which the
+    /// caller reserved as part of the map's estimated size.
+    fn finalize(&mut self) -> usize {
+        0
+    }
 
     /// Returns a BooleanArray indicating which of the provided hashes exist in the map.
     fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray;
