@@ -13,6 +13,7 @@ use std::task::Poll;
 use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::joins::Map;
 use crate::joins::PartitionMode;
+use crate::joins::hash_join::exact_keys::join_key_hashes;
 use crate::joins::hash_join::exec::JoinLeftData;
 use crate::joins::hash_join::not_in::NotInProbe;
 use crate::joins::hash_join::shared_bounds::{
@@ -27,7 +28,6 @@ use crate::joins::utils::{
 use crate::stream::EmptyRecordBatchStream;
 use crate::{
     RecordBatchStream, SendableRecordBatchStream, handle_state,
-    hash_utils::create_hashes,
     joins::utils::{
         BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
         StatefulStreamResult, adjust_indices_by_join_type, apply_join_filter_to_indices,
@@ -777,14 +777,24 @@ impl HashJoinStream {
                 // Precalculate hash values for fetched batch
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
-                let valid_keys = if let Map::HashMap(_) =
-                    self.build_side.try_as_ready()?.left_data.map()
-                {
+                let left_data = &self.build_side.try_as_ready()?.left_data;
+                let valid_keys = if let Map::HashMap(map) = left_data.map() {
+                    let exact = map.exact_keys();
+                    if exact
+                        && left_data.values()[0].data_type() != keys_values[0].data_type()
+                    {
+                        return Poll::Ready(internal_err!(
+                            "exact join keys need equal key types, got build {} and probe {}",
+                            left_data.values()[0].data_type(),
+                            keys_values[0].data_type()
+                        ));
+                    }
                     self.hashes_buffer.clear();
                     self.hashes_buffer.resize(batch.num_rows(), 0);
-                    create_hashes(
+                    join_key_hashes(
                         &keys_values,
                         &self.random_state,
+                        exact,
                         &mut self.hashes_buffer,
                     )?;
                     matchable_join_keys(&keys_values, self.null_equality)
@@ -873,6 +883,26 @@ impl HashJoinStream {
         // get the matched by join keys indices
         let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
         {
+            // Exact key hashes: every candidate is a match, skip the comparison.
+            Map::HashMap(map) if map.exact_keys() => {
+                let next_offset = map.get_matched_indices_with_limit_offset(
+                    &self.hashes_buffer,
+                    state.valid_keys.as_ref(),
+                    self.batch_size,
+                    state.offset,
+                    &mut self.probe_indices_buffer,
+                    &mut self.build_indices_buffer,
+                );
+                let build_indices: UInt64Array =
+                    std::mem::take(&mut self.build_indices_buffer).into();
+                let probe_indices: UInt32Array =
+                    std::mem::take(&mut self.probe_indices_buffer).into();
+                array_map_buffers = Some((
+                    build_indices.values().clone(),
+                    probe_indices.values().clone(),
+                ));
+                (build_indices, probe_indices, next_offset)
+            }
             Map::HashMap(map) => lookup_join_hashmap(
                 map.as_ref(),
                 build_side.left_data.values(),
