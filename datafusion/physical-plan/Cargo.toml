@@ -92,6 +92,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+allocator-api2 = "0.2.21"
 arrow-data = { workspace = true }
 criterion = { workspace = true, features = ["async_futures"] }
 datafusion-functions-aggregate = { workspace = true }
@@ -212,3 +213,8 @@ name = "unnest"
 [[bench]]
 harness = false
 name = "ordered_group_values"
+
+[[bench]]
+harness = false
+name = "hash_join_build_phases"
+required-features = ["test_utils"]

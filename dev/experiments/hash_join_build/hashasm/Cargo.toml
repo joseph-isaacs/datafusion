@@ -1,0 +1,21 @@
+[package]
+name = "hashasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+datafusion-common = { path = "../../../../datafusion/common", default-features = false }
+arrow = { version = "60.1.0", default-features = false }
+foldhash = "0.2.0"
+rapidhash = "4"
+ahash = "0.8"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = false
+
+[workspace]
