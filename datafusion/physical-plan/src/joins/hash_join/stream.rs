@@ -18,6 +18,7 @@ use crate::joins::hash_join::not_in::NotInProbe;
 use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
+use crate::joins::hash_join::stats;
 use crate::joins::join_hash_map::ProbeOffset;
 use crate::joins::join_hash_map::ProbeOffset::AtRow;
 use crate::joins::probe_completion::{Completion, ProbeSideSummary};
@@ -403,6 +404,66 @@ pub(super) struct HashJoinStream {
     /// Output buffer for coalescing small batches into larger ones with optional fetch limit.
     /// Uses `LimitedBatchCoalescer` to efficiently combine batches and absorb limit with 'fetch'
     output_buffer: LimitedBatchCoalescer,
+    /// Opt-in workload statistics, see [`stats`].
+    hj_stats: Option<Box<stats::ProbeStats>>,
+}
+
+impl Drop for HashJoinStream {
+    fn drop(&mut self) {
+        let Some(st) = self.hj_stats.take() else {
+            return;
+        };
+        let build_id = self
+            .build_side
+            .try_as_ready()
+            .ok()
+            .map(|b| std::ptr::from_ref(b.left_data.map()) as usize);
+        let out_build_cols = self
+            .column_indices
+            .iter()
+            .filter(|c| c.side == JoinSide::Left)
+            .count();
+        stats::JsonLine::new("probe")
+            .opt_num("build_id", build_id)
+            .num("partition", self.partition)
+            .str("mode", &format!("{:?}", self.mode))
+            .str("join_type", &format!("{:?}", self.join_type))
+            .strs("on", stats::expr_names(&self.on_right))
+            .num("has_filter", self.filter.is_some())
+            .num("batches", st.batches)
+            .num("rows", st.rows)
+            .num(
+                "min_batch_rows",
+                if st.batches == 0 {
+                    0
+                } else {
+                    st.min_batch_rows
+                },
+            )
+            .num("max_batch_rows", st.max_batch_rows)
+            .num("null_keys", st.null_keys)
+            .num("lookup_chunks", st.lookup_chunks)
+            .num("candidates", st.candidates)
+            .num("matched_pairs", st.matched_pairs)
+            .num("filtered_pairs", st.filtered_pairs)
+            .num("out_batches", st.out_batches)
+            .num("out_rows", st.out_rows)
+            .num("out_bytes", st.out_bytes)
+            .num("out_cols", self.column_indices.len())
+            .num("out_build_cols", out_build_cols)
+            .num("identity_probe_chunks", st.identity_probe_chunks)
+            .num("identity_probe_rows", st.identity_probe_rows)
+            .num("contiguous_probe_chunks", st.contiguous_probe_chunks)
+            .num("contiguous_probe_rows", st.contiguous_probe_rows)
+            .ns("hash_ns", st.hash)
+            .ns("lookup_ns", st.lookup)
+            .ns("filter_ns", st.filter)
+            .ns("adjust_ns", st.adjust)
+            .ns("materialize_ns", st.materialize)
+            .ns("push_ns", st.push)
+            .ns("unmatched_emit_ns", st.unmatched_emit)
+            .emit();
+    }
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -487,6 +548,7 @@ pub(super) fn lookup_join_hashmap(
         build_indices_buffer,
     );
 
+    stats::add_candidates(build_indices_buffer.len());
     let build_indices_unfiltered: UInt64Array =
         std::mem::take(build_indices_buffer).into();
     let probe_indices_unfiltered: UInt32Array =
@@ -585,6 +647,7 @@ impl HashJoinStream {
             build_report: BuildReportHandle::new(partition, mode, build_accumulator),
             mode,
             output_buffer,
+            hj_stats: stats::enabled().then(Box::default),
         }
     }
 
@@ -775,6 +838,7 @@ impl HashJoinStream {
             }
             Some(Ok(batch)) => {
                 // Precalculate hash values for fetched batch
+                let hj_t = stats::now();
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
                 let valid_keys = if let Map::HashMap(_) =
@@ -791,6 +855,23 @@ impl HashJoinStream {
                 } else {
                     None
                 };
+                if let Some(st) = self.hj_stats.as_deref_mut() {
+                    st.hash += stats::elapsed(hj_t);
+                    let n = batch.num_rows() as u64;
+                    st.batches += 1;
+                    st.rows += n;
+                    st.min_batch_rows = if st.batches == 1 {
+                        n
+                    } else {
+                        st.min_batch_rows.min(n)
+                    };
+                    st.max_batch_rows = st.max_batch_rows.max(n);
+                    st.null_keys += keys_values
+                        .iter()
+                        .map(|k| k.logical_null_count() as u64)
+                        .max()
+                        .unwrap_or(0);
+                }
 
                 self.join_metrics.input_batches.add(1);
                 self.join_metrics.input_rows.add(batch.num_rows());
@@ -870,6 +951,8 @@ impl HashJoinStream {
         // space once this chunk's output batch is built.
         let mut array_map_buffers = None;
 
+        let hj_t = stats::now();
+        let hj_c0 = stats::candidates();
         // get the matched by join keys indices
         let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
         {
@@ -906,6 +989,14 @@ impl HashJoinStream {
             }
         };
 
+        if let Some(st) = self.hj_stats.as_deref_mut() {
+            st.lookup += stats::elapsed(hj_t);
+            st.lookup_chunks += 1;
+            let c = stats::candidates() - hj_c0;
+            // Array map lookups are exact, so candidates equal matches.
+            st.candidates += if c == 0 { left_indices.len() as u64 } else { c };
+            st.matched_pairs += left_indices.len() as u64;
+        }
         let matched_probe_rows = state.count_new_matched_probe_rows(&right_indices);
 
         self.join_metrics
@@ -917,6 +1008,7 @@ impl HashJoinStream {
         self.join_metrics.avg_fanout.add_total(matched_probe_rows);
 
         // apply join filter if exists
+        let hj_t = stats::now();
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
             apply_join_filter_to_indices(
                 build_side.left_data.batch(),
@@ -932,6 +1024,11 @@ impl HashJoinStream {
             (left_indices, right_indices)
         };
 
+        if let Some(st) = self.hj_stats.as_deref_mut() {
+            st.filter += stats::elapsed(hj_t);
+            st.filtered_pairs += left_indices.len() as u64;
+        }
+        let hj_t = stats::now();
         // mark joined left-side indices as visited, if required by join type
         if need_produce_result_in_final(self.join_type) {
             let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
@@ -988,6 +1085,26 @@ impl HashJoinStream {
             );
         }
 
+        if let Some(st) = self.hj_stats.as_deref_mut() {
+            st.adjust += stats::elapsed(hj_t);
+        }
+        if let Some(st) = self.hj_stats.as_deref_mut()
+            && self.join_type != JoinType::RightMark
+            && right_indices.null_count() == 0
+            && !right_indices.is_empty()
+        {
+            let v = right_indices.values();
+            let contiguous = v.windows(2).all(|w| w[1] == w[0] + 1);
+            if contiguous {
+                st.contiguous_probe_chunks += 1;
+                st.contiguous_probe_rows += v.len() as u64;
+                if v[0] == 0 && v.len() == state.batch.num_rows() {
+                    st.identity_probe_chunks += 1;
+                    st.identity_probe_rows += v.len() as u64;
+                }
+            }
+        }
+        let hj_t = stats::now();
         // Build output batch and push to coalescer
         let (build_batch, probe_batch, join_side) =
             if self.join_type == JoinType::RightMark {
@@ -1016,7 +1133,19 @@ impl HashJoinStream {
             self.probe_indices_buffer = probe_buffer.into();
         }
 
+        let hj_t = if let Some(st) = self.hj_stats.as_deref_mut() {
+            st.materialize += stats::elapsed(hj_t);
+            st.out_batches += 1;
+            st.out_rows += batch.num_rows() as u64;
+            st.out_bytes += stats::batch_bytes(&batch) as u64;
+            stats::now()
+        } else {
+            None
+        };
         let push_status = self.output_buffer.push_batch(batch)?;
+        if let Some(st) = self.hj_stats.as_deref_mut() {
+            st.push += stats::elapsed(hj_t);
+        }
 
         timer.done();
 
@@ -1104,6 +1233,17 @@ impl HashJoinStream {
     /// once, which otherwise grows with the number of unmatched build rows
     /// (e.g. a highly selective `LeftAnti` join over a large build side).
     fn emit_unmatched_build_rows(
+        &mut self,
+    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        let hj_t = stats::now();
+        let result = self.emit_unmatched_build_rows_inner();
+        if let Some(st) = self.hj_stats.as_deref_mut() {
+            st.unmatched_emit += stats::elapsed(hj_t);
+        }
+        result
+    }
+
+    fn emit_unmatched_build_rows_inner(
         &mut self,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         let timer = self.join_metrics.join_time.timer();
