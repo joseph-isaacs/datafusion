@@ -23,6 +23,7 @@ use crate::joins::hash_join::not_in::{NotIn, NotInBuild};
 use crate::joins::hash_join::shared_bounds::{
     ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
 };
+use crate::joins::hash_join::stats;
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
@@ -3186,6 +3187,18 @@ fn build_in_memory(
     prepared: bool,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
+    let hj_t0 = stats::now();
+    let hj_t_index;
+    let hj_t_concat;
+    let hj_num_batches = batches.len();
+    let hj_bounds = if stats::enabled() {
+        bounds
+            .as_ref()
+            .and_then(|b| b.get_column_bounds(0))
+            .map(|cb| (cb.min.clone(), cb.max.clone()))
+    } else {
+        None
+    };
 
     let (join_hash_map, batch, left_values) = if let Some((min_val, max_val)) =
         array_map_key_range(
@@ -3198,13 +3211,17 @@ fn build_in_memory(
             config.execution.perfect_hash_join_min_key_density,
             null_equality,
         )? {
+        let t = stats::now();
         let batch = if prepared {
             concat_batches(schema, batches.iter())?
         } else {
             concat_build_batches(schema, batches, input_bytes, &mut reservation, metrics)?
         };
+        hj_t_concat = stats::elapsed(t);
+        let t = stats::now();
         let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
         let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
+        hj_t_index = stats::elapsed(t);
 
         array_map_created_count.add(1);
         metrics.build_mem_used.add(array_map.size());
@@ -3229,6 +3246,7 @@ fn build_in_memory(
         // The maximum is known: avoid geometric growth and its excess capacity.
         let mut hashes_buffer = Vec::with_capacity(max_batch_rows);
         let mut offset = num_rows;
+        let t = stats::now();
 
         // Update the hashmap starting from the last batch, so rows with smaller
         // indices end up on top of the chains. Each batch is indexed at its
@@ -3250,12 +3268,16 @@ fn build_in_memory(
             )?;
         }
 
+        hj_t_index = stats::elapsed(t);
+
         // Merge all batches into a single batch, so we can directly index into the arrays
+        let t = stats::now();
         let batch = if prepared {
             concat_batches(schema, batches.iter())?
         } else {
             concat_build_batches(schema, batches, input_bytes, &mut reservation, metrics)?
         };
+        hj_t_concat = stats::elapsed(t);
 
         let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
@@ -3385,6 +3407,55 @@ fn build_in_memory(
             copy_bytes,
             retained,
         )?;
+    }
+
+    if stats::enabled() {
+        let (map_kind, distinct) = match map.as_ref() {
+            Map::ArrayMap(a) => ("array_map", a.num_of_distinct_key()),
+            Map::HashMap(h) => ("hash_map", h.len()),
+        };
+        let key_nulls: usize = left_values.iter().map(|v| v.null_count()).sum();
+        let (kmin, kmax, range) = match &hj_bounds {
+            Some((mi, ma)) => {
+                let range = ArrayMap::key_to_u64(mi)
+                    .zip(ArrayMap::key_to_u64(ma))
+                    .map(|(a, b)| ArrayMap::calculate_range(a, b));
+                (Some(mi.to_string()), Some(ma.to_string()), range)
+            }
+            None => (None, None, None),
+        };
+        let membership_kind = match &membership {
+            PushdownStrategy::Empty => "empty",
+            PushdownStrategy::InList(_) => "inlist",
+            PushdownStrategy::Map(_, Some(_)) => "map+bitmap",
+            PushdownStrategy::Map(_, None) => "map",
+        };
+        let bytes = stats::batch_bytes(&batch);
+        stats::JsonLine::new("build")
+            .num("build_id", Arc::as_ptr(&map) as usize)
+            .strs("on", stats::expr_names(on_left))
+            .strs("key_types", stats::key_types(&left_values))
+            .num("rows", num_rows)
+            .num("batches", hj_num_batches)
+            .num("max_batch_rows", max_batch_rows)
+            .str("map", map_kind)
+            .num("phj_candidate", is_phj_candidate)
+            .num("distinct_keys", distinct)
+            .num("key_nulls", key_nulls)
+            .opt_num("key_range", range)
+            .str("key_min", kmin.as_deref().unwrap_or(""))
+            .str("key_max", kmax.as_deref().unwrap_or(""))
+            .num("payload_cols", batch.num_columns())
+            .num("payload_bytes", bytes)
+            .num("with_visited_bitmap", with_visited_indices_bitmap)
+            .num("probe_threads", probe_threads_count)
+            .num("dynamic_filters", should_compute_dynamic_filters)
+            .str("membership", membership_kind)
+            .num("prepared", prepared)
+            .ns("index_ns", hj_t_index)
+            .ns("concat_ns", hj_t_concat)
+            .ns("total_ns", stats::elapsed(hj_t0))
+            .emit();
     }
 
     let data = JoinLeftData {
