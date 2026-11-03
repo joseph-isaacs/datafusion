@@ -591,9 +591,17 @@ mod tests {
     /// in the same order, for every chunk size.
     #[test]
     fn matches_chained_map() {
-        for (n, distinct) in [(1, 1), (7, 3), (100, 100), (1000, 37), (5000, 4000)] {
+        for (n, distinct) in [
+            (1, 1),
+            (7, 3),
+            (100, 100),
+            (1000, 37),
+            (5000, 4000),
+            // Every hash distinct.
+            (5000, u64::MAX),
+        ] {
             let build_hashes = pseudo_random_hashes(n, distinct, n as u64);
-            let mut probe = pseudo_random_hashes(300, distinct * 2, 7);
+            let mut probe = pseudo_random_hashes(300, distinct.saturating_mul(2), 7);
             probe.extend(&build_hashes[..n.min(50)]);
             let valid: Vec<bool> = (0..probe.len()).map(|i| i % 11 != 3).collect();
             let valid_keys = NullBuffer::from(valid);
