@@ -87,7 +87,7 @@ use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::Accumulator;
 use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_physical_expr::equivalence::{
-    ProjectionMapping, join_equivalence_properties,
+    EquivalenceProperties, ProjectionMapping, join_equivalence_properties,
 };
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
 use datafusion_physical_expr::projection::{ProjectionRef, combine_projections};
@@ -470,6 +470,24 @@ impl HashJoinExecBuilder {
         if on.is_empty() {
             return plan_err!("On constraints in HashJoinExec should be non-empty");
         }
+
+        // Only while nothing has been derived from `on` yet: the dynamic filter
+        // captures the keys, null-aware joins require a single key, and the
+        // inputs of a `Partitioned` join may already be hash partitioned on
+        // them.
+        let on = if dynamic_filter.is_none()
+            && !null_aware
+            && null_equality == NullEquality::NullEqualsNothing
+            && matches!(mode, PartitionMode::Auto | PartitionMode::CollectLeft)
+        {
+            dedup_join_keys(
+                on,
+                left.properties().equivalence_properties(),
+                right.properties().equivalence_properties(),
+            )
+        } else {
+            on
+        };
 
         check_join_is_valid(&left_schema, &right_schema, &on)?;
         let (join_schema, column_indices) =
@@ -2183,6 +2201,38 @@ impl BuildSideState {
                 .transpose()?,
         })
     }
+}
+
+/// Removes the join key pairs implied by the pairs before them.
+///
+/// The pair `(l, r)` is redundant when an earlier kept pair `(kl, kr)` has
+/// `kl = l` on the build input and `kr = r` on the probe input, as proven by
+/// their equivalence properties (identical expressions are always equal):
+/// matching `kl = kr` then already implies `l = r`.
+///
+/// Queries that spell out every pairwise equality, such as
+/// `mk.movie_id = ci.movie_id AND mk.movie_id = mc.movie_id` after a join on
+/// `ci.movie_id = mc.movie_id`, otherwise hash and compare the same key
+/// twice, and lose the single-key [`ArrayMap`] path.
+fn dedup_join_keys(
+    on: JoinOn,
+    left: &EquivalenceProperties,
+    right: &EquivalenceProperties,
+) -> JoinOn {
+    if on.len() < 2 {
+        return on;
+    }
+    let (left_eq, right_eq) = (left.eq_group(), right.eq_group());
+    let mut kept: JoinOn = Vec::with_capacity(on.len());
+    for (l, r) in on {
+        let implied = kept
+            .iter()
+            .any(|(kl, kr)| left_eq.exprs_equal(kl, &l) && right_eq.exprs_equal(kr, &r));
+        if !implied {
+            kept.push((l, r));
+        }
+    }
+    kept
 }
 
 fn should_collect_min_max_for_perfect_hash(
@@ -7276,6 +7326,160 @@ mod tests {
             lit(true),
         ));
         assert!(join.with_dynamic_filter_expr(df).is_err());
+        Ok(())
+    }
+
+    /// Probe side `(a2, b2, c2)` with rows where `a2 = b2` and rows where it
+    /// does not, optionally behind a `FilterExec` on `a2 = b2`, which makes
+    /// the two columns equivalent.
+    fn dedup_probe(equal_filter: bool) -> Result<Arc<dyn ExecutionPlan>> {
+        let right = build_table(
+            ("a2", &vec![1, 2, 3, 4]),
+            ("b2", &vec![1, 2, 30, 4]),
+            ("c2", &vec![10, 20, 30, 40]),
+        );
+        if !equal_filter {
+            return Ok(right);
+        }
+        let schema = right.schema();
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new_with_schema("a2", &schema)?),
+            Operator::Eq,
+            Arc::new(Column::new_with_schema("b2", &schema)?),
+        ));
+        Ok(Arc::new(FilterExecBuilder::new(predicate, right).build()?))
+    }
+
+    fn dedup_build() -> Arc<dyn ExecutionPlan> {
+        build_table(
+            ("a1", &vec![1, 2, 3, 4, 4]),
+            ("b1", &vec![1, 2, 3, 4, 4]),
+            ("c1", &vec![7, 8, 9, 10, 11]),
+        )
+    }
+
+    /// `b1 = a2 AND b1 = b2`, the shape of queries that spell out every
+    /// pairwise equality.
+    fn dedup_on(
+        left: &Arc<dyn ExecutionPlan>,
+        right: &Arc<dyn ExecutionPlan>,
+    ) -> Result<JoinOn> {
+        let b1: PhysicalExprRef =
+            Arc::new(Column::new_with_schema("b1", &left.schema())?);
+        Ok(vec![
+            (
+                Arc::clone(&b1),
+                Arc::new(Column::new_with_schema("a2", &right.schema())?) as _,
+            ),
+            (
+                b1,
+                Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
+            ),
+        ])
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn join_keys_implied_by_probe_equivalence_are_removed(
+        #[values(true, false)] use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let left = dedup_build();
+        let right = dedup_probe(true)?;
+        let on = dedup_on(&left, &right)?;
+
+        let join = join(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        )?;
+        assert_eq!(join.on().len(), 1);
+        assert_eq!(join.on()[0].1.to_string(), "a2@0");
+
+        let task_ctx = prepare_task_ctx(8192, use_perfect_hash_join_as_possible);
+        let batches = common::collect(join.execute(0, task_ctx)?).await?;
+        if use_perfect_hash_join_as_possible {
+            assert_phj_used(&join.metrics().unwrap(), true);
+        }
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+----+----+----+----+----+
+            | a1 | b1 | c1 | a2 | b2 | c2 |
+            +----+----+----+----+----+----+
+            | 1  | 1  | 7  | 1  | 1  | 10 |
+            | 2  | 2  | 8  | 2  | 2  | 20 |
+            | 4  | 4  | 10 | 4  | 4  | 40 |
+            | 4  | 4  | 11 | 4  | 4  | 40 |
+            +----+----+----+----+----+----+
+            ");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_keys_kept_without_probe_equivalence() -> Result<()> {
+        let left = dedup_build();
+        let right = dedup_probe(false)?;
+        let on = dedup_on(&left, &right)?;
+
+        let join = join(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        )?;
+        assert_eq!(join.on().len(), 2);
+
+        let batches =
+            common::collect(join.execute(0, prepare_task_ctx(8192, true))?).await?;
+        // The probe row (3, 30, 30) fails `b1 = b2` and must not match.
+        assert_snapshot!(batches_to_sort_string(&batches), @r"
+        +----+----+----+----+----+----+
+        | a1 | b1 | c1 | a2 | b2 | c2 |
+        +----+----+----+----+----+----+
+        | 1  | 1  | 7  | 1  | 1  | 10 |
+        | 2  | 2  | 8  | 2  | 2  | 20 |
+        | 4  | 4  | 10 | 4  | 4  | 40 |
+        | 4  | 4  | 11 | 4  | 4  | 40 |
+        +----+----+----+----+----+----+
+        ");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::partitioned(
+        PartitionMode::Partitioned,
+        NullEquality::NullEqualsNothing,
+        false
+    )]
+    #[case::nulls_equal(PartitionMode::CollectLeft, NullEquality::NullEqualsNull, false)]
+    #[case::null_aware(PartitionMode::CollectLeft, NullEquality::NullEqualsNothing, true)]
+    fn join_keys_not_deduplicated_when_unsafe(
+        #[case] mode: PartitionMode,
+        #[case] null_equality: NullEquality,
+        #[case] null_aware: bool,
+    ) -> Result<()> {
+        let left = dedup_build();
+        let right = dedup_probe(true)?;
+        let on = dedup_on(&left, &right)?;
+        let join_type = if null_aware {
+            JoinType::LeftAnti
+        } else {
+            JoinType::Inner
+        };
+        let join = HashJoinExecBuilder::new(left, right, on, join_type)
+            .with_partition_mode(mode)
+            .with_null_equality(null_equality)
+            .with_null_aware(null_aware)
+            .build();
+        // 55.2 rejects multi-key null-aware joins outright.
+        let Ok(join) = join else {
+            assert!(null_aware);
+            return Ok(());
+        };
+        assert_eq!(join.on().len(), 2);
         Ok(())
     }
 }
