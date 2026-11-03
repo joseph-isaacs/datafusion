@@ -53,6 +53,14 @@ impl Keys {
             _ => &["k0"],
         }
     }
+
+    /// Output rows of joining the single probe row, the build side's row 0.
+    fn expected_matches(self) -> usize {
+        match self {
+            Keys::Dup4 => 4,
+            _ => 1,
+        }
+    }
 }
 
 /// Scatters `i` over the `i64` domain without collisions.
@@ -168,7 +176,10 @@ fn bench_build(c: &mut Criterion) {
                 b.iter(|| {
                     let plan = workload.plan().unwrap();
                     let out = rt.block_on(collect(plan, Arc::clone(&ctx))).unwrap();
-                    assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+                    assert_eq!(
+                        out.iter().map(|b| b.num_rows()).sum::<usize>(),
+                        keys.expected_matches()
+                    );
                     black_box(out)
                 })
             });
