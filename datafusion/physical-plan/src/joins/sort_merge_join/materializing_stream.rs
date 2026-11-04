@@ -495,6 +495,10 @@ pub(super) struct MaterializingSortMergeJoinStream {
     /// The merge loop's previous key comparison, to detect runs of
     /// non-matching rows worth galloping over.
     pub last_ordering: Ordering,
+    /// Whether the last galloped run of `Less` (`Greater`) rows was longer
+    /// than a row, so the next such run gallops from its first step.
+    pub long_less_runs: bool,
+    pub long_greater_runs: bool,
     /// Matches left to pass before probing for a one-to-one run again, and
     /// the current backoff; see [`Self::try_pair_unique_run`].
     pub unique_run_skip: u32,
@@ -750,6 +754,8 @@ impl MaterializingSortMergeJoinStream {
             join_time_start: None,
             streamed_buffered_cmp: None,
             last_ordering: Ordering::Equal,
+            long_less_runs: false,
+            long_greater_runs: false,
             unique_run_skip: 0,
             unique_run_backoff: 0,
             streamed_run_skip: 0,
@@ -812,13 +818,20 @@ impl MaterializingSortMergeJoinStream {
             // under way: the step before had the same ordering. A dense join
             // alternates `Equal` with a single `Greater`, and probing for a
             // run there would cost an extra key comparison per row.
+            // A run of misses whose previous run (in the same direction) was
+            // long gallops from its first step: a sparse join then spends
+            // one merge-loop trip per run, not two.
             let in_run = ordering == self.last_ordering;
             self.last_ordering = ordering;
             match ordering {
                 // 3a. The streamed row can never match: null-join it (outer
                 //     joins emit it; inner joins drop it), then advance.
                 Ordering::Less => {
-                    self.null_join_streamed_rows(in_run);
+                    let gallop = in_run || self.long_less_runs;
+                    let handled = self.null_join_streamed_rows(gallop);
+                    if gallop {
+                        self.long_less_runs = handled > 1;
+                    }
                     if self.num_unfrozen_pairs() >= self.batch_size {
                         self.freeze_and_emit(emitter).await?;
                     }
@@ -831,8 +844,8 @@ impl MaterializingSortMergeJoinStream {
                 //     the next key group.
                 Ordering::Greater => {
                     self.null_join_buffered_group();
-                    if in_run {
-                        self.skip_buffered_rows_below_streamed();
+                    if in_run || self.long_greater_runs {
+                        self.long_greater_runs = self.skip_buffered_rows_below_streamed();
                     }
                     if !self.try_advance_buffered_group()? {
                         self.advance_buffered_group().await?;
@@ -1057,7 +1070,7 @@ impl MaterializingSortMergeJoinStream {
     /// trip around the merge loop instead of one of each per row. Without
     /// `gallop` (no run under way yet) only the current row is handled, which
     /// costs no comparison beyond the merge loop's own.
-    fn null_join_streamed_rows(&mut self, gallop: bool) {
+    fn null_join_streamed_rows(&mut self, gallop: bool) -> usize {
         let outer = matches!(
             self.join_type,
             JoinType::Left | JoinType::Right | JoinType::Full
@@ -1087,8 +1100,10 @@ impl MaterializingSortMergeJoinStream {
                 );
             }
         }
+        let handled = run_end - self.streamed_batch.idx;
         self.streamed_batch.idx = run_end - 1;
         self.buffered_data.scanning_reset();
+        handled
     }
 
     /// The end of the run of streamed rows, starting at the cursor (which
@@ -1124,12 +1139,12 @@ impl MaterializingSortMergeJoinStream {
     /// comparisons instead of a group scan and a merge-loop trip per row.
     /// Only acts within a single buffered batch; group boundaries that reach
     /// the end of the batch are left to [`Self::advance_buffered_group`].
-    fn skip_buffered_rows_below_streamed(&mut self) {
+    fn skip_buffered_rows_below_streamed(&mut self) -> bool {
         if self.streamed_exhausted || self.buffered_data.batches.len() != 1 {
-            return;
+            return false;
         }
         let Some(cmp) = self.streamed_buffered_cmp.as_ref() else {
-            return;
+            return false;
         };
         let streamed_idx = self.streamed_batch.idx;
         let batch = self.buffered_data.head_batch();
@@ -1138,7 +1153,7 @@ impl MaterializingSortMergeJoinStream {
             cmp.compare(streamed_idx, b) == Ordering::Greater
         });
         if skip_end == start {
-            return;
+            return false;
         }
         let batch = self.buffered_data.tail_batch_mut();
         if self.join_type == JoinType::Full {
@@ -1147,6 +1162,7 @@ impl MaterializingSortMergeJoinStream {
         // An empty "previous group" ending where the next one starts: both
         // advance paths seed the next group at `range.end`.
         batch.range = skip_end..skip_end;
+        true
     }
 
     /// `Greater` (FULL join): the buffered group can never match a streamed
