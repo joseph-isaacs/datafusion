@@ -1721,4 +1721,119 @@ mod tests {
             self.stream = None;
         }
     }
+
+    /// A `FileOpener` whose file `mock_file{n}` yields `batches` batches of
+    /// `rows` rows holding consecutive values from `n * 1000`, so the
+    /// stream's output is strictly increasing exactly when its files and
+    /// batches come out in order. Each batch yields to the runtime first, so
+    /// files opened ahead really decode concurrently.
+    struct OrderedOpener {
+        batches: usize,
+        rows: usize,
+        scan_error_file: Option<usize>,
+    }
+
+    impl FileOpener for OrderedOpener {
+        fn open(&self, file: PartitionedFile) -> Result<FileOpenFuture> {
+            let n: usize = file
+                .object_meta
+                .location
+                .as_ref()
+                .trim_start_matches("mock_file")
+                .parse()
+                .unwrap();
+            let (batches, rows) = (self.batches, self.rows);
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+            if self.scan_error_file == Some(n) {
+                let error = futures::future::ready(datafusion_common::exec_err!(
+                    "error scanning"
+                ));
+                return Ok(futures::future::ready(Ok(
+                    futures::stream::once(error).boxed()
+                ))
+                .boxed());
+            }
+            let stream = futures::stream::iter(0..batches)
+                .then(move |b| {
+                    let schema = Arc::clone(&schema);
+                    async move {
+                        tokio::task::yield_now().await;
+                        let start = (n * 1000 + b * rows) as i32;
+                        let values = arrow::array::Int32Array::from_iter_values(
+                            start..start + rows as i32,
+                        );
+                        Ok(RecordBatch::try_new(schema, vec![Arc::new(values)])?)
+                    }
+                })
+                .boxed();
+            Ok(futures::future::ready(Ok(stream)).boxed())
+        }
+    }
+
+    async fn ordered_values(
+        num_files: usize,
+        on_error: OnError,
+        scan_error_file: Option<usize>,
+    ) -> Result<Vec<i32>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(
+            (0..num_files)
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect(),
+        )
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file,
+            }))
+            .with_metrics(&metrics_set)
+            .with_on_error(on_error)
+            .build()?;
+        let batches = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(batches
+            .iter()
+            .flat_map(|b| b.column(0).as_primitive::<Int32Type>().values().to_vec())
+            .collect())
+    }
+
+    /// On a multi-threaded runtime the scan opens and decodes the next file
+    /// ahead of the current one; its output must still be in file order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_opened_ahead_keep_their_order() -> Result<()> {
+        for num_files in [1, 2, 9] {
+            let values = ordered_values(num_files, OnError::Fail, None).await?;
+            let expected: Vec<i32> = (0..num_files as i32)
+                .flat_map(|n| n * 1000..n * 1000 + 21)
+                .collect();
+            assert_eq!(values, expected, "{num_files} files");
+        }
+        Ok(())
+    }
+
+    /// A file failing to scan while opened ahead fails the scan, or is skipped
+    /// in place, just as without the lookahead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_opened_ahead_report_errors_in_order() -> Result<()> {
+        assert!(ordered_values(5, OnError::Fail, Some(3)).await.is_err());
+        let values = ordered_values(5, OnError::Skip, Some(3)).await?;
+        let expected: Vec<i32> = [0, 1, 2, 4]
+            .into_iter()
+            .flat_map(|n| n * 1000..n * 1000 + 21)
+            .collect();
+        assert_eq!(values, expected);
+        Ok(())
+    }
 }
