@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+##########
+## Hash join keys implied by the inputs' equivalences are dropped
+##########
+
+statement ok
+CREATE TABLE build_t(a INT, v INT) AS VALUES (1, 10), (2, 20), (3, 30), (4, 40), (NULL, 50);
+
+statement ok
+CREATE TABLE probe_t(x INT, y INT, w INT) AS VALUES
+  (1, 1, 100), (2, 2, 200), (3, 30, 300), (4, 4, 400), (NULL, NULL, 500), (5, 5, 600);
+
+statement ok
+set datafusion.explain.logical_plan_only = false;
+
+# `x = y` on the probe side makes `a = y` redundant once `a = x` holds,
+# so the hash join keeps a single key.
+query TT
+EXPLAIN SELECT b.a, b.v, p.w
+FROM build_t b
+JOIN (SELECT * FROM probe_t WHERE x = y) p
+  ON b.a = p.x AND b.a = p.y;
+----
+logical_plan
+01)Projection: b.a, b.v, p.w
+02)--Inner Join: b.a = p.x, b.a = p.y
+03)----SubqueryAlias: b
+04)------TableScan: build_t projection=[a, v]
+05)----SubqueryAlias: p
+06)------Filter: probe_t.y = probe_t.x
+07)--------TableScan: probe_t projection=[x, y, w]
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, x@0)], projection=[a@0, v@1, w@4]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+03)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+04)----FilterExec: y@1 = x@0
+05)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+query III rowsort
+SELECT b.a, b.v, p.w
+FROM build_t b
+JOIN (SELECT * FROM probe_t WHERE x = y) p
+  ON b.a = p.x AND b.a = p.y;
+----
+1 10 100
+2 20 200
+4 40 400
+
+# Without the equivalence both keys are needed.
+query TT
+EXPLAIN SELECT b.a, b.v, p.w
+FROM build_t b
+JOIN probe_t p
+  ON b.a = p.x AND b.a = p.y;
+----
+logical_plan
+01)Projection: b.a, b.v, p.w
+02)--Inner Join: b.a = p.x, b.a = p.y
+03)----SubqueryAlias: b
+04)------TableScan: build_t projection=[a, v]
+05)----SubqueryAlias: p
+06)------TableScan: probe_t projection=[x, y, w]
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, x@0), (a@0, y@1)], projection=[a@0, v@1, w@4]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+03)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+query III rowsort
+SELECT b.a, b.v, p.w
+FROM build_t b
+JOIN probe_t p
+  ON b.a = p.x AND b.a = p.y;
+----
+1 10 100
+2 20 200
+4 40 400
+
+statement ok
+DROP TABLE build_t;
+
+statement ok
+DROP TABLE probe_t;
