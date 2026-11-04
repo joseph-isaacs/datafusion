@@ -140,6 +140,7 @@ impl<V: Copy + Default> HashIndex<V> {
         let home = self.home(hash);
         prefetch(&self.tags, home);
         prefetch(&self.hashes, home);
+        prefetch(&self.values, home);
     }
 
     /// Returns the first entry with hash `hash` for which `eq` holds.
