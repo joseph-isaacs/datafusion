@@ -124,6 +124,33 @@ pub trait JoinHashMapType: Send + Sync {
         deleted_offset: usize,
     );
 
+    /// Inserts build rows `row_offset..row_offset + hashes.len()`, where
+    /// `hashes[i]` is the hash of row `row_offset + i`. Rows marked NULL in
+    /// `valid` are skipped. With `reverse`, rows are inserted from last to
+    /// first, so that earlier rows end up on top of the chains.
+    ///
+    /// Equivalent to [`Self::update_from_iter`] over the same rows, but lets
+    /// implementations run a monomorphized loop instead of a boxed iterator.
+    fn update_from_hashes(
+        &mut self,
+        hashes: &[u64],
+        row_offset: usize,
+        valid: Option<&NullBuffer>,
+        deleted_offset: usize,
+        reverse: bool,
+    ) {
+        let iter = hashes
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| valid.is_none_or(|nulls| nulls.is_valid(*i)))
+            .map(move |(i, hash)| (i + row_offset, hash));
+        if reverse {
+            self.update_from_iter(Box::new(iter.rev()), deleted_offset);
+        } else {
+            self.update_from_iter(Box::new(iter), deleted_offset);
+        }
+    }
+
     fn get_matched_indices<'a>(
         &self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
@@ -195,6 +222,25 @@ impl JoinHashMapType for JoinHashMapU32 {
     ) {
         self.chained |=
             update_from_iter::<u32>(&mut self.map, &mut self.next, iter, deleted_offset);
+    }
+
+    fn update_from_hashes(
+        &mut self,
+        hashes: &[u64],
+        row_offset: usize,
+        valid: Option<&NullBuffer>,
+        deleted_offset: usize,
+        reverse: bool,
+    ) {
+        self.chained |= update_from_hashes::<u32>(
+            &mut self.map,
+            &mut self.next,
+            hashes,
+            row_offset,
+            valid,
+            deleted_offset,
+            reverse,
+        );
     }
 
     fn get_matched_indices<'a>(
@@ -283,6 +329,25 @@ impl JoinHashMapType for JoinHashMapU64 {
             update_from_iter::<u64>(&mut self.map, &mut self.next, iter, deleted_offset);
     }
 
+    fn update_from_hashes(
+        &mut self,
+        hashes: &[u64],
+        row_offset: usize,
+        valid: Option<&NullBuffer>,
+        deleted_offset: usize,
+        reverse: bool,
+    ) {
+        self.chained |= update_from_hashes::<u64>(
+            &mut self.map,
+            &mut self.next,
+            hashes,
+            row_offset,
+            valid,
+            deleted_offset,
+            reverse,
+        );
+    }
+
     fn get_matched_indices<'a>(
         &self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
@@ -364,6 +429,57 @@ where
                 vacant_entry.insert((hash_value, T::try_from(row + 1).unwrap()));
             }
         }
+    }
+    chained
+}
+
+/// Slice-based counterpart of [`update_from_iter`], see
+/// [`JoinHashMapType::update_from_hashes`]. Returns `true` if any row was
+/// chained onto an existing hash value.
+pub fn update_from_hashes<T>(
+    map: &mut HashTable<(u64, T)>,
+    next: &mut [T],
+    hashes: &[u64],
+    row_offset: usize,
+    valid: Option<&NullBuffer>,
+    deleted_offset: usize,
+    reverse: bool,
+) -> bool
+where
+    T: Copy + TryFrom<usize>,
+    <T as TryFrom<usize>>::Error: Debug,
+{
+    let mut chained = false;
+    let mut insert = |i: usize| {
+        let hash_value = hashes[i];
+        let row = row_offset + i;
+        let value = T::try_from(row + 1).unwrap();
+        match map.entry(
+            hash_value,
+            |&(hash, _)| hash_value == hash,
+            |&(hash, _)| hash,
+        ) {
+            Occupied(mut occupied_entry) => {
+                let prev_index =
+                    std::mem::replace(&mut occupied_entry.get_mut().1, value);
+                next[row - deleted_offset] = prev_index;
+                chained = true;
+            }
+            Vacant(vacant_entry) => {
+                vacant_entry.insert((hash_value, value));
+            }
+        }
+    };
+    match (valid, reverse) {
+        (None, true) => (0..hashes.len()).rev().for_each(&mut insert),
+        (None, false) => (0..hashes.len()).for_each(&mut insert),
+        (Some(valid), true) => (0..hashes.len())
+            .rev()
+            .filter(|&i| valid.is_valid(i))
+            .for_each(&mut insert),
+        (Some(valid), false) => (0..hashes.len())
+            .filter(|&i| valid.is_valid(i))
+            .for_each(&mut insert),
     }
     chained
 }

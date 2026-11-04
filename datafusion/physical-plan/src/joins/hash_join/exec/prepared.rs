@@ -68,7 +68,7 @@ impl PreparedHashJoinBuild {
     /// consuming input or modifying either plan. Cache identity is caller-owned.
     pub(super) fn validate(&self, join: &HashJoinExec) -> Result<()> {
         let keys = prepared_key_indices(join)?;
-        if join.left.schema() != self.build.batch.schema()
+        if join.left.schema() != *self.build.batch.schema()
             || keys != self.keys
             || join.null_equality != self.null_equality
         {
@@ -183,6 +183,7 @@ impl HashJoinExec {
             None,
             count,
             BuildMode::Prepared,
+            false,
         )
         .await?;
         Ok(Arc::new(PreparedHashJoinBuild {

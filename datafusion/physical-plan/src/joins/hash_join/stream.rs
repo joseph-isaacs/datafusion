@@ -989,24 +989,31 @@ impl HashJoinStream {
         }
 
         // Build output batch and push to coalescer
-        let (build_batch, probe_batch, join_side) =
-            if self.join_type == JoinType::RightMark {
-                (&state.batch, build_side.left_data.batch(), JoinSide::Right)
-            } else {
-                (build_side.left_data.batch(), &state.batch, JoinSide::Left)
-            };
-
-        let batch = build_batch_from_indices(
-            &self.schema,
-            build_batch,
-            probe_batch,
-            &left_indices,
-            &right_indices,
-            &self.column_indices,
-            join_side,
-            self.join_type,
-            None,
-        )?;
+        let batch = if self.join_type == JoinType::RightMark {
+            build_batch_from_indices(
+                &self.schema,
+                &state.batch,
+                &build_side.left_data.single_batch()?,
+                &left_indices,
+                &right_indices,
+                &self.column_indices,
+                JoinSide::Right,
+                self.join_type,
+                None,
+            )?
+        } else {
+            build_batch_from_indices(
+                &self.schema,
+                build_side.left_data.batch(),
+                &state.batch,
+                &left_indices,
+                &right_indices,
+                &self.column_indices,
+                JoinSide::Left,
+                self.join_type,
+                None,
+            )?
+        };
 
         // Reclaim the array map scratch buffers now that no index array
         // refers to them.
@@ -1200,17 +1207,45 @@ fn next_final_indices_chunk(
     // emit the unmatched ones.
     let emit_visited = join_type == JoinType::LeftSemi;
     let mut build_indices = Vec::with_capacity(batch_size.min(num_rows - start));
-    let mut idx = start;
-    while idx < num_rows && build_indices.len() < batch_size {
-        if visited.value(idx) == emit_visited {
-            build_indices.push(idx as u64);
-        }
-        idx += 1;
-    }
-    *cursor = idx;
+    *cursor = bit_positions(visited, start, emit_visited, batch_size, &mut build_indices);
 
     let probe_indices = UInt32Array::new_null(build_indices.len());
     (UInt64Array::from(build_indices), probe_indices)
+}
+
+/// Pushes to `out` the positions, from `start` on, of the bits of `bits` that
+/// equal `value`, at most `limit` of them. Returns the position to continue
+/// from: that of the next such bit, or `bits.len()` when there is none.
+///
+/// Examines 64 bits at a time, so runs of other bits are skipped cheaply.
+fn bit_positions(
+    bits: &BooleanBuffer,
+    start: usize,
+    value: bool,
+    limit: usize,
+    out: &mut Vec<u64>,
+) -> usize {
+    let window = bits.slice(start, bits.len() - start);
+    let chunks = window.bit_chunks();
+    let remainder_len = chunks.remainder_len();
+    let remainder_mask = (1u64 << remainder_len).wrapping_sub(1);
+    let words = chunks
+        .iter()
+        .map(|word| (word, u64::MAX))
+        .chain(std::iter::once((chunks.remainder_bits(), remainder_mask)));
+    for (k, (word, mask)) in words.enumerate() {
+        let mut word = if value { word } else { !word } & mask;
+        let base = start + k * 64;
+        while word != 0 {
+            let position = base + word.trailing_zeros() as usize;
+            if out.len() == limit {
+                return position;
+            }
+            out.push(position as u64);
+            word &= word - 1;
+        }
+    }
+    bits.len()
 }
 
 impl Stream for HashJoinStream {
@@ -1243,6 +1278,29 @@ mod tests {
 
     fn partitioned_handle(acc: &Arc<SharedBuildAccumulator>) -> BuildReportHandle {
         BuildReportHandle::new(0, PartitionMode::Partitioned, Some(Arc::clone(acc)))
+    }
+
+    #[test]
+    fn bit_positions_matches_scan() {
+        let bits = BooleanBuffer::from_iter((0..300).map(|i| i % 7 == 0 || i > 250));
+        for value in [false, true] {
+            for start in [0, 1, 63, 64, 130, 299, 300] {
+                for limit in [1, 5, 64, 1000] {
+                    let mut out = vec![];
+                    let next = bit_positions(&bits, start, value, limit, &mut out);
+                    let expected: Vec<u64> = (start..bits.len())
+                        .filter(|&i| bits.value(i) == value)
+                        .map(|i| i as u64)
+                        .collect();
+                    assert_eq!(out, expected[..expected.len().min(limit)]);
+                    let expected_next = expected
+                        .get(limit)
+                        .map(|&i| i as usize)
+                        .unwrap_or(bits.len());
+                    assert_eq!(next, expected_next, "{value} {start} {limit}");
+                }
+            }
+        }
     }
 
     #[test]

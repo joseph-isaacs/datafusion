@@ -9,10 +9,14 @@ use std::mem::size_of;
 use crate::joins::chain::traverse_chain;
 use crate::joins::join_hash_map::ProbeOffset;
 use crate::joins::join_hash_map::ProbeOffset::{AtRow, MidChain};
+use crate::joins::join_hash_table::prefetch;
 use arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
 use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::ArrowNumericType;
 use datafusion_common::{Result, ScalarValue, internal_err};
+
+/// Number of probe rows ahead whose bucket is prefetched.
+const PREFETCH_DISTANCE: usize = 16;
 
 /// A macro to downcast only supported integer types (up to 64-bit) and invoke a generic function.
 ///
@@ -261,6 +265,12 @@ impl ArrayMap {
         )
     }
 
+    /// Prefetches the bucket of `key`, see [`Self::get_value`].
+    #[inline(always)]
+    fn prefetch_key(&self, key: u64) {
+        prefetch(&self.data, key.wrapping_sub(self.offset) as usize);
+    }
+
     /// Looks up `key` (a raw probe value cast to `u64`) in the build side,
     /// returning the 1-based build-side slot if the key maps to a non-empty
     /// bucket, or `None` otherwise.
@@ -301,6 +311,13 @@ impl ArrayMap {
             for prob_idx in rows..arr.len() {
                 if build_indices.len() == limit {
                     return Ok(Some(AtRow { row: prob_idx }));
+                }
+                if prob_idx + PREFETCH_DISTANCE < arr.len() {
+                    // SAFETY: the index is checked to be in bounds just above.
+                    self.prefetch_key(
+                        unsafe { arr.value_unchecked(prob_idx + PREFETCH_DISTANCE) }
+                            .as_(),
+                    );
                 }
 
                 // short circuit
@@ -345,6 +362,13 @@ impl ArrayMap {
             for prob_side_idx in to_skip..arr.len() {
                 if remaining_output == 0 {
                     return Ok(Some(AtRow { row: prob_side_idx }));
+                }
+                if prob_side_idx + PREFETCH_DISTANCE < arr.len() {
+                    // SAFETY: the index is checked to be in bounds just above.
+                    self.prefetch_key(
+                        unsafe { arr.value_unchecked(prob_side_idx + PREFETCH_DISTANCE) }
+                            .as_(),
+                    );
                 }
 
                 if have_null && arr.is_null(prob_side_idx) {
@@ -402,6 +426,12 @@ impl ArrayMap {
     {
         let arr = array.as_primitive::<T>();
         let buffer = BooleanBuffer::collect_bool(arr.len(), |i| {
+            if i + PREFETCH_DISTANCE < arr.len() {
+                // SAFETY: the index is checked to be in bounds just above.
+                self.prefetch_key(
+                    unsafe { arr.value_unchecked(i + PREFETCH_DISTANCE) }.as_(),
+                );
+            }
             if arr.is_null(i) {
                 return false;
             }

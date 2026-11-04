@@ -18,6 +18,7 @@ use crate::filter_pushdown::{
 };
 use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
+use crate::joins::chunked_batch::ChunkedBatch;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::not_in::{NotIn, NotInBuild};
 use crate::joins::hash_join::shared_bounds::{
@@ -27,6 +28,7 @@ use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
 use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
+use crate::joins::join_hash_table::JoinHashTableU32;
 use crate::joins::key_range_bitmap::KeyRangeBitmap;
 use crate::joins::probe_completion::{Completion, ProbeCompletion};
 use crate::joins::utils::{
@@ -72,8 +74,8 @@ use datafusion_common::utils::memory::{
     RecordBatchMemoryCounter, estimate_memory_size, get_record_batch_memory_size,
 };
 use datafusion_common::{
-    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
-    plan_err, project_schema,
+    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err,
+    internal_datafusion_err, internal_err, plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -194,7 +196,7 @@ struct JoinBuildData {
     /// Hash table with row indices into `batch`, also shared with dynamic filters.
     map: Arc<Map>,
     /// The input rows for the build side.
-    batch: RecordBatch,
+    batch: ChunkedBatch,
     /// Evaluated build-side key expressions, with float `-0.0` rewritten to
     /// `+0.0` so probe batches can compare against them without scanning the
     /// build side again. The dynamic filters (`bounds`, `membership`) and
@@ -233,9 +235,17 @@ impl JoinLeftData {
         self.not_in.as_ref()
     }
 
-    /// returns a reference to the build side batch
-    pub(super) fn batch(&self) -> &RecordBatch {
+    /// returns a reference to the build side rows
+    pub(super) fn batch(&self) -> &ChunkedBatch {
         &self.build.batch
+    }
+
+    /// Returns the build side rows as a single batch, for joins that index
+    /// them directly (see the `allow_chunks` of `collect_left_input`).
+    pub(super) fn single_batch(&self) -> Result<RecordBatch> {
+        self.build.batch.as_single().ok_or_else(|| {
+            internal_datafusion_err!("Hash join build rows are not in a single batch")
+        })
     }
 
     /// Returns `true` if the build side physically contains rows.
@@ -1022,6 +1032,37 @@ impl HashJoinExec {
         (to_right, to_left)
     }
 
+    /// Whether this join gathers build rows only once the probe side is
+    /// exhausted, if at all: then its build rows are kept in their input
+    /// batches instead of being copied into one, see `ChunkedBatch`.
+    ///
+    /// Gathering from several batches costs more per row than from one, so
+    /// joins that gather build rows for every probe match concatenate them.
+    fn gathers_few_build_rows(&self) -> bool {
+        if self.filter.is_some() {
+            return false;
+        }
+        match self.join_type {
+            // Build rows are gathered from the final bitmap, or never.
+            JoinType::LeftSemi
+            | JoinType::LeftAnti
+            | JoinType::LeftMark
+            | JoinType::RightSemi
+            | JoinType::RightAnti => true,
+            // Reads the build rows as a single batch.
+            JoinType::RightMark => false,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
+                let output_column = |i: usize| &self.column_indices[i];
+                match self.projection.as_ref() {
+                    Some(projection) => projection
+                        .iter()
+                        .all(|&i| output_column(i).side != JoinSide::Left),
+                    None => self.column_indices.iter().all(|c| c.side != JoinSide::Left),
+                }
+            }
+        }
+    }
+
     fn allow_join_dynamic_filter_pushdown(&self, config: &ConfigOptions) -> bool {
         let (_, probe_preserved) = self.join_type.on_lr_is_preserved();
         if !probe_preserved || !config.optimizer.enable_join_dynamic_filter_pushdown {
@@ -1725,6 +1766,7 @@ impl ExecutionPlan for HashJoinExec {
                     not_in,
                     array_map_created_count,
                     BuildMode::Ordinary,
+                    self.gathers_few_build_rows(),
                 ))
             })?,
             (None, PartitionMode::Partitioned) => {
@@ -1747,6 +1789,7 @@ impl ExecutionPlan for HashJoinExec {
                     not_in,
                     array_map_created_count,
                     BuildMode::Ordinary,
+                    self.gathers_few_build_rows(),
                 ))
             }
             (None, PartitionMode::Auto) => {
@@ -2942,6 +2985,28 @@ pub(super) fn new_join_hashmap(
     }
 }
 
+/// Creates the hash table of the build side of [`HashJoinExec`], reserving its
+/// memory before allocating it.
+///
+/// Uses the open-addressing [`JoinHashTableU32`] for build sides that fit `u32`
+/// row indices, and [`new_join_hashmap`] otherwise.
+pub(super) fn new_build_join_hashmap(
+    num_rows: usize,
+    reservation: &mut MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+) -> Result<Box<dyn JoinHashMapType>> {
+    if num_rows >= u32::MAX as usize {
+        return new_join_hashmap(num_rows, reservation, metrics);
+    }
+    let estimated_size =
+        JoinHashTableU32::estimate_memory_size(num_rows).ok_or_else(|| {
+            datafusion_common::exec_datafusion_err!("Hash join table size overflow")
+        })?;
+    reservation.try_grow(estimated_size)?;
+    metrics.build_mem_used.add(estimated_size);
+    Ok(Box::new(JoinHashTableU32::with_capacity(num_rows)))
+}
+
 /// Estimates the memory newly allocated for `array`'s share of a concatenated
 /// array.
 ///
@@ -3008,6 +3073,21 @@ fn concat_build_batches(
     Ok(batch)
 }
 
+/// Concatenates the join key columns evaluated per build batch, `chunk_keys[b][k]`
+/// being key `k` of batch `b`, into one array per key.
+fn concat_key_columns(
+    num_keys: usize,
+    chunk_keys: &[Vec<ArrayRef>],
+) -> Result<Vec<ArrayRef>> {
+    (0..num_keys)
+        .map(|k| {
+            let arrays: Vec<&dyn Array> =
+                chunk_keys.iter().map(|keys| keys[k].as_ref()).collect();
+            Ok(arrow::compute::concat(&arrays)?)
+        })
+        .collect()
+}
+
 /// Collects all batches from the left (build) side stream and creates a hash map for joining.
 ///
 /// This function is responsible for:
@@ -3060,6 +3140,7 @@ async fn collect_left_input(
     not_in: Option<NotIn>,
     array_map_created_count: Count,
     mode: BuildMode,
+    allow_chunks: bool,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
     let prepared = mode == BuildMode::Prepared;
@@ -3153,6 +3234,7 @@ async fn collect_left_input(
         not_in,
         &array_map_created_count,
         prepared,
+        allow_chunks,
     )
 }
 
@@ -3163,7 +3245,7 @@ async fn collect_left_input(
 /// further. On error the reservation is dropped, releasing everything, while
 /// `batches` keeps every build row (possibly concatenated into one batch) for
 /// callers that need to recover from a failed build.
-#[expect(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn build_in_memory(
     random_state: &RandomState,
     schema: &SchemaRef,
@@ -3184,8 +3266,17 @@ fn build_in_memory(
     not_in: Option<NotIn>,
     array_map_created_count: &Count,
     prepared: bool,
+    allow_chunks: bool,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
+
+    // Keep the build rows in their input batches rather than copying them
+    // into a single one, see `ChunkedBatch`. The `NOT IN` state and prepared
+    // builds index a single batch.
+    let chunked = allow_chunks
+        && !prepared
+        && not_in.is_none()
+        && ChunkedBatch::worth_chunking(batches);
 
     let (join_hash_map, batch, left_values) = if let Some((min_val, max_val)) =
         array_map_key_range(
@@ -3198,12 +3289,33 @@ fn build_in_memory(
             config.execution.perfect_hash_join_min_key_density,
             null_equality,
         )? {
-        let batch = if prepared {
-            concat_batches(schema, batches.iter())?
+        let (batch, left_values) = if chunked {
+            let keys = batches
+                .iter()
+                .map(|batch| evaluate_expressions_to_arrays(on_left, batch))
+                .collect::<Result<Vec<_>>>()?;
+            (
+                ChunkedBatch::new(Arc::clone(schema), batches.clone()),
+                concat_key_columns(on_left.len(), &keys)?,
+            )
         } else {
-            concat_build_batches(schema, batches, input_bytes, &mut reservation, metrics)?
+            let batch = if prepared {
+                concat_batches(schema, batches.iter())?
+            } else {
+                concat_build_batches(
+                    schema,
+                    batches,
+                    input_bytes,
+                    &mut reservation,
+                    metrics,
+                )?
+            };
+            let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+            (
+                ChunkedBatch::new(Arc::clone(schema), vec![batch]),
+                left_values,
+            )
         };
-        let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
         let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
 
         array_map_created_count.add(1);
@@ -3216,7 +3328,7 @@ fn build_in_memory(
         // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
         // `u64` indice variant
         // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-        let mut hashmap = new_join_hashmap(num_rows, &mut reservation, metrics)?;
+        let mut hashmap = new_build_join_hashmap(num_rows, &mut reservation, metrics)?;
 
         let scratch_reservation = reservation.new_empty();
         if prepared {
@@ -3233,11 +3345,14 @@ fn build_in_memory(
         // Update the hashmap starting from the last batch, so rows with smaller
         // indices end up on top of the chains. Each batch is indexed at its
         // position in the forward concatenation below.
+        // With `chunked`, the keys of each batch are kept to be concatenated
+        // afterwards, in place of evaluating them over the concatenated batch.
+        let mut chunk_keys = Vec::with_capacity(if chunked { batches.len() } else { 0 });
         for batch in batches.iter().rev() {
             offset -= batch.num_rows();
             hashes_buffer.clear();
             hashes_buffer.resize(batch.num_rows(), 0);
-            update_hash(
+            let keys = update_hash(
                 on_left,
                 batch,
                 &mut *hashmap,
@@ -3248,16 +3363,36 @@ fn build_in_memory(
                 true,
                 null_equality,
             )?;
+            if chunked {
+                chunk_keys.push(keys);
+            }
         }
 
-        // Merge all batches into a single batch, so we can directly index into the arrays
-        let batch = if prepared {
-            concat_batches(schema, batches.iter())?
+        let (batch, left_values) = if chunked {
+            chunk_keys.reverse();
+            (
+                ChunkedBatch::new(Arc::clone(schema), batches.clone()),
+                concat_key_columns(on_left.len(), &chunk_keys)?,
+            )
         } else {
-            concat_build_batches(schema, batches, input_bytes, &mut reservation, metrics)?
+            // Merge all batches into a single batch, so we can directly index into the arrays
+            let batch = if prepared {
+                concat_batches(schema, batches.iter())?
+            } else {
+                concat_build_batches(
+                    schema,
+                    batches,
+                    input_bytes,
+                    &mut reservation,
+                    metrics,
+                )?
+            };
+            let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+            (
+                ChunkedBatch::new(Arc::clone(schema), vec![batch]),
+                left_values,
+            )
         };
-
-        let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
         (Map::HashMap(hashmap), batch, left_values)
     };
@@ -3272,7 +3407,9 @@ fn build_in_memory(
     // expression evaluates to new arrays that are kept for the whole join.
     // The same goes for normalized keys: only a rewritten copy adds memory.
     let mut key_counter = RecordBatchMemoryCounter::new();
-    key_counter.count_batch(&batch);
+    for chunk in batch.chunks() {
+        key_counter.count_batch(chunk);
+    }
     let keys_size = left_values
         .iter()
         .chain(&normalized_values)
@@ -3282,11 +3419,11 @@ fn build_in_memory(
     metrics.build_mem_used.add(keys_size);
 
     let allocate_bitmap = || -> Result<BooleanBufferBuilder> {
-        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+        let bitmap_size = bit_util::ceil(num_rows, 8);
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
 
-        let mut bitmap = BooleanBufferBuilder::new(batch.num_rows());
+        let mut bitmap = BooleanBufferBuilder::new(num_rows);
         bitmap.append_n(num_rows, false);
         Ok(bitmap)
     };
@@ -3300,6 +3437,9 @@ fn build_in_memory(
 
     let not_in = not_in
         .map(|not_in| {
+            let batch = batch.as_single().ok_or_else(|| {
+                internal_datafusion_err!("NOT IN build rows must be in a single batch")
+            })?;
             NotInBuild::try_new(
                 not_in,
                 on_left,
@@ -3378,7 +3518,8 @@ fn build_in_memory(
         batches.clear();
         // Prepared keys are direct columns. IN-list arrays share these batch
         // buffers, including through multi-key StructArray children.
-        let retained = RecordBatchMemoryCounter::new().count_batch(&batch);
+        let mut counter = RecordBatchMemoryCounter::new();
+        let retained = batch.chunks().iter().map(|c| counter.count_batch(c)).sum();
         prepared::reconcile_prepared_copy_reservation(
             &reservation,
             input_bytes,
@@ -4277,6 +4418,7 @@ mod tests {
             None,
             Count::new(),
             BuildMode::Ordinary,
+            true,
         )
         .await?;
         Ok((left_data, metrics))
@@ -4292,17 +4434,15 @@ mod tests {
         let stored = with_neg_zero.values()[0].as_primitive::<Float64Type>();
         assert_eq!(stored.value(0).to_bits(), 0.0_f64.to_bits());
         assert_eq!(stored.value(1), 1.0);
-        let original = with_neg_zero
-            .batch()
-            .column(0)
-            .as_primitive::<Float64Type>();
+        let original_batch = with_neg_zero.single_batch()?;
+        let original = original_batch.column(0).as_primitive::<Float64Type>();
         assert_eq!(original.value(0).to_bits(), (-0.0_f64).to_bits());
 
         let (without_neg_zero, pos_metrics) =
             collect_float_build(Arc::new(Float64Array::from(vec![0.0, 1.0]))).await?;
         assert!(Arc::ptr_eq(
             &without_neg_zero.values()[0],
-            without_neg_zero.batch().column(0)
+            without_neg_zero.single_batch()?.column(0)
         ));
 
         // Both builds are the same shape, so they differ only by the copy.
@@ -4316,7 +4456,8 @@ mod tests {
                 .await?;
         let stored = f32_build.values()[0].as_primitive::<Float32Type>();
         assert_eq!(stored.value(0).to_bits(), 0.0_f32.to_bits());
-        let original = f32_build.batch().column(0).as_primitive::<Float32Type>();
+        let original_batch = f32_build.single_batch()?;
+        let original = original_batch.column(0).as_primitive::<Float32Type>();
         assert_eq!(original.value(0).to_bits(), (-0.0_f32).to_bits());
         Ok(())
     }
@@ -8175,16 +8316,22 @@ mod tests {
         Ok(())
     }
 
-    /// The build side is concatenated into a single batch, and that copy must
-    /// be visible to the memory pool while the input batches are still alive.
+    /// Build batches too small to be kept as chunks (see `ChunkedBatch`) are
+    /// concatenated into a single batch, and that copy must be visible to the
+    /// memory pool while the input batches are still alive.
+    ///
+    /// Larger build batches of a join that gathers few build rows are kept as
+    /// they are: the build then fits in the memory that the copy would have
+    /// exceeded.
     #[rstest]
     #[tokio::test]
     async fn join_build_concat_is_reserved(
         #[values(PartitionMode::CollectLeft, PartitionMode::Partitioned)]
         mode: PartitionMode,
         #[values(false, true)] use_perfect_hash_join_as_possible: bool,
+        #[values(500, 4000)] num_rows: i32,
     ) -> Result<()> {
-        let num_rows = 4000;
+        let chunked = num_rows >= 1024;
         let values = (0..num_rows).collect::<Vec<i32>>();
         let batches = (0..4)
             .map(|_| build_table_i32(("a1", &values), ("b1", &values), ("c1", &values)))
@@ -8206,11 +8353,10 @@ mod tests {
         let map = if use_perfect_hash_join_as_possible {
             ArrayMap::estimate_memory_size(0, num_rows as u64 - 1, build_rows)
         } else {
-            estimate_memory_size::<(u32, u64)>(build_rows, size_of::<JoinHashMapU32>())?
-                + build_rows * size_of::<u32>()
+            JoinHashTableU32::estimate_memory_size(build_rows).unwrap()
         };
 
-        for (limit, fits) in [(map + inputs * 3 / 2, false), (map + inputs * 3, true)] {
+        for (limit, fits) in [(map + inputs * 3 / 2, chunked), (map + inputs * 3, true)] {
             let left = TestMemoryExec::try_new_exec(
                 std::slice::from_ref(&batches),
                 Arc::clone(&left_schema),
@@ -8221,7 +8367,11 @@ mod tests {
                 Arc::clone(&right),
                 on.clone(),
                 None,
-                &JoinType::Inner,
+                if chunked {
+                    &JoinType::LeftSemi
+                } else {
+                    &JoinType::Inner
+                },
                 None,
                 mode,
                 NullEquality::NullEqualsNothing,
@@ -8251,6 +8401,86 @@ mod tests {
         Ok(())
     }
 
+    /// Joins that keep large build batches as chunks (see `ChunkedBatch`)
+    /// return the same rows as over the concatenated build batch.
+    #[rstest]
+    #[tokio::test]
+    async fn join_with_chunked_build_matches_single_batch(
+        #[values(
+            JoinType::LeftSemi,
+            JoinType::LeftAnti,
+            JoinType::LeftMark,
+            JoinType::RightSemi,
+            JoinType::RightAnti
+        )]
+        join_type: JoinType,
+        #[values(PartitionMode::CollectLeft, PartitionMode::Partitioned)]
+        mode: PartitionMode,
+        #[values(false, true)] use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("a1", DataType::Int32, true),
+            Field::new("b1", DataType::Utf8View, true),
+        ]));
+        // Three batches with duplicate keys and NULLs, so that rows of a key
+        // are spread over several chunks.
+        let left_batches = (0..3)
+            .map(|b| {
+                let keys = Int32Array::from_iter(
+                    (0..1500).map(|i| (i % 97 != 0).then_some((i * 7 + b) % 3000)),
+                );
+                let values = StringViewArray::from_iter((0..1500).map(|i| {
+                    (i % 5 != 0).then(|| format!("build row {b} {i} with a long value"))
+                }));
+                RecordBatch::try_new(
+                    Arc::clone(&left_schema),
+                    vec![Arc::new(keys), Arc::new(values)],
+                )
+            })
+            .collect::<arrow::error::Result<Vec<_>>>()?;
+        let single = concat_batches(&left_schema, &left_batches)?;
+        let right = build_table_i32(
+            ("a2", &(0..4000).map(|i| (i * 3) % 3500).collect()),
+            ("b2", &(0..4000).collect()),
+            ("c2", &(0..4000).collect()),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("a1", &left_schema)?) as _,
+            Arc::new(Column::new_with_schema("a2", &right.schema())?) as _,
+        )];
+
+        let mut results = vec![];
+        for batches in [left_batches, vec![single]] {
+            let left =
+                TestMemoryExec::try_new_exec(&[batches], Arc::clone(&left_schema), None)?;
+            let right = TestMemoryExec::try_new_exec(
+                &[vec![right.clone()]],
+                right.schema(),
+                None,
+            )?;
+            let task_ctx = prepare_task_ctx(1000, use_perfect_hash_join_as_possible);
+            let (_, batches, _) = join_collect_with_partition_mode(
+                left,
+                right,
+                on.clone(),
+                &join_type,
+                mode,
+                NullEquality::NullEqualsNothing,
+                task_ctx,
+            )
+            .await?;
+            let mut rows = batches_to_sort_string(&batches)
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            rows.sort();
+            results.push(rows);
+        }
+        assert!(results[0].len() > 6, "{join_type}: {:?}", results[0]);
+        assert_eq!(results[0], results[1], "{join_type}");
+        Ok(())
+    }
+
     /// Join keys that are not plain columns evaluate to new arrays, which are
     /// kept for the whole join and must be reserved.
     #[rstest]
@@ -8274,10 +8504,7 @@ mod tests {
         let map = if use_perfect_hash_join_as_possible {
             ArrayMap::estimate_memory_size(1, num_rows as u64, num_rows as usize)
         } else {
-            estimate_memory_size::<(u32, u64)>(
-                num_rows as usize,
-                size_of::<JoinHashMapU32>(),
-            )? + num_rows as usize * size_of::<u32>()
+            JoinHashTableU32::estimate_memory_size(num_rows as usize).unwrap()
         };
 
         for (computed_key, limit, fits) in [

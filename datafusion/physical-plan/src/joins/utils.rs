@@ -1392,7 +1392,7 @@ pub(crate) fn is_existence_join(join_type: JoinType) -> bool {
 
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn apply_join_filter_to_indices(
-    build_input_buffer: &RecordBatch,
+    build_input_buffer: &(impl BuildSideRows + ?Sized),
     probe_batch: &RecordBatch,
     build_indices: UInt64Array,
     probe_indices: UInt32Array,
@@ -1463,6 +1463,48 @@ pub(crate) fn apply_join_filter_to_indices(
     ))
 }
 
+/// The rows of the build side of a join, gathered by index into output
+/// columns by [`build_batch_from_indices`].
+pub(crate) trait BuildSideRows {
+    /// Number of rows.
+    fn num_rows(&self) -> usize;
+
+    /// Data type of column `index`.
+    fn column_data_type(&self, index: usize) -> &DataType;
+
+    /// Gathers column `column` at `indices`, like [`take`]. NULL indices
+    /// produce NULLs.
+    fn take_column(&self, column: usize, indices: &UInt64Array) -> Result<ArrayRef>;
+}
+
+impl BuildSideRows for RecordBatch {
+    fn num_rows(&self) -> usize {
+        RecordBatch::num_rows(self)
+    }
+
+    fn column_data_type(&self, index: usize) -> &DataType {
+        self.schema_ref().field(index).data_type()
+    }
+
+    fn take_column(&self, column: usize, indices: &UInt64Array) -> Result<ArrayRef> {
+        Ok(take(self.column(column).as_ref(), indices, None)?)
+    }
+}
+
+impl BuildSideRows for super::chunked_batch::ChunkedBatch {
+    fn num_rows(&self) -> usize {
+        super::chunked_batch::ChunkedBatch::num_rows(self)
+    }
+
+    fn column_data_type(&self, index: usize) -> &DataType {
+        self.schema().field(index).data_type()
+    }
+
+    fn take_column(&self, column: usize, indices: &UInt64Array) -> Result<ArrayRef> {
+        super::chunked_batch::ChunkedBatch::take_column(self, column, indices)
+    }
+}
+
 /// Creates a [RecordBatch] with zero columns but the given row count.
 /// Used when a join has an empty projection (e.g. `SELECT count(1) ...`).
 fn new_empty_schema_batch(schema: &SchemaRef, row_count: usize) -> Result<RecordBatch> {
@@ -1479,7 +1521,7 @@ fn new_empty_schema_batch(schema: &SchemaRef, row_count: usize) -> Result<Record
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn build_batch_from_indices(
     schema: &SchemaRef,
-    build_input_buffer: &RecordBatch,
+    build_input_buffer: &(impl BuildSideRows + ?Sized),
     probe_batch: &RecordBatch,
     build_indices: &UInt64Array,
     probe_indices: &UInt32Array,
@@ -1499,6 +1541,11 @@ pub(crate) fn build_batch_from_indices(
         return new_empty_schema_batch(schema, row_count);
     }
 
+    // When the probe indices are a run of consecutive rows, as for a probe
+    // batch whose every row matches a single build row, the probe columns
+    // are slices of the probe batch rather than gathered copies.
+    let probe_run = consecutive_run(probe_indices);
+
     // build the columns of the new [RecordBatch]:
     // 1. pick whether the column is from the left or right
     // 2. based on the pick, `take` items from the different RecordBatches
@@ -1513,21 +1560,27 @@ pub(crate) fn build_batch_from_indices(
                 None => Arc::new(compute::is_not_null(probe_indices)?),
             }
         } else if column_index.side == build_side {
-            let array = build_input_buffer.column(column_index.index);
-            if array.is_empty() || build_indices.null_count() == build_indices.len() {
+            if build_input_buffer.num_rows() == 0
+                || build_indices.null_count() == build_indices.len()
+            {
                 // Outer join would generate a null index when finding no match at our side.
                 // Therefore, it's possible we are empty but need to populate an n-length null array,
                 // where n is the length of the index array.
                 assert_eq!(build_indices.null_count(), build_indices.len());
-                new_null_array(array.data_type(), build_indices.len())
+                new_null_array(
+                    build_input_buffer.column_data_type(column_index.index),
+                    build_indices.len(),
+                )
             } else {
-                take(array.as_ref(), build_indices, None)?
+                build_input_buffer.take_column(column_index.index, build_indices)?
             }
         } else {
             let array = probe_batch.column(column_index.index);
             if array.is_empty() || probe_indices.null_count() == probe_indices.len() {
                 assert_eq!(probe_indices.null_count(), probe_indices.len());
                 new_null_array(array.data_type(), probe_indices.len())
+            } else if let Some((offset, len)) = probe_run {
+                array.slice(offset, len)
             } else {
                 take(array.as_ref(), probe_indices, None)?
             }
@@ -1538,13 +1591,33 @@ pub(crate) fn build_batch_from_indices(
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
+/// Returns `(offset, len)` if `indices` holds no NULLs and is the run of
+/// consecutive values `offset..offset + len`.
+fn consecutive_run(indices: &UInt32Array) -> Option<(usize, usize)> {
+    if indices.is_empty() || indices.null_count() > 0 {
+        return None;
+    }
+    let values = indices.values();
+    let first = values[0];
+    let last = values[values.len() - 1];
+    // A cheap rejection before the full scan.
+    if (last as usize).checked_sub(first as usize)? != values.len() - 1 {
+        return None;
+    }
+    values
+        .iter()
+        .enumerate()
+        .all(|(i, &v)| v as usize == first as usize + i)
+        .then_some((first as usize, values.len()))
+}
+
 /// Returns a new [RecordBatch] for a probe batch when no probe row can find a
 /// match: the build-side map is empty, either because the build side has no
 /// rows or because none of its rows has a matchable (non-NULL) join key.
 /// The resulting batch has [Schema] `schema`.
 pub(crate) fn build_batch_empty_build_side(
     schema: &SchemaRef,
-    build_batch: &RecordBatch,
+    build_batch: &(impl BuildSideRows + ?Sized),
     probe_batch: &RecordBatch,
     column_indices: &[ColumnIndex],
     join_type: JoinType,
@@ -1564,10 +1637,9 @@ pub(crate) fn build_batch_empty_build_side(
         .iter()
         .map(|column_index| match column_index.side {
             // left -> null array
-            JoinSide::Left => new_null_array(
-                build_batch.column(column_index.index).data_type(),
-                num_rows,
-            ),
+            JoinSide::Left => {
+                new_null_array(build_batch.column_data_type(column_index.index), num_rows)
+            }
             // right -> respective right array
             JoinSide::Right => Arc::clone(probe_batch.column(column_index.index)),
             // right mark -> unset boolean array as there are no matches on the left side
@@ -2349,7 +2421,7 @@ pub fn update_hash(
     deleted_offset: usize,
     fifo_hashmap: bool,
     null_equality: NullEquality,
-) -> Result<()> {
+) -> Result<Vec<ArrayRef>> {
     // evaluate the keys
     let keys_values = evaluate_expressions_to_arrays(on, batch)?;
 
@@ -2362,20 +2434,15 @@ pub fn update_hash(
     // Unmatchable NULL-key rows are filtered out below.
     let valid_keys = matchable_join_keys(&keys_values, null_equality);
 
-    // Updating JoinHashMap from hash values iterator
-    let hash_values_iter = hash_values
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| valid_keys.as_ref().is_none_or(|nulls| nulls.is_valid(*i)))
-        .map(|(i, val)| (i + offset, val));
+    hash_map.update_from_hashes(
+        hash_values,
+        offset,
+        valid_keys.as_ref(),
+        deleted_offset,
+        fifo_hashmap,
+    );
 
-    if fifo_hashmap {
-        hash_map.update_from_iter(Box::new(hash_values_iter.rev()), deleted_offset);
-    } else {
-        hash_map.update_from_iter(Box::new(hash_values_iter), deleted_offset);
-    }
-
-    Ok(())
+    Ok(keys_values)
 }
 
 /// Returns the combined validity of the join key columns `join_key_arrays`: a row
@@ -2568,21 +2635,30 @@ fn equal_rows_single_col(
             let mut left_filtered = Vec::with_capacity(indices_left.len());
             let mut right_filtered = Vec::with_capacity(indices_right.len());
 
-            for (left_idx, right_idx) in
-                indices_left.values().iter().zip(indices_right.values())
-            {
-                let i = *left_idx as usize;
-                let j = *right_idx as usize;
+            let pairs = indices_left.values().iter().zip(indices_right.values());
+            if l.null_count() == 0 && r.null_count() == 0 {
+                // No NULLs: compare the values only.
+                for (left_idx, right_idx) in pairs {
+                    if l.value(*left_idx as usize) == r.value(*right_idx as usize) {
+                        left_filtered.push(*left_idx);
+                        right_filtered.push(*right_idx);
+                    }
+                }
+            } else {
+                for (left_idx, right_idx) in pairs {
+                    let i = *left_idx as usize;
+                    let j = *right_idx as usize;
 
-                let is_equal = match (l.is_null(i), r.is_null(j)) {
-                    (false, false) => l.value(i) == r.value(j),
-                    (true, true) => null_equals_null,
-                    _ => false,
-                };
+                    let is_equal = match (l.is_null(i), r.is_null(j)) {
+                        (false, false) => l.value(i) == r.value(j),
+                        (true, true) => null_equals_null,
+                        _ => false,
+                    };
 
-                if is_equal {
-                    left_filtered.push(*left_idx);
-                    right_filtered.push(*right_idx);
+                    if is_equal {
+                        left_filtered.push(*left_idx);
+                        right_filtered.push(*right_idx);
+                    }
                 }
             }
 

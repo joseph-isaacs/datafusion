@@ -7,4 +7,5 @@
 pub(crate) mod boolean;
 pub(crate) mod bytes;
 pub(crate) mod bytes_view;
+mod group_table;
 pub(crate) mod primitive;

@@ -29,6 +29,7 @@ pub use sort_merge_join::SortMergeJoinExec;
 pub use symmetric_hash_join::SymmetricHashJoinExec;
 mod asof_join;
 mod chain;
+mod chunked_batch;
 mod cross_join;
 mod hash_join;
 mod logical_batch;
@@ -53,6 +54,8 @@ mod join_filter;
 /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
 #[doc(hidden)]
 pub mod join_hash_map;
+#[doc(hidden)]
+pub mod join_hash_table;
 pub mod key_range_bitmap;
 
 use array_map::ArrayMap;

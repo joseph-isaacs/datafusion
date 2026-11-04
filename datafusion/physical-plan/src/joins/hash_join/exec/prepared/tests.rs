@@ -444,7 +444,8 @@ async fn prepared_build_shares_single_batch_but_owns_output() -> Result<()> {
             let single_batch = sources.len() == 1;
             let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
             let prepared = prepare(&base, sources, Arc::clone(&pool)).await?;
-            let addresses = buffer_addresses(prepared.build.batch.columns());
+            let addresses =
+                buffer_addresses(prepared.build.batch.as_single().unwrap().columns());
             if single_batch {
                 assert_eq!(addresses, buffer_addresses(build.columns()));
             }
@@ -754,7 +755,8 @@ async fn prepared_inlist_shares_accounted_build_buffers() -> Result<()> {
             let PushdownStrategy::InList(values) = &prepared.build.membership else {
                 panic!("expected IN-list membership");
             };
-            let columns = prepared.build.batch.columns();
+            let single = prepared.build.batch.as_single().unwrap();
+            let columns = single.columns();
             if keys == 1 {
                 assert!(Arc::ptr_eq(values, &columns[0]));
             } else {
@@ -765,7 +767,8 @@ async fn prepared_inlist_shares_accounted_build_buffers() -> Result<()> {
             }
             let bytes = prepared.reserved_bytes();
             let mut counter = RecordBatchMemoryCounter::new();
-            let batch_bytes = counter.count_batch(&prepared.build.batch);
+            let batch_bytes =
+                counter.count_batch(&prepared.build.batch.as_single().unwrap());
             assert!(bytes > batch_bytes, "hash storage must also be reserved");
             let membership_batch =
                 RecordBatch::try_from_iter([("membership", Arc::clone(values))])?;
