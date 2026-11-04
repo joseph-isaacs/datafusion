@@ -361,9 +361,10 @@ fn multi_thread_runtime() -> bool {
 /// Decodes `morsel` in its own task, up to [`LOOKAHEAD_BATCHES`] ahead of its
 /// consumer. Dropping the returned morsel, or its stream, stops the task.
 ///
-/// With a `reservation`, each batch decoded ahead is reserved from it until
-/// the consumer takes the batch, so the memory pool sees what the lookahead
-/// holds; dropping the morsel's stream releases what is still waiting.
+/// With a `reservation`, the lookahead's capacity (`LOOKAHEAD_BATCHES` times
+/// the first batch's size) is reserved from it while the morsel decodes, so
+/// the memory pool sees what the lookahead can hold; it is released when the
+/// morsel's stream is dropped.
 fn spawn_morsel(
     morsel: Box<dyn Morsel>,
     reservation: Option<&MemoryReservation>,
@@ -371,15 +372,21 @@ fn spawn_morsel(
     let (tx, rx) = tokio::sync::mpsc::channel(LOOKAHEAD_BATCHES);
     let mut stream = morsel.into_stream();
     let held = reservation.map(|r| Arc::new(r.new_empty()));
-    let produced = held.clone();
+    let producer = held.clone();
     let task = SpawnedTask::spawn(async move {
         // Reserve a slot before decoding, so at most `LOOKAHEAD_BATCHES`
         // batches exist ahead of the consumer.
         while let Ok(permit) = tx.reserve().await {
             match stream.next().await {
                 Some(item) => {
-                    if let (Some(held), Ok(batch)) = (&produced, &item) {
-                        held.grow(batch.get_array_memory_size());
+                    // Reserve the buffer's whole capacity once, sized by the
+                    // first batch, rather than growing and shrinking the
+                    // pool (which may lock) for every batch.
+                    if let (Some(reservation), Ok(batch)) = (&producer, &item)
+                        && reservation.size() == 0
+                    {
+                        reservation
+                            .grow(LOOKAHEAD_BATCHES * batch.get_array_memory_size());
                     }
                     permit.send(item)
                 }
@@ -387,13 +394,11 @@ fn spawn_morsel(
             }
         }
     });
+    // The consumer's side keeps the reservation until the stream is dropped,
+    // covering batches still waiting in the channel after decoding ends.
     let stream =
         futures::stream::unfold((rx, task, held), |(mut rx, task, held)| async move {
-            let item = rx.recv().await?;
-            if let (Some(held), Ok(batch)) = (&held, &item) {
-                held.shrink(batch.get_array_memory_size());
-            }
-            Some((item, (rx, task, held)))
+            rx.recv().await.map(|item| (item, (rx, task, held)))
         });
     Box::new(SpawnedMorsel(stream.boxed()))
 }
