@@ -61,8 +61,8 @@ use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::format::ExplainAnalyzeCategories;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
-    DFSchema, DFSchemaRef, ScalarValue, Statistics, exec_err, internal_datafusion_err,
-    internal_err, not_impl_err, plan_err,
+    DFSchema, DFSchemaRef, NullEquality, ScalarValue, Statistics, exec_err,
+    internal_datafusion_err, internal_err, not_impl_err, plan_err,
 };
 use datafusion_common::{
     TableReference, assert_eq_or_internal_err, assert_or_internal_err,
@@ -92,7 +92,7 @@ use datafusion_physical_expr::aggregate::{
 };
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::{
-    LexOrdering, PhysicalSortExpr, create_physical_sort_exprs,
+    EquivalenceProperties, LexOrdering, PhysicalSortExpr, create_physical_sort_exprs,
 };
 use datafusion_physical_optimizer::ensure_requirements::EnsureRequirements;
 use datafusion_physical_optimizer::sanity_checker::{
@@ -1884,6 +1884,21 @@ impl DefaultPhysicalPlanner {
                         *null_equality,
                     )?)
                 } else {
+                    let supported_null_equality = match null_equality {
+                        NullEquality::NullEqualsNothing => true,
+                        NullEquality::NullEqualsNull => false,
+                    };
+                    let join_on =
+                        if matches!(*null_aware, false) && supported_null_equality {
+                            dedup_join_keys(
+                                join_on,
+                                physical_left.equivalence_properties(),
+                                physical_right.equivalence_properties(),
+                            )
+                        } else {
+                            join_on
+                        };
+
                     // Null-aware joins need global probe-side state, so keep
                     // them in CollectLeft mode.
                     let partition_mode = if can_repartition_join {
@@ -2346,6 +2361,29 @@ impl DefaultPhysicalPlanner {
             ))
         }
     }
+}
+
+/// Remove key pairs implied by an earlier pair and the inputs' equivalences.
+/// This runs before the new hash join has distribution or dynamic-filter state.
+fn dedup_join_keys(
+    on: join_utils::JoinOn,
+    left: &EquivalenceProperties,
+    right: &EquivalenceProperties,
+) -> join_utils::JoinOn {
+    if on.len() < 2 {
+        return on;
+    }
+    let (left_eq, right_eq) = (left.eq_group(), right.eq_group());
+    let mut kept: join_utils::JoinOn = Vec::with_capacity(on.len());
+    for (l, r) in on {
+        let implied = kept
+            .iter()
+            .any(|(kl, kr)| left_eq.exprs_equal(kl, &l) && right_eq.exprs_equal(kr, &r));
+        if !implied {
+            kept.push((l, r));
+        }
+    }
+    kept
 }
 
 fn create_information_schema_provider(
@@ -3935,13 +3973,14 @@ mod tests {
     };
     use datafusion_functions_aggregate::count::{count_all, count_udaf};
     use datafusion_functions_aggregate::expr_fn::sum;
-    use datafusion_physical_expr::EquivalenceProperties;
     use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion_physical_plan::joins::HashJoinExec;
     use datafusion_physical_plan::operator_statistics::StatisticsRegistry;
     use datafusion_physical_plan::statistics::StatisticsArgs;
     use datafusion_physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion_session::QueryPlanner;
     use parking_lot::Mutex as SyncMutex;
+    use rstest::rstest;
 
     /// Records the root statistics computed with the shared statistics context
     #[derive(Debug)]
@@ -4450,6 +4489,95 @@ mod tests {
                 params.args[0].human_display()
             ))
         }
+    }
+
+    // Inspect the initial plan before join selection/distribution enforcement so
+    // both Auto and CollectLeft are covered without logical optimizer rewrites.
+    #[rstest]
+    #[case::equivalent(true, NullEquality::NullEqualsNothing, false, 1)]
+    #[case::independent(false, NullEquality::NullEqualsNothing, false, 2)]
+    #[case::nulls_equal(true, NullEquality::NullEqualsNull, false, 2)]
+    #[case::null_aware(true, NullEquality::NullEqualsNothing, true, 2)]
+    #[tokio::test]
+    async fn hash_join_key_deduplication(
+        #[values(1, 8)] partitions: usize,
+        #[case] equivalent: bool,
+        #[case] null_equality: NullEquality,
+        #[case] null_aware: bool,
+        #[case] expected_keys: usize,
+    ) -> Result<()> {
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(partitions),
+        );
+        let left = ctx
+            .read_batch(RecordBatch::try_from_iter(vec![(
+                "k",
+                Arc::new(Int32Array::from(vec![1, 1, 2, 3])) as ArrayRef,
+            )])?)?
+            .into_unoptimized_plan();
+        let mut right = ctx
+            .read_batch(RecordBatch::try_from_iter(vec![
+                ("a", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef),
+                ("b", Arc::new(Int32Array::from(vec![1, 2, 30])) as ArrayRef),
+            ])?)?
+            .into_unoptimized_plan();
+        if equivalent {
+            right = LogicalPlanBuilder::from(right)
+                .filter(col("a").eq(col("b")))?
+                .build()?;
+        }
+        let join_type = if null_aware {
+            JoinType::LeftAnti
+        } else {
+            JoinType::Inner
+        };
+        let mut logical_plan = LogicalPlanBuilder::from(left)
+            .join_detailed(
+                right,
+                join_type,
+                (vec!["k", "k"], vec!["a", "b"]),
+                None,
+                null_equality,
+            )?
+            .build()?;
+        if let LogicalPlan::Join(join) = &mut logical_plan {
+            join.null_aware = null_aware;
+            join.null_aware_value_keys = 2;
+        }
+        let planner = DefaultPhysicalPlanner::default();
+        let state = ctx.state();
+        let initial = planner.create_initial_plan(&logical_plan, &state).await?;
+        let join = initial.downcast_ref::<HashJoinExec>().expect("hash join");
+        assert_eq!(join.on().len(), expected_keys);
+        assert_eq!(
+            join.partition_mode(),
+            &if partitions == 1 || null_aware {
+                PartitionMode::CollectLeft
+            } else {
+                PartitionMode::Auto
+            }
+        );
+
+        let physical = planner.create_physical_plan(&logical_plan, &state).await?;
+        let batches = datafusion_physical_plan::collect(physical, ctx.task_ctx()).await?;
+        if null_aware {
+            assert_batches_eq!(["+---+", "| k |", "+---+", "| 3 |", "+---+",], &batches);
+        } else {
+            // Duplicates survive; (3, 30) must fail the second join predicate.
+            datafusion_common::assert_batches_sorted_eq!(
+                [
+                    "+---+---+---+",
+                    "| k | a | b |",
+                    "+---+---+---+",
+                    "| 1 | 1 | 1 |",
+                    "| 1 | 1 | 1 |",
+                    "| 2 | 2 | 2 |",
+                    "+---+---+---+",
+                ],
+                &batches
+            );
+        }
+        Ok(())
     }
 
     async fn plan_sql(query: &str) -> Result<Arc<dyn ExecutionPlan>> {
