@@ -1142,11 +1142,11 @@ impl BitwiseSortMergeJoinStream {
         // helpers are only entered at batch boundaries.
         // Read each input ahead from the moment it is needed: the inner one
         // once the outer one has produced a row.
-        super::prefetch(&mut self.outer);
+        super::prefetch(&mut self.outer, &self.reservation);
         let mut inner_prefetched = false;
         while self.has_current_outer_row() || self.advance_outer_row(emitter).await? {
             if !inner_prefetched {
-                super::prefetch(&mut self.inner);
+                super::prefetch(&mut self.inner, &self.reservation);
                 inner_prefetched = true;
             }
             if !(self.has_current_inner_row() || self.advance_inner_row().await?) {

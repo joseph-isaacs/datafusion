@@ -850,10 +850,10 @@ impl MaterializingSortMergeJoinStream {
     ) -> Result<()> {
         // 1. Load the first streamed row and the first buffered key group,
         //    reading each input ahead from the moment it is needed.
-        super::prefetch(&mut self.streamed);
+        super::prefetch(&mut self.streamed, &self.reservation);
         self.load_next_streamed_batch().await?;
         if !self.finished() {
-            super::prefetch(&mut self.buffered);
+            super::prefetch(&mut self.buffered, &self.reservation);
             self.advance_buffered_group().await?;
         }
 
@@ -2063,7 +2063,8 @@ impl MaterializingSortMergeJoinStream {
     /// Stages an unfiltered batch of matched pairs, as the end of
     /// [`Self::freeze_streamed_matched`] does when there is no filter.
     fn joined_records_push_matched(&mut self, batch: RecordBatch) {
-        self.joined_record_batches.push_batch_without_metadata(batch);
+        self.joined_record_batches
+            .push_batch_without_metadata(batch);
     }
 
     /// Materializes columns, evaluates the join filter, and pushes output

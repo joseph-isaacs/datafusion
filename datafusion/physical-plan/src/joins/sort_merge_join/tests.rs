@@ -8232,3 +8232,51 @@ async fn join_time_series_shapes_match_hash_join() -> Result<()> {
     }
     Ok(())
 }
+
+/// On a multi-threaded runtime `prefetch` reads ahead in its own task. The
+/// batches held there are counted in the pool, under the given reservation,
+/// released as the join takes them, and released when it drops the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_ahead_batches_are_reserved_and_released() -> Result<()> {
+    let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+    let reservation = MemoryConsumer::new("test").register(&pool);
+    let keys: Vec<i64> = (0..6400).collect();
+    let input = sorted_key_table("k", "p", &keys, 100, false);
+    let batch_size = input
+        .execute(0, Arc::new(TaskContext::default()))?
+        .next()
+        .await
+        .unwrap()?
+        .get_array_memory_size();
+    let mut stream = input.execute(0, Arc::new(TaskContext::default()))?;
+    super::prefetch(&mut stream, &reservation);
+
+    let wait_for = |want: fn(usize, usize) -> bool| {
+        let pool = Arc::clone(&pool);
+        async move {
+            for _ in 0..200 {
+                if want(pool.reserved(), batch_size) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        }
+    };
+    // Before anything is taken the read-ahead fills its slots.
+    assert!(wait_for(|r, b| r >= 4 * b).await, "{}", pool.reserved());
+    // Taking every batch releases each one's reservation.
+    let mut taken = 0;
+    while let Some(batch) = stream.next().await {
+        batch?;
+        taken += 1;
+        if taken == 10 {
+            break;
+        }
+    }
+    assert!(pool.reserved() <= 5 * batch_size, "{}", pool.reserved());
+    // Dropping the stream mid-way releases what is still read ahead.
+    drop(stream);
+    assert!(wait_for(|r, _| r == 0).await, "leaked {}", pool.reserved());
+    Ok(())
+}
