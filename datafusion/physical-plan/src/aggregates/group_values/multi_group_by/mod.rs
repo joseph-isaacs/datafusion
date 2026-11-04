@@ -43,6 +43,9 @@ use datafusion_physical_expr::binary_map::OutputType;
 
 use hash_index::{HashIndex, PREFETCH_DISTANCE};
 
+/// Table size above which lookups prefetch, see [`HashIndex::prefetch`].
+const PREFETCH_MIN_TABLE_BYTES: usize = 1 << 20;
+
 const NON_INLINED_FLAG: u64 = 0x8000000000000000;
 const VALUE_MASK: u64 = 0x7FFFFFFFFFFFFFFF;
 
@@ -367,11 +370,15 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         batch_hashes.resize(n_rows, 0);
         create_hashes(cols, &self.random_state, batch_hashes)?;
 
-        for &hash in &batch_hashes[..PREFETCH_DISTANCE.min(n_rows)] {
-            self.map.prefetch(hash);
+        // Prefetching only pays off once the table outgrows the caches.
+        let prefetch = self.map.allocation_size() > PREFETCH_MIN_TABLE_BYTES;
+        if prefetch {
+            for &hash in &batch_hashes[..PREFETCH_DISTANCE.min(n_rows)] {
+                self.map.prefetch(hash);
+            }
         }
         for (row, &target_hash) in batch_hashes.iter().enumerate() {
-            if let Some(&hash) = batch_hashes.get(row + PREFETCH_DISTANCE) {
+            if prefetch && let Some(&hash) = batch_hashes.get(row + PREFETCH_DISTANCE) {
                 self.map.prefetch(hash);
             }
             let entry = self.map.find_mut(target_hash, |group_idx_view| {
@@ -526,11 +533,15 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             .equal_to_group_indices
             .clear();
 
-        for &hash in &batch_hashes[..PREFETCH_DISTANCE.min(batch_hashes.len())] {
-            self.map.prefetch(hash);
+        // Prefetching only pays off once the table outgrows the caches.
+        let prefetch = self.map.allocation_size() > PREFETCH_MIN_TABLE_BYTES;
+        if prefetch {
+            for &hash in &batch_hashes[..PREFETCH_DISTANCE.min(batch_hashes.len())] {
+                self.map.prefetch(hash);
+            }
         }
         for (row, &target_hash) in batch_hashes.iter().enumerate() {
-            if let Some(&hash) = batch_hashes.get(row + PREFETCH_DISTANCE) {
+            if prefetch && let Some(&hash) = batch_hashes.get(row + PREFETCH_DISTANCE) {
                 self.map.prefetch(hash);
             }
             let entry = self.map.find(target_hash).copied();
