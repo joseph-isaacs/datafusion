@@ -7,6 +7,8 @@
 
 use std::mem::size_of;
 
+use crate::joins::join_hash_table::zeroed_vec;
+
 /// Number of slots per bucket.
 const BUCKET_SLOTS: usize = 8;
 
@@ -49,6 +51,16 @@ fn prefetch<T>(slice: &[T], index: usize) {
     }
 }
 
+/// Types for which all zero bytes are a valid value.
+///
+/// # Safety
+///
+/// All zero bytes must be a valid value of the type.
+pub(crate) unsafe trait Zeroable: Copy + Default {}
+
+// SAFETY: every bit pattern is a valid `u64`.
+unsafe impl Zeroable for u64 {}
+
 /// A multimap from 64-bit hashes to values of type `V`.
 ///
 /// Same semantics as `hashbrown::HashTable<(u64, V)>` searched by hash
@@ -70,19 +82,21 @@ pub(crate) struct HashIndex<V> {
     len: usize,
 }
 
-impl<V: Copy + Default> Default for HashIndex<V> {
+impl<V: Zeroable> Default for HashIndex<V> {
     fn default() -> Self {
         Self::with_capacity(0)
     }
 }
 
-impl<V: Copy + Default> HashIndex<V> {
+impl<V: Zeroable> HashIndex<V> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         let num_buckets = Self::num_buckets(capacity);
         Self {
-            tags: vec![Tags::default(); num_buckets],
+            // SAFETY: zero tags are empty slots.
+            tags: unsafe { zeroed_vec(num_buckets) },
             hashes: vec![[0; BUCKET_SLOTS]; num_buckets],
-            values: vec![[V::default(); BUCKET_SLOTS]; num_buckets],
+            // SAFETY: `V: Zeroable`.
+            values: unsafe { zeroed_vec(num_buckets) },
             mask: num_buckets.saturating_sub(1),
             len: 0,
         }

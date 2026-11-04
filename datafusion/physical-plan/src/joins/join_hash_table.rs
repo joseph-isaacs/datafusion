@@ -65,6 +65,32 @@ pub(crate) fn prefetch<T>(slice: &[T], index: usize) {
     }
 }
 
+/// Returns `n` values of type `T` whose memory is all zero bytes.
+///
+/// Allocates zeroed memory (`calloc`), which for a large table hands out
+/// fresh pages that the OS zeroes on first touch, rather than writing every
+/// element as `vec![value; n]` does for a type that is not a primitive.
+///
+/// # Safety
+///
+/// All zero bytes must be a valid value of `T`.
+pub(crate) unsafe fn zeroed_vec<T>(n: usize) -> Vec<T> {
+    if n == 0 || size_of::<T>() == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<T>(n).expect("table size overflow");
+    // SAFETY: `layout` has a non-zero size; the caller guarantees that the
+    // zeroed memory is `n` valid values of `T`, allocated by the global
+    // allocator with the layout of a `Box<[T]>` of length `n`.
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<T>();
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, n)).into_vec()
+    }
+}
+
 /// A cache line of slots, see the [module documentation](self).
 ///
 /// The tags and rows of the slots are stored apart, so all eight tags are
@@ -121,7 +147,8 @@ impl JoinHashTableU32 {
     pub fn with_capacity(cap: usize) -> Self {
         let num_buckets = Self::num_buckets(cap);
         Self {
-            buckets: vec![Bucket::default(); num_buckets],
+            // SAFETY: a `Bucket` of zeros is a bucket of empty slots.
+            buckets: unsafe { zeroed_vec(num_buckets) },
             mask: num_buckets - 1,
             len: 0,
             next: vec![0; cap],

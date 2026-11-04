@@ -138,6 +138,9 @@ pub fn nulls_equal_to(lhs_null: bool, rhs_null: bool) -> Option<bool> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct GroupIndexView(u64);
 
+// SAFETY: a `GroupIndexView` is a `u64`, valid for every bit pattern.
+unsafe impl hash_index::Zeroable for GroupIndexView {}
+
 impl GroupIndexView {
     #[inline]
     pub fn is_non_inlined(&self) -> bool {

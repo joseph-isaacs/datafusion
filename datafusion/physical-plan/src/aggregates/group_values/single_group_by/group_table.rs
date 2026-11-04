@@ -7,6 +7,8 @@
 
 use std::mem::size_of;
 
+use crate::joins::join_hash_table::zeroed_vec;
+
 /// Number of slots per bucket.
 const BUCKET_SLOTS: usize = 8;
 
@@ -76,7 +78,8 @@ impl<K: Copy + Default> GroupTable<K> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         let num_buckets = Self::num_buckets(capacity);
         Self {
-            buckets: vec![Bucket::default(); num_buckets],
+            // SAFETY: a `Bucket` of zeros is a bucket of empty slots.
+            buckets: unsafe { zeroed_vec(num_buckets) },
             keys: vec![[K::default(); BUCKET_SLOTS]; num_buckets],
             mask: num_buckets - 1,
             len: 0,

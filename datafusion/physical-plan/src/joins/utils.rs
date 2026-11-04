@@ -1541,11 +1541,6 @@ pub(crate) fn build_batch_from_indices(
         return new_empty_schema_batch(schema, row_count);
     }
 
-    // When the probe indices are a run of consecutive rows, as for a probe
-    // batch whose every row matches a single build row, the probe columns
-    // are slices of the probe batch rather than gathered copies.
-    let probe_run = consecutive_run(probe_indices);
-
     // build the columns of the new [RecordBatch]:
     // 1. pick whether the column is from the left or right
     // 2. based on the pick, `take` items from the different RecordBatches
@@ -1579,8 +1574,6 @@ pub(crate) fn build_batch_from_indices(
             if array.is_empty() || probe_indices.null_count() == probe_indices.len() {
                 assert_eq!(probe_indices.null_count(), probe_indices.len());
                 new_null_array(array.data_type(), probe_indices.len())
-            } else if let Some((offset, len)) = probe_run {
-                array.slice(offset, len)
             } else {
                 take(array.as_ref(), probe_indices, None)?
             }
@@ -1589,26 +1582,6 @@ pub(crate) fn build_batch_from_indices(
         columns.push(array);
     }
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
-}
-
-/// Returns `(offset, len)` if `indices` holds no NULLs and is the run of
-/// consecutive values `offset..offset + len`.
-fn consecutive_run(indices: &UInt32Array) -> Option<(usize, usize)> {
-    if indices.is_empty() || indices.null_count() > 0 {
-        return None;
-    }
-    let values = indices.values();
-    let first = values[0];
-    let last = values[values.len() - 1];
-    // A cheap rejection before the full scan.
-    if (last as usize).checked_sub(first as usize)? != values.len() - 1 {
-        return None;
-    }
-    values
-        .iter()
-        .enumerate()
-        .all(|(i, &v)| v as usize == first as usize + i)
-        .then_some((first as usize, values.len()))
 }
 
 /// Returns a new [RecordBatch] for a probe batch when no probe row can find a
