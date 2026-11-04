@@ -58,6 +58,35 @@ pub(super) struct StreamedJoinedChunk {
     buffered_indices: Vec<u64>,
     /// Validity of `buffered_indices`, null where the pair is null-joined
     buffered_nulls: NullBufferBuilder,
+    /// While the chunk holds a single diagonal run and nothing else, that run
+    /// as `(streamed start, buffered start, len)`, with the index vectors
+    /// still empty: freezing then slices both batches directly, with no index
+    /// vectors written, allocated or scanned. Any other pair first spills it
+    /// into the vectors ([`Self::flatten_diagonal`]).
+    diagonal: Option<(usize, usize, usize)>,
+    /// Capacity the index vectors get when first written, so a chunk that
+    /// only ever holds a diagonal run allocates none.
+    capacity: usize,
+}
+
+impl StreamedJoinedChunk {
+    /// Moves a pending diagonal run into the index vectors, and gives them
+    /// their capacity, before any other pair is appended.
+    #[inline(always)]
+    fn flatten_diagonal(&mut self) {
+        if self.streamed_indices.capacity() == 0 {
+            self.streamed_indices.reserve(self.capacity);
+            self.buffered_indices.reserve(self.capacity);
+        }
+        if let Some((streamed, buffered, len)) = self.diagonal.take() {
+            let (streamed, buffered) = (streamed as u64, buffered as u64);
+            self.streamed_indices
+                .extend(streamed..streamed + len as u64);
+            self.buffered_indices
+                .extend(buffered..buffered + len as u64);
+            self.buffered_nulls.append_n_non_nulls(len);
+        }
+    }
 }
 
 /// Represents a record batch from streamed input.
@@ -166,7 +195,9 @@ impl StreamedBatch {
     }
 
     /// Appends the `len` pairs `(self.idx + t, buffered_start + t)`: a run of
-    /// streamed rows each matching the buffered row opposite it.
+    /// streamed rows each matching the buffered row opposite it. Into a chunk
+    /// holding nothing else (or only the run it continues), it is recorded as
+    /// a range rather than written out; see [`StreamedJoinedChunk::diagonal`].
     fn append_diagonal_pairs(
         &mut self,
         buffered_batch_idx: usize,
@@ -175,15 +206,27 @@ impl StreamedBatch {
         batch_size: usize,
     ) {
         debug_assert!(len > 0 && self.num_output_rows + len <= batch_size);
-        let (streamed, buffered) = (self.idx as u64, buffered_start as u64);
-        let current_chunk = self.chunk_for(Some(buffered_batch_idx), batch_size);
-        current_chunk
-            .streamed_indices
-            .extend(streamed..streamed + len as u64);
-        current_chunk
-            .buffered_indices
-            .extend(buffered..buffered + len as u64);
-        current_chunk.buffered_nulls.append_n_non_nulls(len);
+        let streamed_start = self.idx;
+        let chunk = self.raw_chunk_for(Some(buffered_batch_idx), batch_size);
+        match chunk.diagonal {
+            None if chunk.streamed_indices.is_empty() => {
+                chunk.diagonal = Some((streamed_start, buffered_start, len));
+            }
+            Some((s, b, l)) if s + l == streamed_start && b + l == buffered_start => {
+                chunk.diagonal = Some((s, b, l + len));
+            }
+            _ => {
+                chunk.flatten_diagonal();
+                let (streamed, buffered) = (streamed_start as u64, buffered_start as u64);
+                chunk
+                    .streamed_indices
+                    .extend(streamed..streamed + len as u64);
+                chunk
+                    .buffered_indices
+                    .extend(buffered..buffered + len as u64);
+                chunk.buffered_nulls.append_n_non_nulls(len);
+            }
+        }
         self.num_output_rows += len;
     }
 
@@ -254,6 +297,18 @@ impl StreamedBatch {
         buffered_batch_idx: Option<usize>,
         batch_size: usize,
     ) -> &mut StreamedJoinedChunk {
+        let chunk = self.raw_chunk_for(buffered_batch_idx, batch_size);
+        chunk.flatten_diagonal();
+        chunk
+    }
+
+    /// [`Self::chunk_for`], leaving a pending diagonal run in place.
+    #[inline(always)]
+    fn raw_chunk_for(
+        &mut self,
+        buffered_batch_idx: Option<usize>,
+        batch_size: usize,
+    ) -> &mut StreamedJoinedChunk {
         if self.output_indices.is_empty() || self.buffered_batch_idx != buffered_batch_idx
         {
             self.start_chunk(buffered_batch_idx, batch_size);
@@ -276,9 +331,11 @@ impl StreamedBatch {
         let capacity = batch_size - self.num_output_rows;
         self.output_indices.push(StreamedJoinedChunk {
             buffered_batch_idx,
-            streamed_indices: Vec::with_capacity(capacity),
-            buffered_indices: Vec::with_capacity(capacity),
+            streamed_indices: Vec::new(),
+            buffered_indices: Vec::new(),
             buffered_nulls: NullBufferBuilder::new(capacity),
+            diagonal: None,
+            capacity,
         });
         self.buffered_batch_idx = buffered_batch_idx;
     }
@@ -1920,7 +1977,35 @@ impl MaterializingSortMergeJoinStream {
             Vec::with_capacity(self.streamed_batch.output_indices.len());
         let mut total_matched_rows: usize = 0;
 
-        for chunk in self.streamed_batch.output_indices.iter_mut() {
+        for chunk_idx in 0..self.streamed_batch.output_indices.len() {
+            let chunk = &mut self.streamed_batch.output_indices[chunk_idx];
+            if let (Some((streamed, buffered, len)), Some(batch_idx)) =
+                (chunk.diagonal, chunk.buffered_batch_idx)
+                && self.filter.is_none()
+                && let BufferedBatchState::InMemory(buffered_batch) =
+                    &self.buffered_data.batches[batch_idx].batch
+            {
+                // A pure diagonal run without a filter: both sides are plain
+                // slices. Rows collected so far go first, to keep the order.
+                let right = buffered_batch.slice(buffered, len);
+                chunk.diagonal = None;
+                if !matched_chunks.is_empty() {
+                    self.freeze_streamed_matched(&matched_chunks, total_matched_rows)?;
+                    matched_chunks.clear();
+                    total_matched_rows = 0;
+                }
+                let left = self.streamed_batch.batch.slice(streamed, len);
+                let columns = if self.join_type != JoinType::Right {
+                    [left.columns(), right.columns()].concat()
+                } else {
+                    [right.columns(), left.columns()].concat()
+                };
+                let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
+                self.joined_records_push_matched(batch);
+                continue;
+            }
+            let chunk = &mut self.streamed_batch.output_indices[chunk_idx];
+            chunk.flatten_diagonal();
             let left_indices =
                 UInt64Array::try_new(take(&mut chunk.streamed_indices).into(), None)?;
             if left_indices.is_empty() {
@@ -1973,6 +2058,12 @@ impl MaterializingSortMergeJoinStream {
         self.streamed_batch.output_indices.clear();
         self.streamed_batch.num_output_rows = 0;
         Ok(())
+    }
+
+    /// Stages an unfiltered batch of matched pairs, as the end of
+    /// [`Self::freeze_streamed_matched`] does when there is no filter.
+    fn joined_records_push_matched(&mut self, batch: RecordBatch) {
+        self.joined_record_batches.push_batch_without_metadata(batch);
     }
 
     /// Materializes columns, evaluates the join filter, and pushes output
