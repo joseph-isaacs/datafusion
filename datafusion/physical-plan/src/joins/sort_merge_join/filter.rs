@@ -210,6 +210,21 @@ pub fn get_corrected_filter_mask(
             let row_nulls = row_indices.nulls();
             let mask_values = filter_mask.values();
             let mask_nulls = filter_mask.nulls();
+            // Every pair the last of its input row (no two neighbours share
+            // a row: a one-to-one join), and no nulls: each row's group is
+            // that pair alone, so the corrected mask is the filter mask.
+            if row_nulls.is_none()
+                && mask_nulls.is_none()
+                && rows
+                    .windows(2)
+                    .zip(batch_ids.windows(2))
+                    .all(|(r, b)| r[0] != r[1] || b[0] != b[1])
+            {
+                let mut values = BooleanBufferBuilder::new(expected_size);
+                values.append_buffer(mask_values);
+                values.append_n(expected_size - len, false);
+                return Some(BooleanArray::new(values.finish(), None));
+            }
             let mut values = BooleanBufferBuilder::new(expected_size);
             let mut validity = BooleanBufferBuilder::new(expected_size);
             let mut seen_true = false;
