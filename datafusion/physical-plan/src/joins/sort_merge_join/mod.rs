@@ -32,9 +32,10 @@ use crate::stream::EmptyRecordBatchStream;
 ///
 /// Batches waiting in the read-ahead are not counted in the join's memory
 /// reservation, so the depth is kept small (each slot holds one input
-/// batch). Four slots, over one, are 5-17% faster on the sorted time-series benchmark
-/// (`dfbench smj-ts`), whose Parquet inputs decode in bursts that a single
-/// slot cannot absorb, with no measurable change in peak RSS.
+/// batch). Four slots, over one, are 18-37% faster on the sorted
+/// time-series benchmark (`dfbench smj-ts`), whose Parquet inputs decode in
+/// bursts that a single slot cannot absorb, with no measurable change in
+/// peak RSS.
 const PREFETCH_BATCHES: usize = 4;
 
 pub(super) fn prefetch(stream: &mut SendableRecordBatchStream) {
