@@ -598,6 +598,10 @@ pub(super) struct JoinedRecordBatches {
     pub(super) joined_batches: BatchCoalescer,
     /// Filter metadata for deferred filtering
     pub(super) filter_metadata: FilterMetadata,
+    /// The join's output projection, when the stream applies it (joins
+    /// without deferred filtering): each batch is projected before it is
+    /// coalesced, so columns the projection drops are never copied.
+    pub(super) projection: Option<Vec<usize>>,
 }
 
 impl JoinedRecordBatches {
@@ -667,9 +671,7 @@ impl JoinedRecordBatches {
         self.filter_metadata.append_nulls(num_rows);
 
         self.filter_metadata.debug_assert_metadata_aligned();
-        self.joined_batches
-            .push_batch(batch)
-            .expect("Failed to push batch to BatchCoalescer");
+        self.push_projected(batch);
     }
 
     /// Pushes a batch with filter metadata (filtered outer joins)
@@ -707,9 +709,7 @@ impl JoinedRecordBatches {
         );
 
         self.filter_metadata.debug_assert_metadata_aligned();
-        self.joined_batches
-            .push_batch(batch)
-            .expect("Failed to push batch to BatchCoalescer");
+        self.push_projected(batch);
     }
 
     /// Pushes a batch without metadata (non-filtered joins)
@@ -718,6 +718,17 @@ impl JoinedRecordBatches {
     /// or null-joined rows are handled separately. No need to track which input
     /// row produced which output row.
     fn push_batch_without_metadata(&mut self, batch: RecordBatch) {
+        self.push_projected(batch);
+    }
+
+    /// Pushes `batch` into the coalescer, after the stream's projection.
+    fn push_projected(&mut self, batch: RecordBatch) {
+        let batch = match &self.projection {
+            Some(projection) => batch
+                .project(projection)
+                .expect("projection indices are validated by the plan"),
+            None => batch,
+        };
         self.joined_batches
             .push_batch(batch)
             .expect("Failed to push batch to BatchCoalescer");
@@ -747,6 +758,7 @@ impl MaterializingSortMergeJoinStream {
         reservation: MemoryReservation,
         spill_manager: SpillManager,
         runtime_env: Arc<RuntimeEnv>,
+        projection: Option<Vec<usize>>,
     ) -> Result<SendableRecordBatchStream> {
         let streamed_schema = streamed.schema();
         let buffered_schema = buffered.schema();
@@ -783,6 +795,14 @@ impl MaterializingSortMergeJoinStream {
         } else {
             None
         };
+        debug_assert!(
+            projection.is_none() || !deferred_filtering,
+            "a deferred-filtering join needs every column until it filters"
+        );
+        let output_schema = match &projection {
+            Some(projection) => Arc::new(schema.project(projection)?),
+            None => Arc::clone(&schema),
+        };
         let mut this = Self {
             sort_options,
             null_equality,
@@ -802,8 +822,12 @@ impl MaterializingSortMergeJoinStream {
             filter_schema,
             filter,
             joined_record_batches: JoinedRecordBatches {
-                joined_batches: new_output_coalescer(Arc::clone(&schema), batch_size),
+                joined_batches: new_output_coalescer(
+                    Arc::clone(&output_schema),
+                    batch_size,
+                ),
                 filter_metadata: FilterMetadata::new(),
+                projection,
             },
             output: new_output_coalescer(schema, batch_size),
             batch_size,
@@ -828,7 +852,7 @@ impl MaterializingSortMergeJoinStream {
             streamed_batch_counter: 0,
         };
 
-        let schema = Arc::clone(&this.schema);
+        let schema = output_schema;
         let baseline_metrics = this.join_metrics.baseline_metrics();
 
         let stream = async_try_stream(|mut emitter| async move {

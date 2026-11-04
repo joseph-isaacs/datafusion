@@ -10,6 +10,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use super::bitwise_stream::BitwiseSortMergeJoinStream;
+use super::filter::needs_deferred_filtering;
 use super::materializing_stream::MaterializingSortMergeJoinStream;
 use super::metrics::SortMergeJoinMetrics;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
@@ -588,6 +589,18 @@ impl ExecutionPlan for SortMergeJoinExec {
         let right = self.right.execute(partition, Arc::clone(&context))?;
         let (on_left, on_right) = self.on.iter().cloned().unzip();
 
+        // The materializing stream projects its output itself, before
+        // coalescing, unless it defers filtering (which needs every column).
+        let embed_projection =
+            !matches!(
+                self.join_type,
+                JoinType::LeftSemi
+                    | JoinType::LeftAnti
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti
+                    | JoinType::LeftMark
+                    | JoinType::RightMark
+            ) && !needs_deferred_filtering(self.filter.as_ref(), self.join_type);
         let joined = sort_merge_join_stream(
             SortMergeJoinInputs {
                 schema: Arc::clone(&self.schema),
@@ -600,12 +613,14 @@ impl ExecutionPlan for SortMergeJoinExec {
                 filter: self.filter.clone(),
                 join_type: self.join_type,
                 partition,
+                projection: self.projection.clone().filter(|_| embed_projection),
             },
             &self.metrics,
             &context,
         )?;
 
-        let Some(projection) = self.projection.clone() else {
+        let Some(projection) = self.projection.clone().filter(|_| !embed_projection)
+        else {
             return Ok(joined);
         };
         let schema = self.schema();
@@ -908,6 +923,9 @@ pub(crate) struct SortMergeJoinInputs {
     pub(crate) filter: Option<JoinFilter>,
     pub(crate) join_type: JoinType,
     pub(crate) partition: usize,
+    /// Output projection the stream applies itself; see
+    /// [`SortMergeJoinExec::execute`] for when it is passed.
+    pub(crate) projection: Option<Vec<usize>>,
 }
 
 /// Joins two sorted inputs with the sort-merge join algorithm.
@@ -934,6 +952,7 @@ pub(crate) fn sort_merge_join_stream(
         filter,
         join_type,
         partition,
+        projection,
     } = inputs;
 
     let (streamed, buffered, on_streamed, on_buffered) =
@@ -999,6 +1018,7 @@ pub(crate) fn sort_merge_join_stream(
             reservation,
             spill_manager,
             context.runtime_env(),
+            projection,
         )
     }
 }

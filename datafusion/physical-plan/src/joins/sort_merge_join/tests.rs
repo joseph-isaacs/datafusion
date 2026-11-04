@@ -4055,6 +4055,7 @@ fn build_joined_record_batches() -> Result<JoinedRecordBatches> {
     let mut batches = JoinedRecordBatches {
         joined_batches: BatchCoalescer::new(Arc::clone(&schema), 8192),
         filter_metadata: crate::joins::sort_merge_join::filter::FilterMetadata::new(),
+        projection: None,
     };
 
     // Insert already prejoined non-filtered rows
@@ -5896,6 +5897,7 @@ fn materializing_join_time_test_join(
         reservation,
         spill_manager,
         runtime_env,
+        None,
     )
     .unwrap();
     (stream, metrics)
