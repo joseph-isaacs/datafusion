@@ -558,6 +558,9 @@ pub(super) struct MaterializingSortMergeJoinStream {
     /// The merge loop's previous key comparison, to detect runs of
     /// non-matching rows worth galloping over.
     pub last_ordering: Ordering,
+    /// Cached all-null columns for null-joined output, per side.
+    pub null_streamed: NullColumns,
+    pub null_buffered: NullColumns,
     /// Whether the last galloped run of `Less` (`Greater`) rows was longer
     /// than a row, so the next such run gallops from its first step.
     pub long_less_runs: bool,
@@ -842,6 +845,8 @@ impl MaterializingSortMergeJoinStream {
             streamed_buffered_cmp: None,
             gallop_i64: None,
             last_ordering: Ordering::Equal,
+            null_streamed: NullColumns::default(),
+            null_buffered: NullColumns::default(),
             long_less_runs: false,
             long_greater_runs: false,
             unique_run_skip: 0,
@@ -1975,6 +1980,8 @@ impl MaterializingSortMergeJoinStream {
                 &self.streamed_schema,
                 &buffered_indices,
                 buffered_batch,
+                &mut self.null_streamed,
+                self.batch_size,
             )? {
                 self.joined_record_batches
                     .push_batch_with_null_metadata(record_batch, self.join_type);
@@ -2011,6 +2018,8 @@ impl MaterializingSortMergeJoinStream {
             &self.streamed_schema,
             &buffered_indices,
             buffered_batch,
+            &mut self.null_streamed,
+            self.batch_size,
         )? {
             self.joined_record_batches
                 .push_batch_with_null_metadata(record_batch, self.join_type);
@@ -2075,8 +2084,11 @@ impl MaterializingSortMergeJoinStream {
             if chunk.buffered_batch_idx.is_none() {
                 let left_columns =
                     materialize_left_columns(&self.streamed_batch.batch, &left_indices)?;
-                let right_columns =
-                    create_unmatched_columns(&self.buffered_schema, left_indices.len());
+                let right_columns = self.null_buffered.get(
+                    &self.buffered_schema,
+                    left_indices.len(),
+                    self.batch_size,
+                );
 
                 let columns = if self.join_type != JoinType::Right {
                     [left_columns, right_columns].concat()
@@ -2542,12 +2554,29 @@ fn materialize_left_columns(
     }
 }
 
-fn create_unmatched_columns(schema: &SchemaRef, size: usize) -> Vec<ArrayRef> {
-    schema
-        .fields()
-        .iter()
-        .map(|f| new_null_array(f.data_type(), size))
-        .collect::<Vec<_>>()
+/// All-null columns for one side's schema, built once and sliced for every
+/// null-joined batch: building them afresh allocates (and zeroes) new
+/// buffers for every batch an outer join emits.
+#[derive(Debug, Default)]
+pub(super) struct NullColumns {
+    columns: Vec<ArrayRef>,
+}
+
+impl NullColumns {
+    /// `size` rows of nulls for each field of `schema`. Rebuilt, for at least
+    /// `min_rows` rows, only when `size` outgrows the cached columns.
+    fn get(&mut self, schema: &SchemaRef, size: usize, min_rows: usize) -> Vec<ArrayRef> {
+        let cached = self.columns.first().map_or(0, |c| c.len());
+        if size > cached || self.columns.len() != schema.fields().len() {
+            let rows = size.max(min_rows);
+            self.columns = schema
+                .fields()
+                .iter()
+                .map(|f| new_null_array(f.data_type(), rows))
+                .collect();
+        }
+        self.columns.iter().map(|c| c.slice(0, size)).collect()
+    }
 }
 
 fn produce_buffered_null_batch(
@@ -2555,6 +2584,8 @@ fn produce_buffered_null_batch(
     streamed_schema: &SchemaRef,
     buffered_indices: &PrimitiveArray<UInt64Type>,
     buffered_batch: &BufferedBatch,
+    null_streamed: &mut NullColumns,
+    batch_size: usize,
 ) -> Result<Option<RecordBatch>> {
     if buffered_indices.is_empty() {
         return Ok(None);
@@ -2565,11 +2596,8 @@ fn produce_buffered_null_batch(
         fetch_right_columns_from_batch_by_idxs(buffered_batch, buffered_indices)?;
 
     // Create null streamed (left) columns
-    let mut left_columns = streamed_schema
-        .fields()
-        .iter()
-        .map(|f| new_null_array(f.data_type(), buffered_indices.len()))
-        .collect::<Vec<_>>();
+    let mut left_columns =
+        null_streamed.get(streamed_schema, buffered_indices.len(), batch_size);
 
     left_columns.extend(right_columns);
 
