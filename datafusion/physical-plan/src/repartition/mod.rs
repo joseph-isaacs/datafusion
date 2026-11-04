@@ -9,7 +9,7 @@
 use std::fmt::{Debug, Display, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 use std::vec;
 
@@ -440,6 +440,7 @@ impl RepartitionExecState {
         context: &Arc<TaskContext>,
         spill_manager: SpillManager,
         coalescer_batch_size: usize,
+        coalesce_output: bool,
     ) -> Result<&mut ConsumingInputStreamsState> {
         let streams_and_metrics = match self {
             RepartitionExecState::NotInitialized => {
@@ -464,7 +465,8 @@ impl RepartitionExecState {
 
         let num_input_partitions = streams_and_metrics.len();
         let num_output_partitions = partitioning.partition_count();
-        let coalesce_batches = !preserve_order && !input.boundedness().is_unbounded();
+        let coalesce_batches =
+            coalesce_output && !preserve_order && !input.boundedness().is_unbounded();
 
         let spill_manager = Arc::new(spill_manager);
 
@@ -1540,6 +1542,9 @@ pub struct RepartitionExec {
     /// Optional override for the batch size used by the output coalescer.
     /// When `None`, falls back to `SessionConfig::batch_size`.
     batch_size: Option<usize>,
+    /// Set by a consumer that copies every input batch anyway, such as the
+    /// build side of a hash join, see [`Self::skip_output_coalescing`].
+    skip_output_coalescing: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1761,6 +1766,7 @@ impl ExecutionPlan for RepartitionExec {
         let coalescer_batch_size = self
             .batch_size
             .unwrap_or_else(|| context.session_config().batch_size());
+        let coalesce_output = !self.skip_output_coalescing.load(AtomicOrdering::Relaxed);
 
         let spill_manager = SpillManager::new(
             Arc::clone(&context.runtime_env()),
@@ -1798,6 +1804,7 @@ impl ExecutionPlan for RepartitionExec {
                     &context,
                     spill_manager.clone(),
                     coalescer_batch_size,
+                    coalesce_output,
                 )?;
 
                 // now return stream for the specified *output* partition which will
@@ -2083,6 +2090,7 @@ impl ExecutionPlan for RepartitionExec {
             preserve_order: self.preserve_order,
             cache: new_properties.into(),
             batch_size: self.batch_size,
+            skip_output_coalescing: Arc::clone(&self.skip_output_coalescing),
         })))
     }
 
@@ -2104,6 +2112,8 @@ impl ExecutionPlan for RepartitionExec {
             cache,
             // User-configurable output batch size, recomputed on decode from session config.
             batch_size: _,
+            // Execution-time hint from the consumer.
+            skip_output_coalescing: _,
         } = self;
 
         let input = ctx.encode_child(input)?;
@@ -2186,6 +2196,7 @@ impl RepartitionExec {
             preserve_order,
             cache: Arc::new(cache),
             batch_size: None,
+            skip_output_coalescing: Default::default(),
         })
     }
 
@@ -2255,6 +2266,18 @@ impl RepartitionExec {
     /// this method when you need a different batch size for a specific
     /// `RepartitionExec` node without changing the global session config.
     ///
+    /// Sends the repartitioned batches as they are, without coalescing them
+    /// into batches of the target batch size first.
+    ///
+    /// For a consumer that copies every input batch anyway, as the build side
+    /// of a hash join concatenates them, coalescing is a redundant copy of
+    /// every row. Must be called before the first `execute`, and applies to
+    /// every output partition.
+    pub fn skip_output_coalescing(&self) {
+        self.skip_output_coalescing
+            .store(true, AtomicOrdering::Relaxed);
+    }
+
     /// Returns an error if `batch_size` is zero.
     pub fn with_batch_size(mut self, batch_size: usize) -> Result<Self> {
         if batch_size == 0 {

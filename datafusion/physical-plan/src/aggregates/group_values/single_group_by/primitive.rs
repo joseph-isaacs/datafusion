@@ -3,6 +3,9 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use super::group_table::{GroupTable, PREFETCH_DISTANCE};
+
+/// Table size above which lookups prefetch, see [`GroupTable::prefetch`].
+const PREFETCH_MIN_TABLE_BYTES: usize = 1 << 20;
 use crate::aggregates::group_values::GroupValues;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::{
@@ -146,11 +149,18 @@ where
         );
         let hashes = &self.hashes;
 
-        for &h in &hashes[..PREFETCH_DISTANCE.min(n)] {
-            self.map.prefetch(h);
+        // Prefetching only pays off once the table outgrows the caches.
+        let prefetch = self.map.allocation_size() > PREFETCH_MIN_TABLE_BYTES;
+        if prefetch {
+            for &h in &hashes[..PREFETCH_DISTANCE.min(n)] {
+                self.map.prefetch(h);
+            }
         }
+        // The previous non-NULL value and its group: runs of equal values,
+        // common in sorted or clustered data, skip the table lookup.
+        let mut previous: Option<(T::Native, usize)> = None;
         for (i, v) in array.iter().enumerate() {
-            if i + PREFETCH_DISTANCE < n {
+            if prefetch && i + PREFETCH_DISTANCE < n {
                 self.map.prefetch(hashes[i + PREFETCH_DISTANCE]);
             }
             let group_id = match v {
@@ -161,20 +171,29 @@ where
                 }),
                 Some(key) => {
                     let key = key.normalize_key();
-                    if self.map.is_full() {
-                        self.map.reserve(1, &hash);
-                    }
-                    let values = &mut self.values;
-                    self.map.get_or_insert(
-                        hashes[i],
-                        key,
-                        |a, b| a.is_eq(b),
-                        || {
-                            let group_id = values.len() as u32;
-                            values.push(key);
+                    match previous {
+                        Some((previous_key, group_id)) if previous_key.is_eq(key) => {
                             group_id
-                        },
-                    ) as usize
+                        }
+                        _ => {
+                            if self.map.is_full() {
+                                self.map.reserve(1, &hash);
+                            }
+                            let values = &mut self.values;
+                            let group_id = self.map.get_or_insert(
+                                hashes[i],
+                                key,
+                                |a, b| a.is_eq(b),
+                                || {
+                                    let group_id = values.len() as u32;
+                                    values.push(key);
+                                    group_id
+                                },
+                            ) as usize;
+                            previous = Some((key, group_id));
+                            group_id
+                        }
+                    }
                 }
             };
             groups.push(group_id)

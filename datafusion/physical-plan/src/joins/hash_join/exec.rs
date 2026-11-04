@@ -41,7 +41,7 @@ use crate::projection::{
     EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
     try_pushdown_through_join_with_column_indices,
 };
-use crate::repartition::REPARTITION_RANDOM_STATE;
+use crate::repartition::{REPARTITION_RANDOM_STATE, RepartitionExec};
 use crate::statistics::{ChildStats, StatisticsArgs, with_per_partition_fetch};
 use crate::{
     ChildrenPropertiesMode, ExecutionPlanProperties, ReplaceChildrenOptions,
@@ -1770,6 +1770,18 @@ impl ExecutionPlan for HashJoinExec {
                 ))
             })?,
             (None, PartitionMode::Partitioned) => {
+                // The build side copies its input batches into one, or keeps
+                // them as they are: coalescing them first is a wasted copy.
+                // Not for variable-width columns, whose coalescing also
+                // compacts the data buffers shared by the batch slices.
+                let fixed_width = self.left.schema().fields().iter().all(|f| {
+                    f.data_type().is_primitive() || f.data_type() == &DataType::Boolean
+                });
+                if fixed_width
+                    && let Some(repartition) = self.left.downcast_ref::<RepartitionExec>()
+                {
+                    repartition.skip_output_coalescing();
+                }
                 let left_stream = self.left.execute(partition, Arc::clone(&context))?;
 
                 let reservation =
