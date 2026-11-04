@@ -1836,4 +1836,58 @@ mod tests {
         assert_eq!(values, expected);
         Ok(())
     }
+
+    /// Batches a file opened ahead decodes are reserved in the stream's
+    /// memory pool while they wait, and released when the stream is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_opened_ahead_reserve_their_batches() -> Result<()> {
+        use datafusion_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(
+            (0..4)
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect(),
+        )
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file: None,
+            }))
+            .with_metrics(&metrics_set)
+            .with_memory_pool(Arc::clone(&pool))
+            .build()?;
+        // Each batch of file 0 takes the lookahead one planning step further
+        // (open file 1, resolve its I/O, produce its morsel); by the fourth,
+        // file 1 is decoding ahead.
+        for _ in 0..4 {
+            stream.next().await.unwrap()?;
+        }
+        let mut reserved = 0;
+        for _ in 0..200 {
+            reserved = pool.reserved();
+            if reserved > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(reserved > 0, "lookahead batches not reserved");
+        drop(stream);
+        for _ in 0..200 {
+            if pool.reserved() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(pool.reserved(), 0, "lookahead reservation leaked");
+        Ok(())
+    }
 }

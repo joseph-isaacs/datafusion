@@ -10,9 +10,11 @@ use crate::morsel::{Morsel, MorselPlanner, Morselizer, PendingMorselPlanner};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_common_runtime::SpawnedTask;
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_plan::metrics::ScopedTimerGuard;
 use futures::stream::BoxStream;
 use futures::{FutureExt as _, StreamExt as _};
+use std::sync::Arc;
 
 use super::work_source::WorkSource;
 use super::{FileStreamMetrics, OnError};
@@ -71,6 +73,9 @@ pub(super) struct ScanState {
     pending_planner: Option<PendingMorselPlanner>,
     /// Metrics for the active scan queues.
     metrics: FileStreamMetrics,
+    /// Where batches decoded ahead by a morsel opened in advance are
+    /// reserved while they wait for the consumer, if the stream has a pool.
+    lookahead_reservation: Option<MemoryReservation>,
 }
 
 impl ScanState {
@@ -80,6 +85,7 @@ impl ScanState {
         morselizer: Box<dyn Morselizer>,
         on_error: OnError,
         metrics: FileStreamMetrics,
+        lookahead_reservation: Option<MemoryReservation>,
     ) -> Self {
         Self {
             work_source,
@@ -91,6 +97,7 @@ impl ScanState {
             reader: None,
             pending_planner: None,
             metrics,
+            lookahead_reservation,
         }
     }
 
@@ -308,8 +315,12 @@ impl ScanState {
         if let Some(planner) = self.ready_planners.pop_front() {
             match planner.plan() {
                 Ok(Some(mut plan)) => {
-                    self.ready_morsels
-                        .extend(plan.take_morsels().into_iter().map(spawn_morsel));
+                    let reservation = self.lookahead_reservation.as_ref();
+                    self.ready_morsels.extend(
+                        plan.take_morsels()
+                            .into_iter()
+                            .map(|morsel| spawn_morsel(morsel, reservation)),
+                    );
                     self.ready_planners.extend(plan.take_ready_planners());
                     self.pending_planner = plan.take_pending_planner();
                 }
@@ -337,7 +348,8 @@ impl ScanState {
 }
 
 /// Batches a morsel opened ahead may decode before the scan reaches it. They
-/// are not counted in any memory reservation, so this stays small.
+/// are reserved in the stream's memory pool while they wait; the depth stays
+/// small all the same.
 const LOOKAHEAD_BATCHES: usize = 2;
 
 fn multi_thread_runtime() -> bool {
@@ -348,22 +360,41 @@ fn multi_thread_runtime() -> bool {
 
 /// Decodes `morsel` in its own task, up to [`LOOKAHEAD_BATCHES`] ahead of its
 /// consumer. Dropping the returned morsel, or its stream, stops the task.
-fn spawn_morsel(morsel: Box<dyn Morsel>) -> Box<dyn Morsel> {
+///
+/// With a `reservation`, each batch decoded ahead is reserved from it until
+/// the consumer takes the batch, so the memory pool sees what the lookahead
+/// holds; dropping the morsel's stream releases what is still waiting.
+fn spawn_morsel(
+    morsel: Box<dyn Morsel>,
+    reservation: Option<&MemoryReservation>,
+) -> Box<dyn Morsel> {
     let (tx, rx) = tokio::sync::mpsc::channel(LOOKAHEAD_BATCHES);
     let mut stream = morsel.into_stream();
+    let held = reservation.map(|r| Arc::new(r.new_empty()));
+    let produced = held.clone();
     let task = SpawnedTask::spawn(async move {
         // Reserve a slot before decoding, so at most `LOOKAHEAD_BATCHES`
         // batches exist ahead of the consumer.
         while let Ok(permit) = tx.reserve().await {
             match stream.next().await {
-                Some(item) => permit.send(item),
+                Some(item) => {
+                    if let (Some(held), Ok(batch)) = (&produced, &item) {
+                        held.grow(batch.get_array_memory_size());
+                    }
+                    permit.send(item)
+                }
                 None => break,
             }
         }
     });
-    let stream = futures::stream::unfold((rx, task), |(mut rx, task)| async move {
-        rx.recv().await.map(|item| (item, (rx, task)))
-    });
+    let stream =
+        futures::stream::unfold((rx, task, held), |(mut rx, task, held)| async move {
+            let item = rx.recv().await?;
+            if let (Some(held), Ok(batch)) = (&held, &item) {
+                held.shrink(batch.get_array_memory_size());
+            }
+            Some((item, (rx, task, held)))
+        });
     Box::new(SpawnedMorsel(stream.boxed()))
 }
 

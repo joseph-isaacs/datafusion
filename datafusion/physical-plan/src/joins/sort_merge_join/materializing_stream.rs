@@ -75,8 +75,8 @@ impl StreamedJoinedChunk {
     #[inline(always)]
     fn flatten_diagonal(&mut self) {
         if self.streamed_indices.capacity() == 0 {
-            self.streamed_indices.reserve(self.capacity);
-            self.buffered_indices.reserve(self.capacity);
+            self.streamed_indices = Vec::with_capacity(self.capacity);
+            self.buffered_indices = Vec::with_capacity(self.capacity);
         }
         if let Some((streamed, buffered, len)) = self.diagonal.take() {
             let (streamed, buffered) = (streamed as u64, buffered as u64);

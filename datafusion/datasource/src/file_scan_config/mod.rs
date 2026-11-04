@@ -776,6 +776,7 @@ impl DataSource for FileScanConfig {
             .with_shared_work_source(shared_work_source)
             .with_morselizer(morselizer)
             .with_metrics(source.metrics())
+            .with_memory_pool(Arc::clone(&context.runtime_env().memory_pool))
             .build()?;
         Ok(Box::pin(cooperative(stream)))
     }

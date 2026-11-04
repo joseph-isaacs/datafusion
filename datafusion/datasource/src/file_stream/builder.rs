@@ -9,6 +9,7 @@ use crate::file_stream::scan_state::ScanState;
 use crate::file_stream::work_source::{SharedWorkSource, WorkSource};
 use crate::morsel::{FileOpenerMorselizer, Morselizer};
 use datafusion_common::{Result, internal_err};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool};
 use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 
 use super::metrics::FileStreamMetrics;
@@ -22,6 +23,7 @@ pub struct FileStreamBuilder<'a> {
     metrics: Option<&'a ExecutionPlanMetricsSet>,
     on_error: OnError,
     shared_work_source: Option<SharedWorkSource>,
+    memory_pool: Option<Arc<dyn MemoryPool>>,
 }
 
 impl<'a> FileStreamBuilder<'a> {
@@ -34,7 +36,16 @@ impl<'a> FileStreamBuilder<'a> {
             metrics: None,
             on_error: OnError::Fail,
             shared_work_source: None,
+            memory_pool: None,
         }
+    }
+
+    /// Configure the memory pool that batches decoded ahead of the stream's
+    /// consumer (see the lookahead in `ScanState`) are reserved from. Without
+    /// one they are not accounted.
+    pub fn with_memory_pool(mut self, memory_pool: Arc<dyn MemoryPool>) -> Self {
+        self.memory_pool = Some(memory_pool);
+        self
     }
 
     /// Configure the partition to scan.
@@ -89,6 +100,7 @@ impl<'a> FileStreamBuilder<'a> {
             metrics,
             on_error,
             shared_work_source,
+            memory_pool,
         } = self;
 
         let Some(partition) = partition else {
@@ -112,12 +124,16 @@ impl<'a> FileStreamBuilder<'a> {
         };
 
         let file_stream_metrics = FileStreamMetrics::new(metrics, partition);
+        let lookahead_reservation = memory_pool.map(|pool| {
+            MemoryConsumer::new(format!("FileStream[{partition}]")).register(&pool)
+        });
         let scan_state = Box::new(ScanState::new(
             work_source,
             config.limit,
             morselizer,
             on_error,
             file_stream_metrics,
+            lookahead_reservation,
         ));
 
         Ok(FileStream {
