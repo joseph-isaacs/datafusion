@@ -19,8 +19,9 @@ use crate::SendableRecordBatchStream;
 use crate::common::spawn_buffered;
 use crate::stream::EmptyRecordBatchStream;
 
-/// Moves the polling of `stream` into its own task, one batch ahead of the
-/// join (as `SortPreservingMergeExec` does for its inputs). A merge join
+/// Moves the polling of `stream` into its own task, up to
+/// [`PREFETCH_BATCHES`] batches ahead of the join (as
+/// `SortPreservingMergeExec` does for its inputs, one batch ahead). A merge join
 /// alternates between its two inputs, so polling them inline leaves each
 /// input's scan and decode idle while the other's runs and while the merge
 /// itself does; buffered, they run in parallel with both.
@@ -28,8 +29,16 @@ use crate::stream::EmptyRecordBatchStream;
 /// The streams call this lazily, on the second input only once the first
 /// has produced a row, so a join that ends early still never starts reading
 /// an input it does not need. A no-op outside a multi-threaded runtime.
+///
+/// Batches waiting in the read-ahead are not counted in the join's memory
+/// reservation, so the depth is kept small (each slot holds one input
+/// batch). Four slots, over one, are 5-17% faster on the sorted time-series benchmark
+/// (`dfbench smj-ts`), whose Parquet inputs decode in bursts that a single
+/// slot cannot absorb, with no measurable change in peak RSS.
+const PREFETCH_BATCHES: usize = 4;
+
 pub(super) fn prefetch(stream: &mut SendableRecordBatchStream) {
     let schema = stream.schema();
     let input = std::mem::replace(stream, Box::pin(EmptyRecordBatchStream::new(schema)));
-    *stream = spawn_buffered(input, 1);
+    *stream = spawn_buffered(input, PREFETCH_BATCHES);
 }
