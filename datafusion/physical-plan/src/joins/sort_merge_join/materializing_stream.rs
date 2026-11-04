@@ -142,6 +142,28 @@ impl StreamedBatch {
         self.num_output_rows += len;
     }
 
+    /// Appends the `len` pairs `(self.idx + t, buffered_idx)`: a run of
+    /// streamed rows sharing the key of the one-row buffered group.
+    fn append_streamed_run_pairs(
+        &mut self,
+        buffered_batch_idx: usize,
+        buffered_idx: usize,
+        len: usize,
+        batch_size: usize,
+    ) {
+        debug_assert!(len > 0 && self.num_output_rows + len <= batch_size);
+        let streamed = self.idx as u64;
+        let current_chunk = self.chunk_for(Some(buffered_batch_idx), batch_size);
+        current_chunk
+            .streamed_indices
+            .extend(streamed..streamed + len as u64);
+        current_chunk
+            .buffered_indices
+            .extend(repeat_n(buffered_idx as u64, len));
+        current_chunk.buffered_nulls.append_n_non_nulls(len);
+        self.num_output_rows += len;
+    }
+
     /// Appends the `len` pairs `(self.idx + t, buffered_start + t)`: a run of
     /// streamed rows each matching the buffered row opposite it.
     fn append_diagonal_pairs(
@@ -476,6 +498,10 @@ pub(super) struct MaterializingSortMergeJoinStream {
     /// the current backoff; see [`Self::try_pair_unique_run`].
     pub unique_run_skip: u32,
     pub unique_run_backoff: u32,
+    /// The same, for runs of duplicate streamed keys; see
+    /// [`Self::try_pair_streamed_run`].
+    pub streamed_run_skip: u32,
+    pub streamed_run_backoff: u32,
     /// Comparator for buffered head vs tail batch equality check
     pub buffered_equality_cmp: Option<JoinKeyComparator>,
 
@@ -725,6 +751,8 @@ impl MaterializingSortMergeJoinStream {
             last_ordering: Ordering::Equal,
             unique_run_skip: 0,
             unique_run_backoff: 0,
+            streamed_run_skip: 0,
+            streamed_run_backoff: 0,
             buffered_equality_cmp: None,
             streamed_batch_counter: 0,
         };
@@ -814,7 +842,7 @@ impl MaterializingSortMergeJoinStream {
                 //     batch of pairs accumulates — then advance streamed.
                 //     The group stays for the next streamed row.
                 Ordering::Equal => {
-                    if !self.try_pair_unique_run() {
+                    if !self.try_pair_unique_run() && !self.try_pair_streamed_run() {
                         while !self.pair_streamed_row_with_group() {
                             self.freeze_and_emit(emitter).await?;
                         }
@@ -905,6 +933,67 @@ impl MaterializingSortMergeJoinStream {
             self.unique_run_skip = self.unique_run_backoff;
             false
         }
+    }
+
+    /// `Equal` with a one-row buffered group and duplicate streamed keys:
+    /// pair the current streamed row and every following one with the same
+    /// key (found by galloping) with that buffered row, in bulk, instead of
+    /// one merge-loop trip per streamed row. Same backoff as
+    /// [`Self::try_pair_unique_run`], for joins whose streamed keys are unique.
+    #[inline(always)]
+    fn try_pair_streamed_run(&mut self) -> bool {
+        if self.streamed_run_skip > 0 {
+            self.streamed_run_skip -= 1;
+            return false;
+        }
+        if self.pair_streamed_run() {
+            self.streamed_run_backoff = 0;
+            true
+        } else {
+            self.streamed_run_backoff = (self.streamed_run_backoff * 2).clamp(1, 64);
+            self.streamed_run_skip = self.streamed_run_backoff;
+            false
+        }
+    }
+
+    #[inline(never)]
+    fn pair_streamed_run(&mut self) -> bool {
+        if self.buffered_data.batches.len() != 1
+            || self.buffered_data.scanning_batch_idx != 0
+            || self.buffered_data.scanning_offset != 0
+        {
+            return false;
+        }
+        let head = self.buffered_data.head_batch();
+        if head.range.len() != 1 {
+            return false;
+        }
+        let (streamed_idx, buffered_idx) = (self.streamed_batch.idx, head.range.start);
+        let end = self
+            .streamed_batch
+            .batch
+            .num_rows()
+            .min(streamed_idx + self.batch_size - self.num_unfrozen_pairs());
+        let Some(cmp) = self.streamed_buffered_cmp.as_ref() else {
+            return false;
+        };
+        let run_end = gallop_while(streamed_idx + 1, end, |s| {
+            cmp.compare(s, buffered_idx) == Ordering::Equal
+        });
+        let len = run_end - streamed_idx;
+        if len < 2 {
+            return false;
+        }
+        self.streamed_batch.append_streamed_run_pairs(
+            0,
+            buffered_idx,
+            len,
+            self.batch_size,
+        );
+        self.streamed_batch.idx = run_end - 1;
+        self.buffered_group_matched = true;
+        self.buffered_data.scanning_reset();
+        true
     }
 
     #[inline(never)]
