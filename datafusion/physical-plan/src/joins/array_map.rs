@@ -160,7 +160,7 @@ impl ArrayMap {
     /// Note: This function processes only the non-null values in the input `array`,
     /// ignoring any rows where the key is `NULL`.
     ///
-    pub(crate) fn try_new(array: &ArrayRef, min_val: u64, max_val: u64) -> Result<Self> {
+    pub fn try_new(array: &ArrayRef, min_val: u64, max_val: u64) -> Result<Self> {
         let range = Self::calculate_range(min_val, max_val);
         if range >= usize::MAX as u64 {
             return internal_err!("ArrayMap key range is too large to be allocated.");

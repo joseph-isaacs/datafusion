@@ -167,6 +167,10 @@ name = "hash_join_build"
 
 [[bench]]
 harness = false
+name = "hash_join_probe"
+
+[[bench]]
+harness = false
 name = "hash_join_semi_anti"
 required-features = ["test_utils"]
 
