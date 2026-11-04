@@ -110,7 +110,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::EmptyRecordBatchStream;
-use crate::joins::utils::{JoinFilter, JoinKeyComparator};
+use crate::joins::utils::{JoinFilter, JoinKeyComparator, gallop_while};
 use crate::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, Time,
 };
@@ -267,6 +267,9 @@ pub(crate) struct BitwiseSortMergeJoinStream {
     // Cached comparators — pre-built to avoid per-row type dispatch.
     /// Comparator for outer vs inner key comparison
     outer_inner_cmp: Option<JoinKeyComparator>,
+    /// The merge loop's previous key comparison, to detect runs of
+    /// non-matching rows worth galloping over.
+    last_ordering: Ordering,
     /// Comparator for outer self-comparison (find_key_group_end on outer)
     outer_self_cmp: Option<JoinKeyComparator>,
     /// Comparator for inner self-comparison (find_key_group_end on inner)
@@ -348,6 +351,7 @@ impl BitwiseSortMergeJoinStream {
             runtime_env,
             inner_buffer_size: 0,
             outer_inner_cmp: None,
+            last_ordering: Ordering::Equal,
             outer_self_cmp: None,
             inner_self_cmp: None,
         };
@@ -939,6 +943,35 @@ impl BitwiseSortMergeJoinStream {
         Ok(())
     }
 
+    /// `Less` within a run of unmatched outer rows: skip, by galloping, every
+    /// outer row of the current batch whose key is below the inner key, in
+    /// `O(log run)` comparisons. Those rows stay unmatched, exactly as
+    /// skipping them one key group at a time would leave them.
+    fn skip_outer_rows_below_inner(&mut self) -> Result<()> {
+        let num_outer = self.outer_batch.as_ref().unwrap().num_rows();
+        let (from, inner_idx) = (self.outer_offset, self.inner_offset);
+        let cmp = self.get_outer_inner_cmp()?;
+        self.outer_offset = gallop_while(from, num_outer, |o| {
+            cmp.compare(o, inner_idx) == Ordering::Less
+        });
+        Ok(())
+    }
+
+    /// `Greater` within a run of inner rows below the outer key: skip, by
+    /// galloping, every inner row of the current batch whose key is below the
+    /// outer key. Reaching the end of the batch is fine: the next inner
+    /// batch's rows are compared afresh, and any of them still below the
+    /// outer key are skipped the same way.
+    fn skip_inner_rows_below_outer(&mut self) -> Result<()> {
+        let num_inner = self.inner_batch.as_ref().unwrap().num_rows();
+        let (outer_idx, from) = (self.outer_offset, self.inner_offset);
+        let cmp = self.get_outer_inner_cmp()?;
+        self.inner_offset = gallop_while(from, num_inner, |i| {
+            cmp.compare(outer_idx, i) == Ordering::Greater
+        });
+        Ok(())
+    }
+
     /// Sync fast path for `Ordering::Greater`: skip the inner key group when
     /// it ends within the current batch. Returns false — leaving all state
     /// unchanged — when the group reaches the batch boundary, in which case
@@ -1101,7 +1134,15 @@ impl BitwiseSortMergeJoinStream {
         // The `has_current_*` / `has_completed_batch` fast paths keep async
         // state machinery out of the per-key-group hot path; the awaiting
         // helpers are only entered at batch boundaries.
+        // Read each input ahead from the moment it is needed: the inner one
+        // once the outer one has produced a row.
+        super::prefetch(&mut self.outer);
+        let mut inner_prefetched = false;
         while self.has_current_outer_row() || self.advance_outer_row(emitter).await? {
+            if !inner_prefetched {
+                super::prefetch(&mut self.inner);
+                inner_prefetched = true;
+            }
             if !(self.has_current_inner_row() || self.advance_inner_row().await?) {
                 self.drain_outer(emitter).await?;
                 break;
@@ -1110,8 +1151,17 @@ impl BitwiseSortMergeJoinStream {
             // Each arm handles the common case synchronously (`try_*`); the
             // async continuations only run when a key group reaches a batch
             // boundary or a filter must be evaluated.
-            match self.compare_current_keys()? {
+            let ordering = self.compare_current_keys()?;
+            // Gallop past a run of non-matching rows only once a run is
+            // under way (the step before had the same ordering): probing for
+            // a run after every match would cost a dense join an extra key
+            // comparison per row.
+            let in_run = ordering == self.last_ordering;
+            self.last_ordering = ordering;
+            match ordering {
+                Ordering::Less if in_run => self.skip_outer_rows_below_inner()?,
                 Ordering::Less => self.skip_outer_key_group()?,
+                Ordering::Greater if in_run => self.skip_inner_rows_below_outer()?,
                 Ordering::Greater => {
                     if !self.try_skip_inner_key_group()? {
                         self.advance_inner_past_key_group().await?;

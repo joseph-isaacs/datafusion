@@ -47,7 +47,7 @@ use arrow::array::{
     StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array,
 };
-use arrow::buffer::{BooleanBuffer, NullBuffer};
+use arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow::compute::{self, take};
 use arrow::datatypes::{
     ArrowNativeType, Field, Schema, SchemaBuilder, SchemaRef, UInt32Type, UInt64Type,
@@ -2772,6 +2772,123 @@ impl JoinKeyComparator {
     }
 }
 
+/// Counts the leading `t` in `0..max` for which left key row `left + t`
+/// equals right key row `right + t`, and, when `unique`, right row
+/// `right + t` also differs from right row `right + t + 1`, so that it is a
+/// key group of one row (row `right + max` must then exist). That is the
+/// length of a diagonal run in a merge of sorted keys: each left row matches
+/// exactly the right row opposite it, as in two time series on one clock.
+///
+/// Scans in a tight loop over the key values, and only for the shape of a
+/// time-series key: one column of the same 32- or 64-bit integer-backed type
+/// (integers, dates, times, timestamps, durations) on both sides, without
+/// nulls. Returns 0 for any other key, telling the caller to take its
+/// row-at-a-time path, which handles null and float semantics.
+pub(crate) fn equal_run_len(
+    left_arrays: &[ArrayRef],
+    right_arrays: &[ArrayRef],
+    left: usize,
+    right: usize,
+    max: usize,
+    unique: bool,
+) -> usize {
+    fn run<T: ArrowNativeType>(
+        l: &dyn Array,
+        r: &dyn Array,
+        left: usize,
+        right: usize,
+        max: usize,
+        unique: bool,
+    ) -> usize {
+        let values = |a: &dyn Array| {
+            let data = a.to_data();
+            let buffer = data.buffers().first()?.clone();
+            Some(ScalarBuffer::<T>::new(buffer, data.offset(), data.len()))
+        };
+        let (Some(l), Some(r)) = (values(l), values(r)) else {
+            return 0;
+        };
+        let (Some(l), Some(r)) = (
+            l.get(left..left + max),
+            r.get(right..right + max + usize::from(unique)),
+        ) else {
+            return 0;
+        };
+        if unique {
+            l.iter()
+                .zip(r.windows(2))
+                .take_while(|(l, r)| **l == r[0] && r[0] != r[1])
+                .count()
+        } else {
+            l.iter().zip(r).take_while(|(l, r)| l == r).count()
+        }
+    }
+
+    let ([l], [r]) = (left_arrays, right_arrays) else {
+        return 0;
+    };
+    if l.data_type() != r.data_type() || l.null_count() > 0 || r.null_count() > 0 {
+        return 0;
+    }
+    let (l, r) = (l.as_ref(), r.as_ref());
+    match l.data_type() {
+        DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
+            run::<i32>(l, r, left, right, max, unique)
+        }
+        DataType::Int64
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Timestamp(..)
+        | DataType::Duration(_) => run::<i64>(l, r, left, right, max, unique),
+        DataType::UInt32 => run::<u32>(l, r, left, right, max, unique),
+        DataType::UInt64 => run::<u64>(l, r, left, right, max, unique),
+        _ => 0,
+    }
+}
+
+/// Returns the first index in `from..to` for which `pred` is false, or `to`
+/// when it holds for the whole range. `pred` must be monotone over the range:
+/// true for a (possibly empty) prefix and false after it, as "this sorted
+/// key is below a bound" is.
+///
+/// Gallops (exponential then binary search), so skipping a run of `n` rows
+/// costs `O(log n)` calls to `pred` rather than `n`, and a run of zero or one
+/// row costs one or two calls.
+#[inline]
+pub(crate) fn gallop_while(
+    from: usize,
+    to: usize,
+    mut pred: impl FnMut(usize) -> bool,
+) -> usize {
+    if from >= to || !pred(from) {
+        return from;
+    }
+    // Invariant: pred(lo) is true; the answer lies in lo + 1..=hi.
+    let mut lo = from;
+    let mut step = 1;
+    let mut hi = loop {
+        let probe = lo + step;
+        if probe >= to {
+            break to;
+        }
+        if !pred(probe) {
+            break probe;
+        }
+        lo = probe;
+        step *= 2;
+    };
+    // Binary search: pred(lo) is true and hi is either `to` or a false index.
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
+}
+
 /// Get comparison result of two rows of join arrays
 pub fn compare_join_arrays(
     left_arrays: &[ArrayRef],
@@ -2885,6 +3002,29 @@ mod tests {
 
     fn assert_u32_values(array: &UInt32Array, expected: &[u32]) {
         assert_eq!(array.values().as_ref(), expected);
+    }
+
+    #[test]
+    fn gallop_while_finds_first_false_index() {
+        // Every split point of every range up to 40 rows, against a linear scan.
+        for len in 0..40usize {
+            for from in 0..=len {
+                for bound in 0..=len + 1 {
+                    let mut calls = 0;
+                    let got = gallop_while(from, len, |i| {
+                        calls += 1;
+                        assert!((from..len).contains(&i), "probed {i}");
+                        i < bound
+                    });
+                    let expected = (from..len).find(|&i| i >= bound).unwrap_or(len);
+                    assert_eq!(got, expected, "len={len} from={from} bound={bound}");
+                    // An empty run costs one probe; a run of n, O(log n).
+                    let run = expected - from;
+                    let max_calls = 1 + 2 * (usize::BITS - run.leading_zeros()) as usize;
+                    assert!(calls <= max_calls, "{calls} probes for a run of {run}");
+                }
+            }
+        }
     }
 
     #[test]

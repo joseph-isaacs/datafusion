@@ -14,3 +14,22 @@ mod metrics;
 
 #[cfg(test)]
 mod tests;
+
+use crate::SendableRecordBatchStream;
+use crate::common::spawn_buffered;
+use crate::stream::EmptyRecordBatchStream;
+
+/// Moves the polling of `stream` into its own task, one batch ahead of the
+/// join (as `SortPreservingMergeExec` does for its inputs). A merge join
+/// alternates between its two inputs, so polling them inline leaves each
+/// input's scan and decode idle while the other's runs and while the merge
+/// itself does; buffered, they run in parallel with both.
+///
+/// The streams call this lazily, on the second input only once the first
+/// has produced a row, so a join that ends early still never starts reading
+/// an input it does not need. A no-op outside a multi-threaded runtime.
+pub(super) fn prefetch(stream: &mut SendableRecordBatchStream) {
+    let schema = stream.schema();
+    let input = std::mem::replace(stream, Box::pin(EmptyRecordBatchStream::new(schema)));
+    *stream = spawn_buffered(input, 1);
+}

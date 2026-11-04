@@ -22,7 +22,7 @@ use crate::joins::sort_merge_join::filter::{
     get_filter_columns, needs_deferred_filtering,
 };
 use crate::joins::sort_merge_join::metrics::SortMergeJoinMetrics;
-use crate::joins::utils::{JoinFilter, JoinKeyComparator};
+use crate::joins::utils::{JoinFilter, JoinKeyComparator, equal_run_len, gallop_while};
 use crate::metrics::Time;
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::{EmptyRecordBatchStream, ObservedStream, RecordBatchStreamAdapter};
@@ -120,6 +120,48 @@ impl StreamedBatch {
         current_chunk.buffered_indices.push(0);
         current_chunk.buffered_nulls.append_null();
         self.num_output_rows += 1;
+    }
+
+    /// Appends `len` pairs of streamed rows `self.idx..self.idx + len` each
+    /// joined to a null buffered row: the bulk form of
+    /// [`Self::append_null_joined_pair`] for a run of unmatched streamed rows.
+    fn append_null_joined_pairs(
+        &mut self,
+        buffered_batch_idx: Option<usize>,
+        len: usize,
+        batch_size: usize,
+    ) {
+        debug_assert!(len > 0 && self.num_output_rows + len <= batch_size);
+        let start = self.idx as u64;
+        let current_chunk = self.chunk_for(buffered_batch_idx, batch_size);
+        current_chunk
+            .streamed_indices
+            .extend(start..start + len as u64);
+        current_chunk.buffered_indices.extend(repeat_n(0, len));
+        current_chunk.buffered_nulls.append_n_nulls(len);
+        self.num_output_rows += len;
+    }
+
+    /// Appends the `len` pairs `(self.idx + t, buffered_start + t)`: a run of
+    /// streamed rows each matching the buffered row opposite it.
+    fn append_diagonal_pairs(
+        &mut self,
+        buffered_batch_idx: usize,
+        buffered_start: usize,
+        len: usize,
+        batch_size: usize,
+    ) {
+        debug_assert!(len > 0 && self.num_output_rows + len <= batch_size);
+        let (streamed, buffered) = (self.idx as u64, buffered_start as u64);
+        let current_chunk = self.chunk_for(Some(buffered_batch_idx), batch_size);
+        current_chunk
+            .streamed_indices
+            .extend(streamed..streamed + len as u64);
+        current_chunk
+            .buffered_indices
+            .extend(buffered..buffered + len as u64);
+        current_chunk.buffered_nulls.append_n_non_nulls(len);
+        self.num_output_rows += len;
     }
 
     /// Appends a pair of the current streamed index and each of the `len` rows from
@@ -427,6 +469,13 @@ pub(super) struct MaterializingSortMergeJoinStream {
     // ========================================================================
     /// Comparator for streamed vs buffered head batch key comparison
     pub streamed_buffered_cmp: Option<JoinKeyComparator>,
+    /// The merge loop's previous key comparison, to detect runs of
+    /// non-matching rows worth galloping over.
+    pub last_ordering: Ordering,
+    /// Matches left to pass before probing for a one-to-one run again, and
+    /// the current backoff; see [`Self::try_pair_unique_run`].
+    pub unique_run_skip: u32,
+    pub unique_run_backoff: u32,
     /// Comparator for buffered head vs tail batch equality check
     pub buffered_equality_cmp: Option<JoinKeyComparator>,
 
@@ -673,6 +722,9 @@ impl MaterializingSortMergeJoinStream {
             join_time,
             join_time_start: None,
             streamed_buffered_cmp: None,
+            last_ordering: Ordering::Equal,
+            unique_run_skip: 0,
+            unique_run_backoff: 0,
             buffered_equality_cmp: None,
             streamed_batch_counter: 0,
         };
@@ -704,9 +756,12 @@ impl MaterializingSortMergeJoinStream {
         &mut self,
         emitter: &mut TryEmitter<RecordBatch, DataFusionError>,
     ) -> Result<()> {
-        // 1. Load the first streamed row and the first buffered key group.
+        // 1. Load the first streamed row and the first buffered key group,
+        //    reading each input ahead from the moment it is needed.
+        super::prefetch(&mut self.streamed);
         self.load_next_streamed_batch().await?;
         if !self.finished() {
+            super::prefetch(&mut self.buffered);
             self.advance_buffered_group().await?;
         }
 
@@ -723,11 +778,18 @@ impl MaterializingSortMergeJoinStream {
             // 3. Compare the join keys at both cursors. An exhausted side
             //    compares as the larger one, so the other side keeps
             //    draining through its own arm.
-            match self.compare_streamed_buffered()? {
+            let ordering = self.compare_streamed_buffered()?;
+            // Gallop past a run of non-matching rows only once a run is
+            // under way: the step before had the same ordering. A dense join
+            // alternates `Equal` with a single `Greater`, and probing for a
+            // run there would cost an extra key comparison per row.
+            let in_run = ordering == self.last_ordering;
+            self.last_ordering = ordering;
+            match ordering {
                 // 3a. The streamed row can never match: null-join it (outer
                 //     joins emit it; inner joins drop it), then advance.
                 Ordering::Less => {
-                    self.null_join_streamed_row();
+                    self.null_join_streamed_rows(in_run);
                     if self.num_unfrozen_pairs() >= self.batch_size {
                         self.freeze_and_emit(emitter).await?;
                     }
@@ -740,6 +802,9 @@ impl MaterializingSortMergeJoinStream {
                 //     the next key group.
                 Ordering::Greater => {
                     self.null_join_buffered_group();
+                    if in_run {
+                        self.skip_buffered_rows_below_streamed();
+                    }
                     if !self.try_advance_buffered_group()? {
                         self.advance_buffered_group().await?;
                     }
@@ -749,7 +814,11 @@ impl MaterializingSortMergeJoinStream {
                 //     batch of pairs accumulates — then advance streamed.
                 //     The group stays for the next streamed row.
                 Ordering::Equal => {
-                    while !self.pair_streamed_row_with_group() {
+                    if !self.try_pair_unique_run() {
+                        while !self.pair_streamed_row_with_group() {
+                            self.freeze_and_emit(emitter).await?;
+                        }
+                    } else if self.num_unfrozen_pairs() >= self.batch_size {
                         self.freeze_and_emit(emitter).await?;
                     }
                     if !self.try_advance_streamed_row() {
@@ -805,22 +874,189 @@ impl MaterializingSortMergeJoinStream {
         true
     }
 
-    /// `Less` (outer joins): no buffered row matches the current streamed
-    /// row — emit it joined to NULLs. Inner joins emit nothing.
-    fn null_join_streamed_row(&mut self) {
-        if matches!(
+    /// `Equal` with a one-row buffered group: pair the current streamed row,
+    /// and each following one, with the buffered row opposite it for as long
+    /// as their keys keep matching one-to-one (each buffered row its own key
+    /// group). That is the whole of a dense unique-key join, such as two
+    /// time series on the same clock, and the run is found in a tight loop
+    /// over the key values instead of two merge-loop trips and three key
+    /// comparisons per row. Its pairs are contiguous on both sides, so
+    /// materializing them slices rather than takes.
+    ///
+    /// Leaves the cursors on the run's last pair, as pairing that row through
+    /// the merge loop would, and returns false, changing nothing, when there
+    /// is no run of at least two rows.
+    ///
+    /// A join without runs (sparse, or with duplicate keys) would pay a
+    /// failed probe per match, so after each failure the next probes are
+    /// skipped for exponentially more matches, up to 64; a found run resets
+    /// that.
+    #[inline(always)]
+    fn try_pair_unique_run(&mut self) -> bool {
+        if self.unique_run_skip > 0 {
+            self.unique_run_skip -= 1;
+            return false;
+        }
+        if self.pair_unique_run() {
+            self.unique_run_backoff = 0;
+            true
+        } else {
+            self.unique_run_backoff = (self.unique_run_backoff * 2).clamp(1, 64);
+            self.unique_run_skip = self.unique_run_backoff;
+            false
+        }
+    }
+
+    #[inline(never)]
+    fn pair_unique_run(&mut self) -> bool {
+        if self.buffered_data.batches.len() != 1
+            || self.buffered_data.scanning_batch_idx != 0
+            || self.buffered_data.scanning_offset != 0
+        {
+            return false;
+        }
+        let head = self.buffered_data.head_batch();
+        if head.range.len() != 1 {
+            return false;
+        }
+        let (streamed_idx, buffered_idx) = (self.streamed_batch.idx, head.range.start);
+        // The last buffered row is excluded: its group may continue into the
+        // next buffered batch.
+        let max = (self.batch_size - self.num_unfrozen_pairs())
+            .min(self.streamed_batch.batch.num_rows() - streamed_idx)
+            .min(head.num_rows - 1 - buffered_idx);
+        if max < 2 {
+            return false;
+        }
+        // One comparison rules out a run in a sparse join before the scan.
+        let Some(cmp) = self.streamed_buffered_cmp.as_ref() else {
+            return false;
+        };
+        if cmp.compare(streamed_idx + 1, buffered_idx + 1) != Ordering::Equal {
+            return false;
+        }
+        let len = equal_run_len(
+            &self.streamed_batch.join_arrays,
+            &head.join_arrays,
+            streamed_idx,
+            buffered_idx,
+            max,
+            true,
+        );
+        if len < 2 {
+            return false;
+        }
+        self.streamed_batch
+            .append_diagonal_pairs(0, buffered_idx, len, self.batch_size);
+        self.streamed_batch.idx = streamed_idx + len - 1;
+        let last = buffered_idx + len - 1;
+        self.buffered_data.tail_batch_mut().range = last..last + 1;
+        self.buffered_group_matched = true;
+        self.buffered_data.scanning_reset();
+        true
+    }
+
+    /// `Less`: no buffered row matches the current streamed row, nor any
+    /// following streamed row of the current batch whose key is also below the
+    /// buffered group's. Outer joins emit those rows joined to NULLs, up to the
+    /// room left in the output batch; inner joins skip them. Leaves the cursor
+    /// on the last row handled, for the caller to advance past.
+    ///
+    /// The run is found by galloping, so a long run of unmatched streamed rows
+    /// (a sparse time-series join) costs `O(log run)` key comparisons and one
+    /// trip around the merge loop instead of one of each per row. Without
+    /// `gallop` (no run under way yet) only the current row is handled, which
+    /// costs no comparison beyond the merge loop's own.
+    fn null_join_streamed_rows(&mut self, gallop: bool) {
+        let outer = matches!(
             self.join_type,
             JoinType::Left | JoinType::Right | JoinType::Full
-        ) {
+        );
+        let mut run_end = if gallop {
+            self.streamed_less_run_end()
+        } else {
+            self.streamed_batch.idx + 1
+        };
+        if outer {
+            let room = self.batch_size - self.num_unfrozen_pairs();
+            run_end = run_end.min(self.streamed_batch.idx + room);
             let scanning_batch_idx = if self.buffered_data.scanning_finished() {
                 None
             } else {
                 Some(self.buffered_data.scanning_batch_idx)
             };
-            self.streamed_batch
-                .append_null_joined_pair(scanning_batch_idx, self.batch_size);
+            let len = run_end - self.streamed_batch.idx;
+            if len == 1 {
+                self.streamed_batch
+                    .append_null_joined_pair(scanning_batch_idx, self.batch_size);
+            } else {
+                self.streamed_batch.append_null_joined_pairs(
+                    scanning_batch_idx,
+                    len,
+                    self.batch_size,
+                );
+            }
         }
+        self.streamed_batch.idx = run_end - 1;
         self.buffered_data.scanning_reset();
+    }
+
+    /// The end of the run of streamed rows, starting at the cursor (which
+    /// compares `Less`), whose keys all compare `Less` than the buffered
+    /// group's key. Bounded by the current streamed batch.
+    fn streamed_less_run_end(&self) -> usize {
+        let idx = self.streamed_batch.idx;
+        let num_rows = self.streamed_batch.batch.num_rows();
+        if idx + 1 >= num_rows {
+            return idx + 1;
+        }
+        if !self.buffered_data.has_buffered_rows() {
+            // No buffered rows left: every remaining streamed row is unmatched.
+            return num_rows;
+        }
+        let Some(cmp) = self.streamed_buffered_cmp.as_ref() else {
+            return idx + 1;
+        };
+        let buffered_idx = self.buffered_data.head_batch().range.start;
+        gallop_while(idx + 1, num_rows, |s| {
+            cmp.compare(s, buffered_idx) == Ordering::Less
+        })
+    }
+
+    /// `Greater`, after the current group was passed: skip every following row
+    /// of the buffered batch whose key is still below the streamed row's, so
+    /// the next group starts at the first row that may match. These rows can
+    /// match no streamed row (the streamed side has moved past them), so a
+    /// FULL join marks them null-joined.
+    ///
+    /// Like [`Self::null_join_streamed_rows`], this gallops: a sparse join
+    /// that passes many unmatched buffered rows per match pays `O(log run)`
+    /// comparisons instead of a group scan and a merge-loop trip per row.
+    /// Only acts within a single buffered batch; group boundaries that reach
+    /// the end of the batch are left to [`Self::advance_buffered_group`].
+    fn skip_buffered_rows_below_streamed(&mut self) {
+        if self.streamed_exhausted || self.buffered_data.batches.len() != 1 {
+            return;
+        }
+        let Some(cmp) = self.streamed_buffered_cmp.as_ref() else {
+            return;
+        };
+        let streamed_idx = self.streamed_batch.idx;
+        let batch = self.buffered_data.head_batch();
+        let start = batch.range.end;
+        let skip_end = gallop_while(start, batch.num_rows, |b| {
+            cmp.compare(streamed_idx, b) == Ordering::Greater
+        });
+        if skip_end == start {
+            return;
+        }
+        let batch = self.buffered_data.tail_batch_mut();
+        if self.join_type == JoinType::Full {
+            batch.null_joined.extend(start..skip_end);
+        }
+        // An empty "previous group" ending where the next one starts: both
+        // advance paths seed the next group at `range.end`.
+        batch.range = skip_end..skip_end;
     }
 
     /// `Greater` (FULL join): the buffered group can never match a streamed

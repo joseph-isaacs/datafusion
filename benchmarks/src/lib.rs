@@ -11,6 +11,7 @@ pub mod hj;
 pub mod imdb;
 pub mod nlj;
 pub mod smj;
+pub mod smj_ts;
 pub mod sort_pushdown;
 pub mod sort_tpch;
 pub mod sql_benchmark;
