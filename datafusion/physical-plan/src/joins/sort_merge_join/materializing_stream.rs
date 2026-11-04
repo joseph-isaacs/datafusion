@@ -17,19 +17,22 @@ use std::mem::{size_of, take};
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::expressions::Column;
 use crate::joins::sort_merge_join::filter::{
     FilterMetadata, filter_record_batch_by_join_type, get_corrected_filter_mask,
     get_filter_columns, needs_deferred_filtering,
 };
 use crate::joins::sort_merge_join::metrics::SortMergeJoinMetrics;
-use crate::joins::utils::{JoinFilter, JoinKeyComparator, equal_run_len, gallop_while};
+use crate::joins::utils::{
+    JoinFilter, JoinKeyComparator, equal_run_len, gallop_while, native_i64_keys,
+};
 use crate::metrics::Time;
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::{EmptyRecordBatchStream, ObservedStream, RecordBatchStreamAdapter};
 use crate::{PhysicalExpr, SendableRecordBatchStream};
 
 use arrow::array::{types::UInt64Type, *};
-use arrow::buffer::NullBuffer;
+use arrow::buffer::{NullBuffer, ScalarBuffer};
 use arrow::compute::{
     self, BatchCoalescer, SortOptions, concat_batches, filter_record_batch, interleave,
     take_arrays,
@@ -549,6 +552,9 @@ pub(super) struct MaterializingSortMergeJoinStream {
     // ========================================================================
     /// Comparator for streamed vs buffered head batch key comparison
     pub streamed_buffered_cmp: Option<JoinKeyComparator>,
+    /// The key values behind `streamed_buffered_cmp` for a single null-free
+    /// 64-bit key, for the gallop predicates; only read while that is `Some`.
+    pub gallop_i64: Option<(ScalarBuffer<i64>, ScalarBuffer<i64>)>,
     /// The merge loop's previous key comparison, to detect runs of
     /// non-matching rows worth galloping over.
     pub last_ordering: Ordering,
@@ -810,6 +816,7 @@ impl MaterializingSortMergeJoinStream {
             join_time,
             join_time_start: None,
             streamed_buffered_cmp: None,
+            gallop_i64: None,
             last_ordering: Ordering::Equal,
             long_less_runs: false,
             long_greater_runs: false,
@@ -1180,6 +1187,16 @@ impl MaterializingSortMergeJoinStream {
             return idx + 1;
         };
         let buffered_idx = self.buffered_data.head_batch().range.start;
+        if let Some((streamed, buffered)) = &self.gallop_i64 {
+            let (bound, desc) = (buffered[buffered_idx], self.sort_options[0].descending);
+            return gallop_while(idx + 1, num_rows, |s| {
+                if desc {
+                    streamed[s] > bound
+                } else {
+                    streamed[s] < bound
+                }
+            });
+        }
         gallop_while(idx + 1, num_rows, |s| {
             cmp.compare(s, buffered_idx) == Ordering::Less
         })
@@ -1206,9 +1223,20 @@ impl MaterializingSortMergeJoinStream {
         let streamed_idx = self.streamed_batch.idx;
         let batch = self.buffered_data.head_batch();
         let start = batch.range.end;
-        let skip_end = gallop_while(start, batch.num_rows, |b| {
-            cmp.compare(streamed_idx, b) == Ordering::Greater
-        });
+        let skip_end = if let Some((streamed, buffered)) = &self.gallop_i64 {
+            let (bound, desc) = (streamed[streamed_idx], self.sort_options[0].descending);
+            gallop_while(start, batch.num_rows, |b| {
+                if desc {
+                    buffered[b] > bound
+                } else {
+                    buffered[b] < bound
+                }
+            })
+        } else {
+            gallop_while(start, batch.num_rows, |b| {
+                cmp.compare(streamed_idx, b) == Ordering::Greater
+            })
+        };
         if skip_end == start {
             return false;
         }
@@ -1418,6 +1446,10 @@ impl MaterializingSortMergeJoinStream {
             &self.sort_options,
             self.null_equality,
         )?);
+        self.gallop_i64 = native_i64_keys(
+            &self.streamed_batch.join_arrays,
+            &self.buffered_data.head_batch().join_arrays,
+        );
         Ok(())
     }
 
@@ -2709,6 +2741,15 @@ fn join_arrays(
     let num_rows = batch.num_rows();
     on_column
         .iter()
-        .map(|c| c.evaluate(batch)?.into_array(num_rows))
+        .map(|c| {
+            // A plain column key is the batch's own column: skip evaluation.
+            if let Some(column) = c.downcast_ref::<Column>()
+                && let Some(array) = batch.columns().get(column.index())
+                && batch.schema_ref().field(column.index()).name() == column.name()
+            {
+                return Ok(Arc::clone(array));
+            }
+            c.evaluate(batch)?.into_array(num_rows)
+        })
         .collect()
 }

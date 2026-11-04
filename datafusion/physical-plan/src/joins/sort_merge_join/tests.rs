@@ -8130,12 +8130,17 @@ async fn join_time_series_shapes_match_hash_join() -> Result<()> {
         Inner, Left, Right, Full, LeftSemi, LeftAnti, RightSemi, RightAnti, LeftMark,
     ];
     for (shape, left_keys, right_keys) in &shapes {
-        for utf8_keys in [false, true] {
+        // Descending keys run the same merge with every comparison reversed.
+        for (utf8_keys, descending) in [(false, false), (true, false), (false, true)] {
             for (input_rows, batch_size) in
                 [(1, 3), (7, 5), (64, 2), (97, 64), (1000, 8192)]
             {
                 let table = |keys: &[i64], k: &str, p: &str| {
-                    sorted_key_table(k, p, keys, input_rows, utf8_keys)
+                    let mut keys = keys.to_vec();
+                    if descending {
+                        keys.reverse();
+                    }
+                    sorted_key_table(k, p, &keys, input_rows, utf8_keys)
                 };
                 let left = table(left_keys, "k1", "p1");
                 let right = table(right_keys, "k2", "p2");
@@ -8215,15 +8220,18 @@ async fn join_time_series_shapes_match_hash_join() -> Result<()> {
                                 on.clone(),
                                 filter,
                                 join_type,
-                                vec![SortOptions::default()],
+                                vec![SortOptions {
+                                    descending,
+                                    nulls_first: true,
+                                }],
                                 NullEquality::NullEqualsNothing,
                             )?))
                             .await?;
                         assert_eq!(
                             actual, expected,
                             "{shape}, {join_type:?}, filter={has_filter}, \
-                             utf8={utf8_keys}, input_rows={input_rows}, \
-                             batch_size={batch_size}"
+                             utf8={utf8_keys}, descending={descending}, \
+                             input_rows={input_rows}, batch_size={batch_size}"
                         );
                     }
                 }

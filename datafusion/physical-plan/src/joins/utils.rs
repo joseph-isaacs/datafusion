@@ -2772,6 +2772,37 @@ impl JoinKeyComparator {
     }
 }
 
+/// The values of a single null-free key column of the same 64-bit
+/// integer-backed type on both sides (integers, timestamps, dates, times,
+/// durations: the time-series key), or `None` for any other key.
+pub(crate) fn native_i64_keys(
+    left_arrays: &[ArrayRef],
+    right_arrays: &[ArrayRef],
+) -> Option<(ScalarBuffer<i64>, ScalarBuffer<i64>)> {
+    let ([l], [r]) = (left_arrays, right_arrays) else {
+        return None;
+    };
+    if l.data_type() != r.data_type() || l.null_count() > 0 || r.null_count() > 0 {
+        return None;
+    }
+    if !matches!(
+        l.data_type(),
+        DataType::Int64
+            | DataType::Date64
+            | DataType::Time64(_)
+            | DataType::Timestamp(..)
+            | DataType::Duration(_)
+    ) {
+        return None;
+    }
+    let values = |a: &ArrayRef| {
+        let data = a.to_data();
+        let buffer = data.buffers().first()?.clone();
+        Some(ScalarBuffer::<i64>::new(buffer, data.offset(), data.len()))
+    };
+    Some((values(l)?, values(r)?))
+}
+
 /// Counts the leading `t` in `0..max` for which left key row `left + t`
 /// equals right key row `right + t`, and, when `unique`, right row
 /// `right + t` also differs from right row `right + t + 1`, so that it is a
