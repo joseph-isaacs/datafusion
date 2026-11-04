@@ -456,10 +456,10 @@ where
     }
 }
 
-/// How many rows ahead of the current insert to prefetch. Far enough to hide a
+/// How many rows ahead of the current insert or lookup to prefetch. Far enough to hide a
 /// DRAM access behind the inserts in between, near enough that the prefetched
 /// lines are still cached when their row is reached.
-const PREFETCH_DISTANCE: usize = 16;
+pub(crate) const PREFETCH_DISTANCE: usize = 16;
 
 /// Prefetches the memory that inserting or looking up a hash in a
 /// [`HashTable`] touches first: the control byte group and the bucket at the
@@ -515,7 +515,7 @@ impl<E> BucketPrefetcher<E> {
 
 /// Hints the CPU to load the cache line holding `addr`. Never faults.
 #[inline(always)]
-fn prefetch_read(addr: usize) {
+pub(crate) fn prefetch_read(addr: usize) {
     let ptr: *const i8 = std::ptr::without_provenance(addr);
     #[cfg(target_arch = "x86_64")]
     // SAFETY: `prefetch` does not access memory and cannot fault, even for an
@@ -666,6 +666,8 @@ where
     input_indices.clear();
     match_indices.clear();
     let one = T::try_from(1).unwrap();
+    // The map is read-only during the probe, so one anchor serves every row.
+    let prefetcher = BucketPrefetcher::new(map);
 
     // Check if hashmap consists of unique values
     // If so, we can skip the chain traversal
@@ -680,6 +682,9 @@ where
         };
         let end = (start + limit).min(hash_values.len());
         for (i, &hash) in hash_values[start..end].iter().enumerate() {
+            if let Some(&ahead) = hash_values.get(start + i + PREFETCH_DISTANCE) {
+                prefetcher.prefetch(ahead);
+            }
             // NULL keys cannot match any build row
             if valid_keys.is_some_and(|valid| valid.is_null(start + i)) {
                 continue;
@@ -728,6 +733,9 @@ where
     let hash_values_len = hash_values.len();
     for (i, &hash) in hash_values[to_skip..].iter().enumerate() {
         let row_idx = to_skip + i;
+        if let Some(&ahead) = hash_values.get(row_idx + PREFETCH_DISTANCE) {
+            prefetcher.prefetch(ahead);
+        }
         // NULL keys cannot match any build row
         if valid_keys.is_some_and(|valid| valid.is_null(row_idx)) {
             continue;
