@@ -29,11 +29,12 @@ use crate::stream::{EmptyRecordBatchStream, ObservedStream, RecordBatchStreamAda
 use crate::{PhysicalExpr, SendableRecordBatchStream};
 
 use arrow::array::{types::UInt64Type, *};
+use arrow::buffer::NullBuffer;
 use arrow::compute::{
     self, BatchCoalescer, SortOptions, concat_batches, filter_record_batch, interleave,
     take_arrays,
 };
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatchOptions;
 use datafusion_common::cast::as_uint64_array;
 use datafusion_common::instant::Instant;
@@ -2460,6 +2461,8 @@ fn fetch_right_columns_from_batch_by_idxs(
         BufferedBatchState::InMemory(batch) => {
             if let Some(range) = is_contiguous_range(buffered_indices) {
                 Ok(batch.slice(range.start, range.len()).columns().to_vec())
+            } else if let Some(nulls) = buffered_indices.nulls() {
+                take_with_null_indices(batch.columns(), buffered_indices, nulls)
             } else {
                 Ok(take_arrays(batch.columns(), buffered_indices, None)?)
             }
@@ -2470,6 +2473,44 @@ fn fetch_right_columns_from_batch_by_idxs(
             )
         }
     }
+}
+
+/// `take` for indices with nulls (null-joined rows of an outer join). Every
+/// null slot holds a valid placeholder row (0), so the columns are gathered
+/// with the null-free index values, which takes arrow's branch-free path,
+/// and the indices' nulls are then laid over each result. That replaces a
+/// per-row validity check in `take` with one bitmap AND per column. Only for
+/// flat types, whose nulls live entirely in their top-level null buffer;
+/// others take with the nullable indices.
+fn take_with_null_indices(
+    columns: &[ArrayRef],
+    indices: &UInt64Array,
+    nulls: &NullBuffer,
+) -> Result<Vec<ArrayRef>> {
+    let values = UInt64Array::new(indices.values().clone(), None);
+    columns
+        .iter()
+        .map(|column| {
+            let flat = column.data_type().is_primitive()
+                || matches!(
+                    column.data_type(),
+                    DataType::Boolean
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Utf8View
+                        | DataType::Binary
+                        | DataType::LargeBinary
+                        | DataType::BinaryView
+                        | DataType::FixedSizeBinary(_)
+                );
+            if !flat {
+                return Ok(compute::take(column, indices, None)?);
+            }
+            let taken = compute::take(column, &values, None)?.into_data();
+            let nulls = NullBuffer::union(Some(nulls), taken.nulls());
+            Ok(make_array(taken.into_builder().nulls(nulls).build()?))
+        })
+        .collect()
 }
 
 /// Buffered data contains all buffered batches with one unique join key
