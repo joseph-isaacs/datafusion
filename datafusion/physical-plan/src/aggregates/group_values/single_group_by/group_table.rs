@@ -5,7 +5,7 @@
 //! [`GroupTable`]: the hash table mapping the values of a single primitive
 //! group by column to their group indices, see `GroupValuesPrimitive`.
 
-use std::mem::size_of;
+use std::mem::{MaybeUninit, size_of};
 
 use crate::joins::join_hash_table::zeroed_vec;
 
@@ -50,8 +50,10 @@ impl Bucket {
 /// cardinality group by overlap rather than add up.
 pub(crate) struct GroupTable<K> {
     buckets: Vec<Bucket>,
-    /// `keys[b][s]` is the value of slot `s` of bucket `b`.
-    keys: Vec<[K; BUCKET_SLOTS]>,
+    /// `keys[b][s]` is the value of slot `s` of bucket `b`, initialized
+    /// only for occupied slots (non-zero tag), so that allocating the table
+    /// does not write it.
+    keys: Vec<[MaybeUninit<K>; BUCKET_SLOTS]>,
     /// `buckets.len() - 1`
     mask: usize,
     /// Number of occupied slots.
@@ -74,13 +76,21 @@ fn prefetch<T>(slice: &[T], index: usize) {
     }
 }
 
+/// `n` uninitialized arrays of keys, see [`GroupTable::keys`].
+fn uninit_vec<K>(n: usize) -> Vec<[MaybeUninit<K>; BUCKET_SLOTS]> {
+    let mut keys = Vec::with_capacity(n);
+    // SAFETY: arrays of `MaybeUninit` need no initialization.
+    unsafe { keys.set_len(n) };
+    keys
+}
+
 impl<K: Copy + Default> GroupTable<K> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         let num_buckets = Self::num_buckets(capacity);
         Self {
             // SAFETY: a `Bucket` of zeros is a bucket of empty slots.
             buckets: unsafe { zeroed_vec(num_buckets) },
-            keys: vec![[K::default(); BUCKET_SLOTS]; num_buckets],
+            keys: uninit_vec(num_buckets),
             mask: num_buckets - 1,
             len: 0,
         }
@@ -113,7 +123,7 @@ impl<K: Copy + Default> GroupTable<K> {
     /// Bytes allocated by the table.
     pub(crate) fn allocation_size(&self) -> usize {
         self.buckets.capacity() * size_of::<Bucket>()
-            + self.keys.capacity() * size_of::<[K; BUCKET_SLOTS]>()
+            + self.keys.capacity() * size_of::<[MaybeUninit<K>; BUCKET_SLOTS]>()
     }
 
     #[inline(always)]
@@ -157,7 +167,8 @@ impl<K: Copy + Default> GroupTable<K> {
             let mut matches = bucket.matches(tag);
             while matches != 0 {
                 let slot = matches.trailing_zeros() as usize;
-                if is_eq(keys[slot], key) {
+                // SAFETY: the slot is occupied, so its key is initialized.
+                if is_eq(unsafe { keys[slot].assume_init() }, key) {
                     return bucket.groups[slot];
                 }
                 matches &= matches - 1;
@@ -168,7 +179,7 @@ impl<K: Copy + Default> GroupTable<K> {
                 let group = new_group();
                 bucket.tags[slot] = tag;
                 bucket.groups[slot] = group;
-                keys[slot] = key;
+                keys[slot] = MaybeUninit::new(key);
                 self.len += 1;
                 return group;
             }
@@ -188,7 +199,7 @@ impl<K: Copy + Default> GroupTable<K> {
                 let slot = empty.trailing_zeros() as usize;
                 bucket.tags[slot] = tag;
                 bucket.groups[slot] = group;
-                self.keys[pos][slot] = key;
+                self.keys[pos][slot] = MaybeUninit::new(key);
                 self.len += 1;
                 return;
             }
@@ -202,7 +213,8 @@ impl<K: Copy + Default> GroupTable<K> {
             for ((&tag, &group), &key) in bucket.tags.iter().zip(&bucket.groups).zip(keys)
             {
                 if tag != 0 {
-                    f(key, group);
+                    // SAFETY: the slot is occupied, so its key is initialized.
+                    f(unsafe { key.assume_init() }, group);
                 }
             }
         }
