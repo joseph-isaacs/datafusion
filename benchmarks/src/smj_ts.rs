@@ -42,6 +42,12 @@ pub struct RunOpt {
     #[arg(short, long)]
     query: Option<usize>,
 
+    /// Run plain scans of the same Parquet (aggregate, filter, top-k) at the
+    /// configured partition count instead of the joins: a check that scan
+    /// changes made for the sorted join do not cost multi-partition scans.
+    #[arg(long = "scan-queries")]
+    scan_queries: bool,
+
     /// Directory holding (or receiving) the generated Parquet tables
     #[arg(short = 'p', long = "path", default_value = "data/smj_ts")]
     path: PathBuf,
@@ -103,30 +109,48 @@ const QUERIES: &[&str] = &[
     "SELECT count(*), sum(t.price - q.bid) FROM trades t JOIN quotes q ON t.ts = q.ts",
 ];
 
+/// Multi-partition scans of `quotes`, for `--scan-queries`.
+const SCAN_QUERIES: &[&str] = &[
+    // S1: full scan into a grouped aggregate
+    "SELECT sym, count(*), sum(bid), max(ask) FROM quotes GROUP BY sym",
+    // S2: full scan with a filter
+    "SELECT count(*) FROM quotes WHERE bid > 105.0",
+    // S3: top-k on the sort column
+    "SELECT ts, bid FROM quotes ORDER BY ts DESC LIMIT 10",
+];
+
 impl RunOpt {
     pub async fn run(self) -> Result<()> {
         println!("Running sorted time-series SMJ benchmarks: {self:#?}\n");
 
+        let queries = if self.scan_queries {
+            SCAN_QUERIES
+        } else {
+            QUERIES
+        };
         let query_range = match self.query {
-            Some(q) if (1..=QUERIES.len()).contains(&q) => q..=q,
+            Some(q) if (1..=queries.len()).contains(&q) => q..=q,
             Some(q) => {
                 return exec_err!(
                     "Query {q} not found. Available queries: 1 to {}",
-                    QUERIES.len()
+                    queries.len()
                 );
             }
-            None => 1..=QUERIES.len(),
+            None => 1..=queries.len(),
         };
 
-        let config = self
-            .common
-            .config()?
-            // One partition per input keeps each scan in file (= timestamp)
-            // order; the planned hash join is swapped for a sort-merge join
-            // (see `to_sort_merge_join`). Dynamic filters belong to the hash
-            // join being replaced.
-            .with_target_partitions(1)
-            .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", false);
+        let config = if self.scan_queries {
+            self.common.config()?
+        } else {
+            self.common
+                .config()?
+                // One partition per input keeps each scan in file (=
+                // timestamp) order; the planned hash join is swapped for a
+                // sort-merge join (see `plan`). Dynamic filters belong to
+                // the hash join being replaced.
+                .with_target_partitions(1)
+                .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", false)
+        };
         let rt = self.common.build_runtime()?;
         let ctx = SessionContext::new_with_config_rt(config, rt);
 
@@ -136,7 +160,7 @@ impl RunOpt {
         let mut benchmark_run = BenchmarkRun::new();
         benchmark_run.set_memory_pool(&ctx.runtime_env().memory_pool);
         for query_id in query_range {
-            let sql = QUERIES[query_id - 1];
+            let sql = queries[query_id - 1];
             benchmark_run.start_new_case(&format!("Query {query_id}"));
             for result in self.benchmark_query(sql, query_id, &ctx).await? {
                 benchmark_run.write_iter(result.elapsed, result.row_count);
@@ -225,12 +249,12 @@ impl RunOpt {
     ) -> Result<Vec<QueryResult>> {
         let plan = self.plan(sql, ctx).await?;
         let plan_string = displayable(plan.as_ref()).indent(true).to_string();
-        if !plan_string.contains("SortMergeJoinExec") {
+        if !self.scan_queries && !plan_string.contains("SortMergeJoinExec") {
             return Err(exec_datafusion_err!(
                 "Query {query_id} does not use a sort-merge join: {plan_string}"
             ));
         }
-        if plan_string.contains("SortExec") {
+        if !self.scan_queries && plan_string.contains("SortExec") {
             return Err(exec_datafusion_err!(
                 "Query {query_id} sorts its pre-sorted input: {plan_string}"
             ));
