@@ -13,9 +13,10 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayBuilder, ArrayRef, BooleanArray, BooleanBuilder, RecordBatch,
-    RecordBatchOptions, UInt64Array, UInt64Builder, new_null_array,
+    Array, ArrayBuilder, ArrayRef, BooleanArray, BooleanBufferBuilder, BooleanBuilder,
+    RecordBatch, RecordBatchOptions, UInt64Array, UInt64Builder, new_null_array,
 };
+use arrow::buffer::NullBuffer;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{self, filter_record_batch};
 use arrow::datatypes::SchemaRef;
@@ -84,8 +85,9 @@ impl FilterMetadata {
             "row_indices and filter_mask must have same length"
         );
 
-        self.filter_mask.extend(filter_mask);
-        self.row_indices.extend(row_indices);
+        // Bulk appends: `extend` would go value by value through `Option`s.
+        self.filter_mask.append_array(filter_mask);
+        self.row_indices.append_array(row_indices);
         self.batch_ids
             .resize(self.batch_ids.len() + row_indices.len(), batch_id);
     }
@@ -167,53 +169,6 @@ pub fn get_filter_columns(
         .collect()
 }
 
-/// Determines if current index is the last occurrence of a row
-///
-/// Used during filter mask correction to detect row boundaries when grouping
-/// output rows by input row.
-fn last_index_for_row(
-    row_index: usize,
-    indices: &UInt64Array,
-    batch_ids: &[usize],
-    indices_len: usize,
-) -> bool {
-    debug_assert_eq!(
-        indices.len(),
-        indices_len,
-        "indices.len() should match indices_len parameter"
-    );
-    debug_assert_eq!(
-        batch_ids.len(),
-        indices_len,
-        "batch_ids.len() should match indices_len"
-    );
-    debug_assert!(
-        row_index < indices_len,
-        "row_index {row_index} should be < indices_len {indices_len}",
-    );
-
-    // If this is the last index overall, it's definitely the last for this row
-    if row_index == indices_len - 1 {
-        return true;
-    }
-
-    // Check if next row has different (batch_id, index) pair
-    let current_batch_id = batch_ids[row_index];
-    let next_batch_id = batch_ids[row_index + 1];
-
-    if current_batch_id != next_batch_id {
-        return true;
-    }
-
-    // Same batch_id, check if row index is different
-    // Both current and next should be non-null (already joined rows)
-    if indices.is_null(row_index) || indices.is_null(row_index + 1) {
-        return true;
-    }
-
-    indices.value(row_index) != indices.value(row_index + 1)
-}
-
 /// Corrects the filter mask for joins with deferred filtering
 ///
 /// When an input row joins with multiple buffered rows, we get multiple output rows.
@@ -240,38 +195,51 @@ pub fn get_corrected_filter_mask(
     filter_mask: &BooleanArray,
     expected_size: usize,
 ) -> Option<BooleanArray> {
-    let row_indices_length = row_indices.len();
-    let mut corrected_mask: BooleanBuilder =
-        BooleanBuilder::with_capacity(row_indices_length);
-    let mut seen_true = false;
-
+    let len = row_indices.len();
     match join_type {
         JoinType::Left | JoinType::Right | JoinType::Full => {
             // For each input row group: keep first filter-passing row,
             // discard (null) remaining matches, null-join if none passed.
             // Null metadata entries are already-null-joined rows that
             // flow through unchanged to preserve output ordering.
-            for i in 0..row_indices_length {
-                let last_index =
-                    last_index_for_row(i, row_indices, batch_ids, row_indices_length);
-                if filter_mask.is_null(i) {
-                    corrected_mask.append_value(true);
-                } else if filter_mask.value(i) {
+            //
+            // Works on the raw buffers rather than through `BooleanBuilder`
+            // a per-row boundary helper, which re-check bounds and
+            // nulls that a batch without nulls does not have.
+            let rows = row_indices.values();
+            let row_nulls = row_indices.nulls();
+            let mask_values = filter_mask.values();
+            let mask_nulls = filter_mask.nulls();
+            let mut values = BooleanBufferBuilder::new(expected_size);
+            let mut validity = BooleanBufferBuilder::new(expected_size);
+            let mut seen_true = false;
+            for i in 0..len {
+                let last_index = i + 1 == len
+                    || batch_ids[i] != batch_ids[i + 1]
+                    || row_nulls.is_some_and(|n| n.is_null(i) || n.is_null(i + 1))
+                    || rows[i] != rows[i + 1];
+                let (value, valid) = if mask_nulls.is_some_and(|n| n.is_null(i)) {
+                    (true, true)
+                } else if mask_values.value(i) {
                     seen_true = true;
-                    corrected_mask.append_value(true);
-                } else if seen_true || !filter_mask.value(i) && !last_index {
-                    corrected_mask.append_null();
+                    (true, true)
+                } else if seen_true || !last_index {
+                    (false, false)
                 } else {
-                    corrected_mask.append_value(false);
-                }
-
+                    (false, true)
+                };
+                values.append(value);
+                validity.append(valid);
                 if last_index {
                     seen_true = false;
                 }
             }
-
-            corrected_mask.append_n(expected_size - corrected_mask.len(), false);
-            Some(corrected_mask.finish())
+            values.append_n(expected_size - len, false);
+            validity.append_n(expected_size - len, true);
+            Some(BooleanArray::new(
+                values.finish(),
+                Some(NullBuffer::new(validity.finish())),
+            ))
         }
         JoinType::LeftMark
         | JoinType::RightMark
