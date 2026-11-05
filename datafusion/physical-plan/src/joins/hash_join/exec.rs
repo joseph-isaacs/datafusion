@@ -2910,8 +2910,7 @@ fn is_perfect_hash_join_candidate(
 }
 
 /// Creates the build side hash table for `num_rows` rows and reserves its
-/// peak memory, see
-/// [`UnchainedJoinHashMap::estimate_memory_size`](crate::joins::unchained_hash_map::UnchainedJoinHashMap::estimate_memory_size).
+/// peak memory, see [`join_hashmap_memory_size`].
 ///
 /// Once every row is inserted the caller must call
 /// [`JoinHashMapType::finalize`] and shrink `reservation` by its result.
@@ -2920,42 +2919,58 @@ pub(super) fn new_join_hashmap(
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
 ) -> Result<Box<dyn JoinHashMapType>> {
+    let estimated_size = join_hashmap_memory_size(num_rows)?;
     let wide = num_rows > u32::MAX as usize;
-    let (estimated_size, map): (usize, Box<dyn JoinHashMapType>) =
-        match (join_hash_map_kind(), wide) {
-            (JoinHashMapKind::Unchained, true) => (
-                UnchainedJoinHashMapU64::estimate_memory_size(num_rows)?,
-                Box::new(UnchainedJoinHashMapU64::with_capacity(num_rows)),
-            ),
-            (JoinHashMapKind::Unchained, false) => (
-                UnchainedJoinHashMapU32::estimate_memory_size(num_rows)?,
-                Box::new(UnchainedJoinHashMapU32::with_capacity(num_rows)),
-            ),
-            (_, true) => (
-                chained_memory_size::<u64>(num_rows, size_of::<JoinHashMapU64>())?,
-                Box::new(JoinHashMapU64::with_capacity(num_rows)),
-            ),
-            (JoinHashMapKind::Chained, false) => (
-                chained_memory_size::<u32>(num_rows, size_of::<JoinHashMapU32>())?,
-                Box::new(JoinHashMapU32::with_capacity(num_rows)),
-            ),
-            (JoinHashMapKind::Pipelined, false) => (
-                chained_memory_size::<u32>(
-                    num_rows,
-                    size_of::<PipelinedJoinHashMapU32>(),
-                )?,
-                Box::new(PipelinedJoinHashMapU32::with_capacity(num_rows)),
-            ),
-        };
+    let map: Box<dyn JoinHashMapType> = match (join_hash_map_kind(), wide) {
+        (JoinHashMapKind::Unchained, true) => {
+            Box::new(UnchainedJoinHashMapU64::with_capacity(num_rows))
+        }
+        (JoinHashMapKind::Unchained, false) => {
+            Box::new(UnchainedJoinHashMapU32::with_capacity(num_rows))
+        }
+        (_, true) => Box::new(JoinHashMapU64::with_capacity(num_rows)),
+        (JoinHashMapKind::Chained, false) => {
+            Box::new(JoinHashMapU32::with_capacity(num_rows))
+        }
+        (JoinHashMapKind::Pipelined, false) => {
+            Box::new(PipelinedJoinHashMapU32::with_capacity(num_rows))
+        }
+    };
     reservation.try_grow(estimated_size)?;
     metrics.build_mem_used.add(estimated_size);
     Ok(map)
 }
 
+/// Peak memory that [`new_join_hashmap`] reserves for a build side hash table
+/// of `num_rows` rows, for the map selected by [`join_hash_map_kind`].
+pub(super) fn join_hashmap_memory_size(num_rows: usize) -> Result<usize> {
+    let wide = num_rows > u32::MAX as usize;
+    match (join_hash_map_kind(), wide) {
+        (JoinHashMapKind::Unchained, true) => {
+            UnchainedJoinHashMapU64::estimate_memory_size(num_rows)
+        }
+        (JoinHashMapKind::Unchained, false) => {
+            UnchainedJoinHashMapU32::estimate_memory_size(num_rows)
+        }
+        (_, true) => chained_memory_size::<u64>(num_rows, size_of::<JoinHashMapU64>()),
+        (JoinHashMapKind::Chained, false) => {
+            chained_memory_size::<u32>(num_rows, size_of::<JoinHashMapU32>())
+        }
+        (JoinHashMapKind::Pipelined, false) => {
+            chained_memory_size::<u32>(num_rows, size_of::<PipelinedJoinHashMapU32>())
+        }
+    }
+}
+
 /// Build side hash map implementation, chosen by the experimental
 /// `DATAFUSION_JOIN_HASH_MAP` environment variable: `chained` (the hashbrown
-/// based `JoinHashMapU32`), `pipelined` (the same on the prefetching hashbrown
-/// fork) or `unchained` (the default).
+/// based `JoinHashMapU32`, the default), `pipelined` (the same on the
+/// prefetching hashbrown fork) or `unchained` (the bucket-grouped map from
+/// Birler et al., DaMoN 2024).
+///
+/// On the Join Order Benchmark neither alternative showed a measurable
+/// end-to-end gain over `chained`, and `unchained` is slower for unique keys,
+/// so `chained` stays the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinHashMapKind {
     Chained,
@@ -2967,15 +2982,14 @@ fn join_hash_map_kind() -> JoinHashMapKind {
     static KIND: OnceLock<JoinHashMapKind> = OnceLock::new();
     *KIND.get_or_init(
         || match std::env::var("DATAFUSION_JOIN_HASH_MAP").as_deref() {
-            Ok("chained") => JoinHashMapKind::Chained,
+            Ok("unchained") => JoinHashMapKind::Unchained,
             Ok("pipelined") => JoinHashMapKind::Pipelined,
-            _ => JoinHashMapKind::Unchained,
+            _ => JoinHashMapKind::Chained,
         },
     )
 }
 
-/// Memory of a chained hashbrown map with `T` row indices for `num_rows` rows,
-/// the estimate used before the unchained map.
+/// Memory of a chained hashbrown map with `T` row indices for `num_rows` rows.
 fn chained_memory_size<T>(num_rows: usize, fixed_size: usize) -> Result<usize> {
     estimate_memory_size::<(u64, T)>(num_rows, fixed_size)?
         // Each build row also owns an index in the duplicate-key chain.
@@ -3573,7 +3587,7 @@ mod tests {
         use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 
         let rows = 1024;
-        let bytes = UnchainedJoinHashMapU32::estimate_memory_size(rows)?;
+        let bytes = join_hashmap_memory_size(rows)?;
         for (limit, succeeds) in [(bytes - 1, false), (bytes, true)] {
             let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
             let mut reservation = MemoryConsumer::new("row indices").register(&pool);
@@ -8264,7 +8278,7 @@ mod tests {
         let map = if use_perfect_hash_join_as_possible {
             ArrayMap::estimate_memory_size(0, num_rows as u64 - 1, build_rows)
         } else {
-            UnchainedJoinHashMapU32::estimate_memory_size(build_rows)?
+            join_hashmap_memory_size(build_rows)?
         };
 
         for (limit, fits) in [(map + inputs * 3 / 2, false), (map + inputs * 3, true)] {
@@ -8331,7 +8345,7 @@ mod tests {
         let map = if use_perfect_hash_join_as_possible {
             ArrayMap::estimate_memory_size(1, num_rows as u64, num_rows as usize)
         } else {
-            UnchainedJoinHashMapU32::estimate_memory_size(num_rows as usize)?
+            join_hashmap_memory_size(num_rows as usize)?
         };
 
         for (computed_key, limit, fits) in [
