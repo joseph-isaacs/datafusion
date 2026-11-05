@@ -7,7 +7,8 @@
 use std::{fmt::Display, hash::Hash, sync::Arc};
 
 use arrow::{
-    array::{ArrayRef, BooleanArray, BooleanBufferBuilder, UInt64Array},
+    array::{ArrayRef, BooleanArray, BooleanBufferBuilder, UInt32Array, UInt64Array},
+    compute::take,
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
@@ -353,7 +354,7 @@ impl HashTableLookupExpr {
     ///
     /// A single non-empty map is probed directly without routing, so it may be
     /// any [`Map`] and `router` is ignored. Otherwise `router` is required and
-    /// every map must be a [`Map::HashMap`].
+    /// every map must be a [`Map::HashMap`] or a [`Map::PackedHashMap`].
     ///
     /// # Public Only for Internal Use:
     /// `datafusion-proto` tests require this constructor, but it is not part of
@@ -379,7 +380,7 @@ impl HashTableLookupExpr {
                 if maps
                     .iter()
                     .flatten()
-                    .any(|map| !matches!(map.as_ref(), Map::HashMap(_)))
+                    .any(|map| matches!(map.as_ref(), Map::ArrayMap(_)))
                 {
                     return internal_err!(
                         "routed lookups only support hash table partitions"
@@ -416,47 +417,84 @@ impl HashTableLookupExpr {
         let mut partition_ids = Vec::with_capacity(num_rows);
         router.route(keys, maps.len(), &mut partition_ids)?;
 
-        with_hashes(keys, self.random_state.random_state(), |hashes| {
-            // Counting sort of the rows by partition, so each table is probed
-            // once per batch over a contiguous run of its rows' hashes.
-            let mut starts = vec![0usize; maps.len() + 1];
-            for &id in &partition_ids {
-                starts[id as usize + 1] += 1;
-            }
-            for i in 0..maps.len() {
-                starts[i + 1] += starts[i];
-            }
-            let mut next = starts.clone();
-            let mut rows = vec![0u32; num_rows];
-            let mut sorted_hashes = vec![0u64; num_rows];
-            for (row, (&id, &hash)) in partition_ids.iter().zip(hashes).enumerate() {
-                let slot = &mut next[id as usize];
-                rows[*slot] = row as u32;
-                sorted_hashes[*slot] = hash;
-                *slot += 1;
-            }
+        // Packed partitions hash their own keys, so only hash tables keyed by
+        // `random_state` need the hashes of every row.
+        let needs_hashes = maps
+            .iter()
+            .flatten()
+            .any(|map| matches!(map.as_ref(), Map::HashMap(_)));
+        if needs_hashes {
+            with_hashes(keys, self.random_state.random_state(), |hashes| {
+                Self::probe_routed(keys, &partition_ids, Some(hashes), maps)
+            })
+        } else {
+            Self::probe_routed(keys, &partition_ids, None, maps)
+        }
+    }
 
-            let mut matched = BooleanBufferBuilder::new(num_rows);
-            matched.append_n(num_rows, false);
-            for (partition, map) in maps.iter().enumerate() {
-                // An empty partition holds no key, so its rows stay unmatched.
-                let Some(map) = map else { continue };
-                let Map::HashMap(map) = map.as_ref() else {
+    /// Looks each row of `keys` up in the map of the partition in
+    /// `partition_ids`, with `hashes` the rows' `random_state` hashes if any
+    /// map is a [`Map::HashMap`].
+    fn probe_routed(
+        keys: &[ArrayRef],
+        partition_ids: &[u64],
+        hashes: Option<&[u64]>,
+        maps: &[Option<Arc<Map>>],
+    ) -> Result<BooleanArray> {
+        let num_rows = keys[0].len();
+        // Counting sort of the rows by partition, so each table is probed
+        // once per batch over a contiguous run of its rows' hashes.
+        let mut starts = vec![0usize; maps.len() + 1];
+        for &id in partition_ids {
+            starts[id as usize + 1] += 1;
+        }
+        for i in 0..maps.len() {
+            starts[i + 1] += starts[i];
+        }
+        let mut next = starts.clone();
+        let mut rows = vec![0u32; num_rows];
+        let mut sorted_hashes = vec![0u64; if hashes.is_some() { num_rows } else { 0 }];
+        for (row, &id) in partition_ids.iter().enumerate() {
+            let slot = &mut next[id as usize];
+            rows[*slot] = row as u32;
+            if let Some(hashes) = hashes {
+                sorted_hashes[*slot] = hashes[row];
+            }
+            *slot += 1;
+        }
+
+        let mut matched = BooleanBufferBuilder::new(num_rows);
+        matched.append_n(num_rows, false);
+        for (partition, map) in maps.iter().enumerate() {
+            // An empty partition holds no key, so its rows stay unmatched.
+            let Some(map) = map else { continue };
+            let run = starts[partition]..starts[partition + 1];
+            if run.is_empty() {
+                continue;
+            }
+            let hits = match map.as_ref() {
+                Map::HashMap(map) => map.contain_hashes(&sorted_hashes[run.clone()]),
+                // Each partition packs keys relative to its own bounds, so
+                // look up the run's own key values.
+                Map::PackedHashMap(map) => {
+                    let indices = UInt32Array::from(rows[run.clone()].to_vec());
+                    let run_keys = keys
+                        .iter()
+                        .map(|k| take(k.as_ref(), &indices, None))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    map.contain_keys(&run_keys)?
+                }
+                Map::ArrayMap(_) => {
                     return internal_err!(
                         "routed lookups only support hash table partitions"
                     );
-                };
-                let run = starts[partition]..starts[partition + 1];
-                if run.is_empty() {
-                    continue;
                 }
-                let hits = map.contain_hashes(&sorted_hashes[run.clone()]);
-                for hit in hits.values().set_indices() {
-                    matched.set_bit(rows[run.start + hit] as usize, true);
-                }
+            };
+            for hit in hits.values().set_indices() {
+                matched.set_bit(rows[run.start + hit] as usize, true);
             }
-            Ok(BooleanArray::new(matched.finish(), None))
-        })
+        }
+        Ok(BooleanArray::new(matched.finish(), None))
     }
 }
 impl std::fmt::Debug for HashTableLookupExpr {
@@ -565,6 +603,10 @@ impl PhysicalExpr for HashTableLookupExpr {
                     })
                 }
                 Map::ArrayMap(map) => {
+                    let array = map.contain_keys(&join_keys)?;
+                    Ok(ColumnarValue::Array(Arc::new(array)))
+                }
+                Map::PackedHashMap(map) => {
                     let array = map.contain_keys(&join_keys)?;
                     Ok(ColumnarValue::Array(Arc::new(array)))
                 }
@@ -1125,6 +1167,34 @@ mod tests {
         Ok(Arc::new(Map::HashMap(Box::new(map))))
     }
 
+    /// A [`Map::PackedHashMap`] of the non-NULL `keys`, packed relative to
+    /// their own bounds as a build partition packs them.
+    fn packed_table(keys: &ArrayRef) -> Result<Arc<Map>> {
+        use crate::joins::{KeyPacker, PackedHashMap, update_packed_hash};
+        use arrow::compute::{max, min};
+        let ints = arrow::array::AsArray::as_primitive::<arrow::datatypes::Int32Type>(
+            keys.as_ref(),
+        );
+        let bounds = (ScalarValue::Int32(min(ints)), ScalarValue::Int32(max(ints)));
+        let packer =
+            KeyPacker::try_new(&[DataType::Int32], [Some((&bounds.0, &bounds.1))])
+                .expect("Int32 keys always fit");
+        let mut map = JoinHashMapU32::with_capacity(keys.len());
+        let mut hashes = vec![0; keys.len()];
+        update_packed_hash(
+            std::slice::from_ref(keys),
+            &packer,
+            &mut map,
+            0,
+            &mut hashes,
+            datafusion_common::NullEquality::NullEqualsNothing,
+        )?;
+        Ok(Arc::new(Map::PackedHashMap(PackedHashMap::new(
+            Box::new(map),
+            packer,
+        ))))
+    }
+
     /// One randomly generated scenario, see [`routed_lookup_fuzz`].
     fn run_routed_lookup_scenario(seed: u64) -> Result<()> {
         use crate::repartition::{BatchPartitioner, REPARTITION_RANDOM_STATE};
@@ -1166,7 +1236,15 @@ mod tests {
         .partition(
             RecordBatch::try_new(schema, vec![Arc::clone(&build)])?,
             |partition, batch| {
-                maps[partition] = Some(hash_table(batch.column(0), &random_state)?);
+                // Mix hash tables and packed tables, which pack each
+                // partition's keys relative to its own bounds.
+                // Forced hash collisions make hash tables match every row.
+                let collisions = cfg!(feature = "force_hash_collisions");
+                maps[partition] = Some(if !collisions && rng.random_bool(0.5) {
+                    packed_table(batch.column(0))?
+                } else {
+                    hash_table(batch.column(0), &random_state)?
+                });
                 Ok(())
             },
         )?;
@@ -1180,19 +1258,56 @@ mod tests {
         )?;
         // Reference: the single-table lookup over the whole build side.
         let single = HashTableLookupExpr::new(
-            vec![column],
+            vec![Arc::clone(&column)],
             random_state.clone(),
             None,
             vec![Some(hash_table(&build, &random_state)?)],
             "single".to_string(),
             None,
         )?;
+        // An empty build side has no bounds to pack relative to.
+        let packed = (!build.is_empty())
+            .then(|| -> Result<_> {
+                HashTableLookupExpr::new(
+                    vec![column],
+                    random_state.clone(),
+                    None,
+                    vec![Some(packed_table(&build)?)],
+                    "packed".to_string(),
+                    None,
+                )
+            })
+            .transpose()?;
 
-        assert_eq!(
-            lookup(&routed, &probe)?,
-            lookup(&single, &probe)?,
-            "{context}"
+        // Exact membership: a NULL probe key matches nothing.
+        let build_keys =
+            arrow::array::AsArray::as_primitive::<arrow::datatypes::Int32Type>(
+                build.as_ref(),
+            )
+            .values()
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        let expected = BooleanArray::from(
+            arrow::array::AsArray::as_primitive::<arrow::datatypes::Int32Type>(
+                probe.as_ref(),
+            )
+            .iter()
+            .map(|v| v.is_some_and(|v| build_keys.contains(&v)))
+            .collect::<Vec<_>>(),
         );
+        if cfg!(feature = "force_hash_collisions") {
+            assert_eq!(
+                lookup(&routed, &probe)?,
+                lookup(&single, &probe)?,
+                "{context}"
+            );
+        } else {
+            assert_eq!(lookup(&routed, &probe)?, expected, "{context}");
+            assert_eq!(lookup(&single, &probe)?, expected, "{context}");
+        }
+        if let Some(packed) = packed {
+            assert_eq!(lookup(&packed, &probe)?, expected, "{context}");
+        }
         Ok(())
     }
 

@@ -777,19 +777,26 @@ impl HashJoinStream {
                 // Precalculate hash values for fetched batch
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
-                let valid_keys = if let Map::HashMap(_) =
-                    self.build_side.try_as_ready()?.left_data.map()
-                {
-                    self.hashes_buffer.clear();
-                    self.hashes_buffer.resize(batch.num_rows(), 0);
-                    create_hashes(
-                        &keys_values,
-                        &self.random_state,
-                        &mut self.hashes_buffer,
-                    )?;
-                    matchable_join_keys(&keys_values, self.null_equality)
-                } else {
-                    None
+                let valid_keys = match self.build_side.try_as_ready()?.left_data.map() {
+                    Map::HashMap(_) => {
+                        self.hashes_buffer.clear();
+                        self.hashes_buffer.resize(batch.num_rows(), 0);
+                        create_hashes(
+                            &keys_values,
+                            &self.random_state,
+                            &mut self.hashes_buffer,
+                        )?;
+                        matchable_join_keys(&keys_values, self.null_equality)
+                    }
+                    // Packed hashes are exact, so rows that cannot match (NULL
+                    // or outside the build key range) must be excluded here.
+                    Map::PackedHashMap(map) => {
+                        self.hashes_buffer.clear();
+                        self.hashes_buffer.resize(batch.num_rows(), 0);
+                        map.packer()
+                            .hash_probe(&keys_values, &mut self.hashes_buffer)?
+                    }
+                    Map::ArrayMap(_) => None,
                 };
 
                 self.join_metrics.input_batches.add(1);
@@ -865,7 +872,8 @@ impl HashJoinStream {
             return Ok(StatefulStreamResult::Continue);
         }
 
-        // Array map lookups move their index buffers into the arrays below.
+        // Array map and packed hash map lookups move their index buffers into
+        // the arrays below.
         // Keep a handle on those buffers so they can be reused as scratch
         // space once this chunk's output batch is built.
         let mut array_map_buffers = None;
@@ -886,6 +894,27 @@ impl HashJoinStream {
                 &mut self.build_indices_buffer,
                 &mut state.key_comparator,
             )?,
+            // A packed hash identifies its key, so the candidates need no key
+            // comparison.
+            Map::PackedHashMap(map) => {
+                let next_offset = map.map().get_matched_indices_with_limit_offset(
+                    &self.hashes_buffer,
+                    state.valid_keys.as_ref(),
+                    self.batch_size,
+                    state.offset,
+                    &mut self.probe_indices_buffer,
+                    &mut self.build_indices_buffer,
+                );
+                let build_indices: UInt64Array =
+                    std::mem::take(&mut self.build_indices_buffer).into();
+                let probe_indices: UInt32Array =
+                    std::mem::take(&mut self.probe_indices_buffer).into();
+                array_map_buffers = Some((
+                    build_indices.values().clone(),
+                    probe_indices.values().clone(),
+                ));
+                (build_indices, probe_indices, next_offset)
+            }
             Map::ArrayMap(array_map) => {
                 let next_offset = array_map.get_matched_indices_with_limit_offset(
                     &state.values,
