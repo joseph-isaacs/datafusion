@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::joins::join_hash_map::ProbeOffset;
 use crate::joins::join_hash_map::{
     contain_hashes, get_matched_indices, get_matched_indices_with_limit_offset,
-    update_from_iter,
+    update_from_hashes, update_from_iter,
 };
 use crate::joins::utils::{JoinFilter, JoinHashMapType};
 use crate::metrics::{
@@ -54,6 +54,26 @@ impl JoinHashMapType for PruningJoinHashMap {
     ) {
         let slice: &mut [u64] = self.next.make_contiguous();
         update_from_iter::<u64>(&mut self.map, slice, iter, deleted_offset);
+    }
+
+    fn update_from_hashes(
+        &mut self,
+        hash_values: &[u64],
+        valid_keys: Option<&NullBuffer>,
+        offset: usize,
+        deleted_offset: usize,
+        reverse: bool,
+    ) {
+        let slice: &mut [u64] = self.next.make_contiguous();
+        update_from_hashes::<u64>(
+            &mut self.map,
+            slice,
+            hash_values,
+            valid_keys,
+            offset,
+            deleted_offset,
+            reverse,
+        );
     }
 
     fn get_matched_indices<'a>(

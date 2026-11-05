@@ -7,6 +7,7 @@
 //! ["on" values] to a list of indices with this key's value.
 
 use std::fmt::{self, Debug};
+use std::marker::PhantomData;
 use std::ops::Sub;
 
 use arrow::array::BooleanArray;
@@ -124,6 +125,22 @@ pub trait JoinHashMapType: Send + Sync {
         deleted_offset: usize,
     );
 
+    /// Inserts build rows `offset..offset + hash_values.len()`, where row
+    /// `offset + i` has hash `hash_values[i]`. Rows marked NULL in
+    /// `valid_keys` are skipped. With `reverse`, rows are inserted last to
+    /// first, so the lowest row index ends up at the head of each chain.
+    ///
+    /// Prefer this over [`Self::update_from_iter`]: the insert loop runs over
+    /// plain slices instead of a boxed iterator.
+    fn update_from_hashes(
+        &mut self,
+        hash_values: &[u64],
+        valid_keys: Option<&NullBuffer>,
+        offset: usize,
+        deleted_offset: usize,
+        reverse: bool,
+    );
+
     fn get_matched_indices<'a>(
         &self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
@@ -195,6 +212,25 @@ impl JoinHashMapType for JoinHashMapU32 {
     ) {
         self.chained |=
             update_from_iter::<u32>(&mut self.map, &mut self.next, iter, deleted_offset);
+    }
+
+    fn update_from_hashes(
+        &mut self,
+        hash_values: &[u64],
+        valid_keys: Option<&NullBuffer>,
+        offset: usize,
+        deleted_offset: usize,
+        reverse: bool,
+    ) {
+        self.chained |= update_from_hashes::<u32>(
+            &mut self.map,
+            &mut self.next,
+            hash_values,
+            valid_keys,
+            offset,
+            deleted_offset,
+            reverse,
+        );
     }
 
     fn get_matched_indices<'a>(
@@ -283,6 +319,25 @@ impl JoinHashMapType for JoinHashMapU64 {
             update_from_iter::<u64>(&mut self.map, &mut self.next, iter, deleted_offset);
     }
 
+    fn update_from_hashes(
+        &mut self,
+        hash_values: &[u64],
+        valid_keys: Option<&NullBuffer>,
+        offset: usize,
+        deleted_offset: usize,
+        reverse: bool,
+    ) {
+        self.chained |= update_from_hashes::<u64>(
+            &mut self.map,
+            &mut self.next,
+            hash_values,
+            valid_keys,
+            offset,
+            deleted_offset,
+            reverse,
+        );
+    }
+
     fn get_matched_indices<'a>(
         &self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
@@ -368,6 +423,178 @@ where
     chained
 }
 
+/// Inserts build rows `offset..offset + hash_values.len()` into `map` and
+/// `next`, where row `offset + i` has hash `hash_values[i]`. Rows that are NULL
+/// in `valid_keys` are skipped. With `reverse`, rows are inserted last to first,
+/// so the lowest row index ends up at the head of each chain.
+///
+/// Returns `true` if any row was chained onto an existing hash value.
+pub fn update_from_hashes<T>(
+    map: &mut HashTable<(u64, T)>,
+    next: &mut [T],
+    hash_values: &[u64],
+    valid_keys: Option<&NullBuffer>,
+    offset: usize,
+    deleted_offset: usize,
+    reverse: bool,
+) -> bool
+where
+    T: Copy + TryFrom<usize>,
+    <T as TryFrom<usize>>::Error: Debug,
+{
+    if reverse {
+        insert_rows::<T, true>(map, next, hash_values, valid_keys, offset, deleted_offset)
+    } else {
+        insert_rows::<T, false>(
+            map,
+            next,
+            hash_values,
+            valid_keys,
+            offset,
+            deleted_offset,
+        )
+    }
+}
+
+/// How many rows ahead of the current insert or lookup to prefetch. Far enough to hide a
+/// DRAM access behind the inserts in between, near enough that the prefetched
+/// lines are still cached when their row is reached.
+pub(crate) const PREFETCH_DISTANCE: usize = 16;
+
+/// Prefetches the memory that inserting or looking up a hash in a
+/// [`HashTable`] touches first: the control byte group and the bucket at the
+/// hash's home position.
+///
+/// `HashTable` has no prefetch API, so the addresses are derived from its
+/// current layout: buckets are stored in reverse order just before the control
+/// bytes, bucket `i` at `data_end - (i + 1)`, and a probe for `hash` starts at
+/// position `hash & (num_buckets - 1)`. The address of an occupied bucket and
+/// its index give `data_end`. If a later `hashbrown` changes the layout, the
+/// prefetches miss and only performance suffers: a prefetch is a hint that
+/// never faults, whatever the address.
+struct BucketPrefetcher<E> {
+    /// Address of the end of the bucket array, also the start of the control
+    /// bytes. `None` until an occupied bucket is seen.
+    data_end: Option<usize>,
+    bucket_mask: usize,
+    _bucket: PhantomData<E>,
+}
+
+impl<E> BucketPrefetcher<E> {
+    fn new(map: &HashTable<E>) -> Self {
+        let mut prefetcher = Self {
+            data_end: None,
+            bucket_mask: 0,
+            _bucket: PhantomData,
+        };
+        if let Some(index) = map.iter_buckets().next() {
+            let bucket = map.get_bucket(index).expect("index of an occupied bucket");
+            let bucket_addr = std::ptr::from_ref(bucket).addr();
+            prefetcher.anchor(bucket_addr, index, map.num_buckets());
+        }
+        prefetcher
+    }
+
+    /// Re-derives the table layout from the address of the occupied bucket at
+    /// `index`. Call after every insert that may have grown the table.
+    #[inline(always)]
+    fn anchor(&mut self, bucket_addr: usize, index: usize, num_buckets: usize) {
+        self.data_end = Some(bucket_addr + (index + 1) * size_of::<E>());
+        self.bucket_mask = num_buckets - 1;
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        if let Some(data_end) = self.data_end {
+            let pos = (hash as usize) & self.bucket_mask;
+            prefetch_read(data_end.wrapping_add(pos));
+            prefetch_read(data_end.wrapping_sub((pos + 1) * size_of::<E>()));
+        }
+    }
+}
+
+/// Hints the CPU to load the cache line holding `addr`. Never faults.
+#[inline(always)]
+pub(crate) fn prefetch_read(addr: usize) {
+    let ptr: *const i8 = std::ptr::without_provenance(addr);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `prefetch` does not access memory and cannot fault, even for an
+    // invalid address.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(ptr);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm` does not access memory and cannot fault, even for an
+    // invalid address.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
+}
+
+fn insert_rows<T, const REVERSE: bool>(
+    map: &mut HashTable<(u64, T)>,
+    next: &mut [T],
+    hash_values: &[u64],
+    valid_keys: Option<&NullBuffer>,
+    offset: usize,
+    deleted_offset: usize,
+) -> bool
+where
+    T: Copy + TryFrom<usize>,
+    <T as TryFrom<usize>>::Error: Debug,
+{
+    let len = hash_values.len();
+    let mut prefetcher = BucketPrefetcher::new(map);
+    let mut chained = false;
+    for k in 0..len {
+        let i = if REVERSE { len - 1 - k } else { k };
+        let ahead = if REVERSE {
+            i.checked_sub(PREFETCH_DISTANCE)
+        } else {
+            Some(i + PREFETCH_DISTANCE).filter(|&j| j < len)
+        };
+        if let Some(j) = ahead {
+            prefetcher.prefetch(hash_values[j]);
+        }
+        if valid_keys.is_some_and(|valid| valid.is_null(i)) {
+            continue;
+        }
+        let hash_value = hash_values[i];
+        let row = offset + i;
+        let value = T::try_from(row + 1).unwrap();
+        match map.entry(
+            hash_value,
+            |&(hash, _)| hash == hash_value,
+            |&(hash, _)| hash,
+        ) {
+            Occupied(mut occupied) => {
+                let (_, head) = occupied.get_mut();
+                next[row - deleted_offset] = *head;
+                *head = value;
+                chained = true;
+            }
+            Vacant(vacant) => {
+                let inserted = vacant.insert((hash_value, value));
+                let bucket_addr = std::ptr::from_ref(inserted.get()).addr();
+                let index = inserted.bucket_index();
+                prefetcher.anchor(
+                    bucket_addr,
+                    index,
+                    inserted.into_table().num_buckets(),
+                );
+            }
+        }
+    }
+    chained
+}
+
 pub fn get_matched_indices<'a, T>(
     map: &HashTable<(u64, T)>,
     next: &[T],
@@ -439,6 +666,8 @@ where
     input_indices.clear();
     match_indices.clear();
     let one = T::try_from(1).unwrap();
+    // The map is read-only during the probe, so one anchor serves every row.
+    let prefetcher = BucketPrefetcher::new(map);
 
     // Check if hashmap consists of unique values
     // If so, we can skip the chain traversal
@@ -453,6 +682,9 @@ where
         };
         let end = (start + limit).min(hash_values.len());
         for (i, &hash) in hash_values[start..end].iter().enumerate() {
+            if let Some(&ahead) = hash_values.get(start + i + PREFETCH_DISTANCE) {
+                prefetcher.prefetch(ahead);
+            }
             // NULL keys cannot match any build row
             if valid_keys.is_some_and(|valid| valid.is_null(start + i)) {
                 continue;
@@ -501,6 +733,9 @@ where
     let hash_values_len = hash_values.len();
     for (i, &hash) in hash_values[to_skip..].iter().enumerate() {
         let row_idx = to_skip + i;
+        if let Some(&ahead) = hash_values.get(row_idx + PREFETCH_DISTANCE) {
+            prefetcher.prefetch(ahead);
+        }
         // NULL keys cannot match any build row
         if valid_keys.is_some_and(|valid| valid.is_null(row_idx)) {
             continue;
@@ -716,5 +951,70 @@ mod tests {
 
         matched.sort_unstable();
         assert_eq!(matched, vec![0, 2]);
+    }
+
+    /// Inserts `hash_values` in two halves, so the second call starts with an
+    /// occupied table, and returns the sorted map entries and the chains.
+    fn build_in_halves(
+        hash_values: &[u64],
+        valid_keys: Option<&NullBuffer>,
+        reverse: bool,
+        use_slices: bool,
+    ) -> (Vec<(u64, u32)>, Vec<u32>) {
+        // Far below the row count, so inserts grow the table.
+        let mut map = HashTable::with_capacity(4);
+        let mut next = vec![0u32; hash_values.len()];
+        let mid = hash_values.len() / 2;
+        let mut halves = [(0, &hash_values[..mid]), (mid, &hash_values[mid..])];
+        if reverse {
+            halves.reverse();
+        }
+        for (offset, hashes) in halves {
+            let valid = valid_keys.map(|valid| valid.slice(offset, hashes.len()));
+            if use_slices {
+                update_from_hashes(
+                    &mut map,
+                    &mut next,
+                    hashes,
+                    valid.as_ref(),
+                    offset,
+                    0,
+                    reverse,
+                );
+            } else {
+                let rows = hashes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| valid.as_ref().is_none_or(|v| v.is_valid(*i)))
+                    .map(|(i, hash)| (i + offset, hash));
+                if reverse {
+                    update_from_iter(&mut map, &mut next, Box::new(rows.rev()), 0);
+                } else {
+                    update_from_iter(&mut map, &mut next, Box::new(rows), 0);
+                }
+            }
+        }
+        let mut entries: Vec<_> = map.into_iter().collect();
+        entries.sort_unstable();
+        (entries, next)
+    }
+
+    #[test]
+    fn update_from_hashes_matches_update_from_iter() {
+        // 1000 rows over 300 distinct, well-spread hashes, so chains form
+        let hash_values: Vec<u64> = (0..1000u64)
+            .map(|i| ((i * 7) % 300).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let valid_keys = NullBuffer::from_iter((0..1000).map(|i| i % 3 != 0));
+        for reverse in [false, true] {
+            for valid_keys in [None, Some(&valid_keys)] {
+                assert_eq!(
+                    build_in_halves(&hash_values, valid_keys, reverse, true),
+                    build_in_halves(&hash_values, valid_keys, reverse, false),
+                    "reverse={reverse}, nulls={}",
+                    valid_keys.is_some()
+                );
+            }
+        }
     }
 }
