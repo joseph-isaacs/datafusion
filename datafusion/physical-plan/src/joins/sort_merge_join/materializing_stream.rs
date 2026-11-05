@@ -304,7 +304,9 @@ impl StreamedBatch {
         batch_size: usize,
     ) -> &mut StreamedJoinedChunk {
         let chunk = self.raw_chunk_for(buffered_batch_idx, batch_size);
-        chunk.flatten_diagonal();
+        if on(9) {
+            chunk.flatten_diagonal();
+        }
         chunk
     }
 
@@ -337,8 +339,17 @@ impl StreamedBatch {
         let capacity = batch_size - self.num_output_rows;
         self.output_indices.push(StreamedJoinedChunk {
             buffered_batch_idx,
-            streamed_indices: Vec::new(),
-            buffered_indices: Vec::new(),
+            // EXPERIMENT: change 9 off allocates up front, as main did.
+            streamed_indices: if on(9) {
+                Vec::new()
+            } else {
+                Vec::with_capacity(capacity)
+            },
+            buffered_indices: if on(9) {
+                Vec::new()
+            } else {
+                Vec::with_capacity(capacity)
+            },
             buffered_nulls: NullBufferBuilder::new(capacity),
             diagonal: None,
             capacity,
@@ -922,9 +933,21 @@ impl MaterializingSortMergeJoinStream {
             // A run of misses whose previous run (in the same direction) was
             // long gallops from its first step: a sparse join then spends
             // one merge-loop trip per run, not two.
-            let in_run = ordering == self.last_ordering;
-            self.last_ordering = ordering;
+            let in_run = on(1) && ordering == self.last_ordering;
+            if on(1) {
+                self.last_ordering = ordering;
+            }
             match ordering {
+                // EXPERIMENT: change 1 off runs main's original row path.
+                Ordering::Less if !on(1) => {
+                    self.null_join_streamed_row_original();
+                    if self.num_unfrozen_pairs() >= self.batch_size {
+                        self.freeze_and_emit(emitter).await?;
+                    }
+                    if !self.try_advance_streamed_row() {
+                        self.load_next_streamed_batch().await?;
+                    }
+                }
                 // 3a. The streamed row can never match: null-join it (outer
                 //     joins emit it; inner joins drop it), then advance.
                 Ordering::Less => {
@@ -1177,6 +1200,23 @@ impl MaterializingSortMergeJoinStream {
     /// trip around the merge loop instead of one of each per row. Without
     /// `gallop` (no run under way yet) only the current row is handled, which
     /// costs no comparison beyond the merge loop's own.
+    /// EXPERIMENT ONLY: main's original single-row `Less` handling.
+    fn null_join_streamed_row_original(&mut self) {
+        if matches!(
+            self.join_type,
+            JoinType::Left | JoinType::Right | JoinType::Full
+        ) {
+            let scanning_batch_idx = if self.buffered_data.scanning_finished() {
+                None
+            } else {
+                Some(self.buffered_data.scanning_batch_idx)
+            };
+            self.streamed_batch
+                .append_null_joined_pair(scanning_batch_idx, self.batch_size);
+        }
+        self.buffered_data.scanning_reset();
+    }
+
     fn null_join_streamed_rows(&mut self, gallop: bool) -> usize {
         let outer = matches!(
             self.join_type,
@@ -1493,10 +1533,14 @@ impl MaterializingSortMergeJoinStream {
             &self.sort_options,
             self.null_equality,
         )?);
-        self.gallop_i64 = native_i64_keys(
-            &self.streamed_batch.join_arrays,
-            &self.buffered_data.head_batch().join_arrays,
-        );
+        self.gallop_i64 = on(11)
+            .then(|| {
+                native_i64_keys(
+                    &self.streamed_batch.join_arrays,
+                    &self.buffered_data.head_batch().join_arrays,
+                )
+            })
+            .flatten();
         Ok(())
     }
 
@@ -1514,7 +1558,7 @@ impl MaterializingSortMergeJoinStream {
             NullEquality::NullEqualsNull,
         )?);
         // Only the single-batch fast path reads these, when head is tail.
-        self.buffered_i64 = (self.buffered_data.batches.len() == 1)
+        self.buffered_i64 = (on(16) && self.buffered_data.batches.len() == 1)
             .then(|| {
                 let arrays = &self.buffered_data.head_batch().join_arrays;
                 native_i64_keys(arrays, arrays).map(|(keys, _)| keys)
