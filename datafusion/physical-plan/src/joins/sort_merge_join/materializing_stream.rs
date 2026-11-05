@@ -555,6 +555,10 @@ pub(super) struct MaterializingSortMergeJoinStream {
     /// The key values behind `streamed_buffered_cmp` for a single null-free
     /// 64-bit key, for the gallop predicates; only read while that is `Some`.
     pub gallop_i64: Option<(ScalarBuffer<i64>, ScalarBuffer<i64>)>,
+    /// The buffered batch's key values behind `buffered_equality_cmp`, for
+    /// a single null-free 64-bit key and a single buffered batch; read only
+    /// while that comparator is `Some`.
+    pub buffered_i64: Option<ScalarBuffer<i64>>,
     /// The merge loop's previous key comparison, to detect runs of
     /// non-matching rows worth galloping over.
     pub last_ordering: Ordering,
@@ -844,6 +848,7 @@ impl MaterializingSortMergeJoinStream {
             join_time_start: None,
             streamed_buffered_cmp: None,
             gallop_i64: None,
+            buffered_i64: None,
             last_ordering: Ordering::Equal,
             null_streamed: NullColumns::default(),
             null_buffered: NullColumns::default(),
@@ -1495,6 +1500,13 @@ impl MaterializingSortMergeJoinStream {
             // is_join_arrays_equal treats both-null as equal
             NullEquality::NullEqualsNull,
         )?);
+        // Only the single-batch fast path reads these, when head is tail.
+        self.buffered_i64 = (self.buffered_data.batches.len() == 1)
+            .then(|| {
+                let arrays = &self.buffered_data.head_batch().join_arrays;
+                native_i64_keys(arrays, arrays).map(|(keys, _)| keys)
+            })
+            .flatten();
         Ok(())
     }
 
@@ -1739,10 +1751,25 @@ impl MaterializingSortMergeJoinStream {
         // everything untouched for the async path.
         let batch = self.buffered_data.head_batch();
         let group_start = batch.range.end;
-        let mut group_end = group_start + 1;
-        while group_end < batch.num_rows && cmp.is_equal(group_start, group_end) {
-            group_end += 1;
-        }
+        let group_end = match &self.buffered_i64 {
+            // A time-series key: scan the group on its values.
+            Some(keys) => {
+                let key = keys[group_start];
+                group_start
+                    + 1
+                    + keys[group_start + 1..batch.num_rows]
+                        .iter()
+                        .take_while(|k| **k == key)
+                        .count()
+            }
+            None => {
+                let mut group_end = group_start + 1;
+                while group_end < batch.num_rows && cmp.is_equal(group_start, group_end) {
+                    group_end += 1;
+                }
+                group_end
+            }
+        };
         if group_end == batch.num_rows {
             return Ok(false);
         }
