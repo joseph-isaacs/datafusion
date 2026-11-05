@@ -215,6 +215,77 @@ fn hash_null<S: HashState>(
     }
 }
 
+/// Builds hash values of a [`BooleanArray`] and writes them into `hashes_buffer`.
+///
+/// A boolean has only two possible hashes, so they are computed once and each
+/// row selects one based on its bit, instead of running the hasher per row.
+/// Produces exactly the same hashes as the generic `hash_array` path.
+#[cfg(not(feature = "force_hash_collisions"))]
+fn hash_boolean_array(
+    array: &BooleanArray,
+    random_state: &impl HashState,
+    hashes_buffer: &mut [u64],
+    rehash: bool,
+) {
+    assert_eq!(
+        hashes_buffer.len(),
+        array.len(),
+        "hashes_buffer and array should be of equal length"
+    );
+    let hash_true = true.hash_one(random_state);
+    let hash_false = false.hash_one(random_state);
+    let values = array.values();
+
+    #[inline(always)]
+    fn apply<const REHASH: bool>(hash: &mut u64, bit: bool, t: u64, f: u64) {
+        let value_hash = if bit { t } else { f };
+        *hash = if REHASH {
+            combine_hashes(value_hash, *hash)
+        } else {
+            value_hash
+        };
+    }
+
+    #[inline(always)]
+    fn dense<const REHASH: bool>(
+        values: &arrow::buffer::BooleanBuffer,
+        hashes: &mut [u64],
+        t: u64,
+        f: u64,
+    ) {
+        let bit_chunks = values.inner().bit_chunks(values.offset(), values.len());
+        let (hash_chunks, hash_tail) = hashes.as_chunks_mut::<64>();
+        for (h, bits) in hash_chunks.iter_mut().zip(bit_chunks.iter()) {
+            for (lane, hash) in h.iter_mut().enumerate() {
+                apply::<REHASH>(hash, (bits >> lane) & 1 == 1, t, f);
+            }
+        }
+        let rem = bit_chunks.remainder_bits();
+        for (lane, hash) in hash_tail.iter_mut().enumerate() {
+            apply::<REHASH>(hash, (rem >> lane) & 1 == 1, t, f);
+        }
+    }
+
+    match (array.nulls().filter(|n| n.null_count() > 0), rehash) {
+        (None, false) => dense::<false>(values, hashes_buffer, hash_true, hash_false),
+        (None, true) => dense::<true>(values, hashes_buffer, hash_true, hash_false),
+        (Some(nulls), false) => {
+            for i in nulls.valid_indices() {
+                // SAFETY: valid_indices yields indices < array.len()
+                let bit = unsafe { values.value_unchecked(i) };
+                apply::<false>(&mut hashes_buffer[i], bit, hash_true, hash_false);
+            }
+        }
+        (Some(nulls), true) => {
+            for i in nulls.valid_indices() {
+                // SAFETY: valid_indices yields indices < array.len()
+                let bit = unsafe { values.value_unchecked(i) };
+                apply::<true>(&mut hashes_buffer[i], bit, hash_true, hash_false);
+            }
+        }
+    }
+}
+
 pub trait HashValue {
     fn hash_one<S: BuildHasher>(&self, state: &S) -> u64;
     /// Write this value into an existing hasher (same data as `hash_one`).
@@ -1140,7 +1211,7 @@ fn hash_single_array(
     downcast_primitive_array! {
         array => hash_array_primitive(array, random_state, hashes_buffer, rehash),
         DataType::Null => hash_null(random_state, hashes_buffer, rehash),
-        DataType::Boolean => hash_array(&as_boolean_array(array)?, random_state, hashes_buffer, rehash),
+        DataType::Boolean => hash_boolean_array(as_boolean_array(array)?, random_state, hashes_buffer, rehash),
         DataType::Utf8 => hash_array(&as_string_array(array)?, random_state, hashes_buffer, rehash),
         DataType::Utf8View => hash_generic_byte_view_array(as_string_view_array(array)?, random_state, hashes_buffer, rehash),
         DataType::LargeUtf8 => hash_array(&as_largestring_array(array), random_state, hashes_buffer, rehash),
@@ -2004,6 +2075,37 @@ mod tests {
         assert_eq!(hashes[0], hashes[5]);
         assert_eq!(hashes[1], hashes[4]);
         assert_eq!(hashes[2], hashes[3]);
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn boolean_fast_path_matches_generic_hashing() {
+        let random_state = RandomState::with_seed(0);
+        // 200 rows covers full 64-bit chunks plus a remainder.
+        let values: Vec<Option<bool>> = (0..200)
+            .map(|i| if i % 7 == 0 { None } else { Some(i % 3 == 0) })
+            .collect();
+        let with_nulls = BooleanArray::from(values.clone());
+        let no_nulls = BooleanArray::from(
+            values.iter().map(|v| v.unwrap_or(true)).collect::<Vec<_>>(),
+        );
+        for base in [&with_nulls, &no_nulls] {
+            // unaligned slice offsets exercise bit_chunks with a non-zero offset
+            for (offset, len) in [(0, 200), (3, 150), (65, 70), (5, 0)] {
+                let array = base.slice(offset, len);
+                for rehash in [false, true] {
+                    let seed: Vec<u64> = (0..len as u64).map(|i| i * 31 + 7).collect();
+                    let mut expected = seed.clone();
+                    hash_array(&&array, &random_state, &mut expected, rehash);
+                    let mut actual = seed;
+                    hash_boolean_array(&array, &random_state, &mut actual, rehash);
+                    assert_eq!(
+                        actual, expected,
+                        "offset={offset} len={len} rehash={rehash}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

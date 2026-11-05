@@ -116,6 +116,11 @@ fn criterion_benchmark(c: &mut Criterion) {
             supports_nulls: true,
         },
         BenchData {
+            name: "boolean",
+            array: boolean_array(BATCH_SIZE),
+            supports_nulls: true,
+        },
+        BenchData {
             name: "null",
             array: Arc::new(NullArray::new(BATCH_SIZE)),
             supports_nulls: false,
