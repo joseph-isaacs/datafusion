@@ -348,12 +348,7 @@ pub(crate) fn update_packed_hash(
 ) -> Result<()> {
     packer.hash_build(keys, hashes_buffer)?;
     let valid_keys = matchable_join_keys(keys, null_equality);
-    let iter = hashes_buffer
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| valid_keys.as_ref().is_none_or(|nulls| nulls.is_valid(*i)))
-        .map(|(i, hash)| (i + offset, hash));
-    map.update_from_iter(Box::new(iter.rev()), 0);
+    map.update_from_hashes(hashes_buffer, valid_keys.as_ref(), offset, 0, true);
     Ok(())
 }
 
