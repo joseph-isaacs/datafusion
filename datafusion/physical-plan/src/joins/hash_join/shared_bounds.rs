@@ -723,7 +723,10 @@ impl SharedBuildAccumulator {
                     keys_have_null |= partition_keys_have_null;
                     let mergeable = match &pushdown {
                         PushdownStrategy::Map(map, _) => {
-                            matches!(map.as_ref(), Map::HashMap(_))
+                            matches!(
+                                map.as_ref(),
+                                Map::HashMap(_) | Map::PackedHashMap(_)
+                            )
                         }
                         PushdownStrategy::InList(_) => true,
                         PushdownStrategy::Empty => false,

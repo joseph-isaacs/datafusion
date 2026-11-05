@@ -168,6 +168,8 @@ impl HashJoinExec {
         let metrics = BuildProbeJoinMetrics::new(0, &metrics_set);
         let count = MetricBuilder::new(&metrics_set)
             .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, 0);
+        let packed_count = MetricBuilder::new(&metrics_set)
+            .counter(PACKED_HASH_MAP_CREATED_COUNT_METRIC_NAME, 0);
         let reservation = MemoryConsumer::new("PreparedHashJoinBuild").register(&pool);
         let data = collect_left_input(
             self.random_state.random_state().clone(),
@@ -182,6 +184,7 @@ impl HashJoinExec {
             self.null_equality,
             None,
             count,
+            packed_count,
             BuildMode::Prepared,
             1,
         )

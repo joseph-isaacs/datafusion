@@ -53,9 +53,11 @@ mod join_filter;
 /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
 #[doc(hidden)]
 pub mod join_hash_map;
+mod key_packing;
 pub mod key_range_bitmap;
 
 use array_map::ArrayMap;
+pub(crate) use key_packing::{KeyPacker, PackedHashMap, update_packed_hash};
 use utils::JoinHashMapType;
 
 /// The build-side map of a hash join, indexing build rows by join key.
@@ -77,6 +79,11 @@ use utils::JoinHashMapType;
 pub enum Map {
     HashMap(Box<dyn JoinHashMapType>),
     ArrayMap(ArrayMap),
+    /// A hash table keyed by the bijective hash of the integer join keys
+    /// packed into one `u64`: a hash match is a key match. Probe keys must be
+    /// hashed with [`PackedHashMap::packer`], not with the join's
+    /// `RandomState`.
+    PackedHashMap(PackedHashMap),
 }
 
 impl Map {
@@ -85,6 +92,7 @@ impl Map {
         match self {
             Map::HashMap(map) => map.len(),
             Map::ArrayMap(array_map) => array_map.num_of_distinct_key(),
+            Map::PackedHashMap(map) => map.len(),
         }
     }
 

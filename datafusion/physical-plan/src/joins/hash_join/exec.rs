@@ -16,7 +16,6 @@ use crate::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation, PushedDownPredicate,
 };
-use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::not_in::{NotIn, NotInBuild};
@@ -34,6 +33,7 @@ use crate::joins::utils::{
     is_existence_join, reorder_output_after_swap, swap_join_projection, update_hash,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
+use crate::joins::{KeyPacker, Map, PackedHashMap, update_packed_hash};
 use crate::metrics::{Count, MetricBuilder, MetricCategory};
 use crate::projection::{
     EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
@@ -102,6 +102,7 @@ pub(crate) const HASH_JOIN_SEED: SeededRandomState =
     SeededRandomState::with_seed(12210250226015887276);
 
 const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &str = "array_map_created_count";
+const PACKED_HASH_MAP_CREATED_COUNT_METRIC_NAME: &str = "packed_hash_map_created_count";
 
 /// The largest memory, as a multiple of the estimated memory of the
 /// `JoinHashMap` it replaces, that one partition of a hash partitioned build
@@ -1725,6 +1726,9 @@ impl ExecutionPlan for HashJoinExec {
         let array_map_created_count = MetricBuilder::new(&self.metrics)
             .with_category(MetricCategory::Rows)
             .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, partition);
+        let packed_hash_map_created_count = MetricBuilder::new(&self.metrics)
+            .with_category(MetricCategory::Rows)
+            .counter(PACKED_HASH_MAP_CREATED_COUNT_METRIC_NAME, partition);
 
         // Initialize build_accumulator lazily with runtime partition counts (only if enabled)
         // Use RepartitionExec's random state (seeds: 0,0,0,0) for partition routing
@@ -1784,6 +1788,7 @@ impl ExecutionPlan for HashJoinExec {
                     self.null_equality,
                     not_in,
                     array_map_created_count,
+                    packed_hash_map_created_count,
                     BuildMode::Ordinary,
                     1,
                 ))
@@ -1813,6 +1818,7 @@ impl ExecutionPlan for HashJoinExec {
                     self.null_equality,
                     not_in,
                     array_map_created_count,
+                    packed_hash_map_created_count,
                     BuildMode::Ordinary,
                     hash_partition_count,
                 ))
@@ -2973,6 +2979,69 @@ fn is_perfect_hash_join_candidate(
     Ok(ArrayMap::is_supported_type(&data_type))
 }
 
+/// Returns whether the build keys could be packed into one `u64` for a
+/// [`PackedHashMap`]: key packing is enabled, the join is not null-aware, and
+/// every key is of a supported integer type.
+///
+/// Only a candidate: [`key_packer`] also requires the observed key ranges to
+/// fit in 64 bits.
+fn is_key_packing_candidate(
+    on_left: &[PhysicalExprRef],
+    schema: &SchemaRef,
+    config: &ConfigOptions,
+    null_aware: bool,
+) -> Result<bool> {
+    // `force_hash_collisions` tests the key comparison of colliding hashes,
+    // which packed keys never need.
+    if cfg!(feature = "force_hash_collisions")
+        || !config.execution.hash_join_key_packing
+        || null_aware
+        || on_left.is_empty()
+    {
+        return Ok(false);
+    }
+    for expr in on_left {
+        if !KeyPacker::is_supported_type(&expr.data_type(schema)?) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The packer of a [`PackedHashMap`] over the build keys, or `None` if the
+/// key ranges in `bounds` do not fit in 64 bits together, or if a NULL build
+/// key could match under [`NullEquality::NullEqualsNull`].
+fn key_packer(
+    on_left: &[PhysicalExprRef],
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    bounds: Option<&PartitionBounds>,
+    null_equality: NullEquality,
+) -> Result<Option<KeyPacker>> {
+    let Some(bounds) = bounds else {
+        return Ok(None);
+    };
+    let data_types = on_left
+        .iter()
+        .map(|expr| expr.data_type(schema))
+        .collect::<Result<Vec<_>>>()?;
+    let Some(packer) = KeyPacker::try_new(
+        &data_types,
+        (0..on_left.len()).map(|i| bounds.get_column_bounds(i).map(|b| (&b.min, &b.max))),
+    ) else {
+        return Ok(None);
+    };
+    if null_equality == NullEquality::NullEqualsNull {
+        for batch in batches {
+            let keys = evaluate_expressions_to_arrays(on_left, batch)?;
+            if keys.iter().any(|keys| keys.logical_null_count() > 0) {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(packer))
+}
+
 pub(super) fn new_join_hashmap(
     num_rows: usize,
     reservation: &mut MemoryReservation,
@@ -3129,6 +3198,7 @@ async fn collect_left_input(
     null_equality: NullEquality,
     not_in: Option<NotIn>,
     array_map_created_count: Count,
+    packed_hash_map_created_count: Count,
     mode: BuildMode,
     hash_partition_count: usize,
 ) -> Result<JoinLeftData> {
@@ -3136,13 +3206,15 @@ async fn collect_left_input(
     let prepared = mode == BuildMode::Prepared;
 
     let is_phj_candidate = is_perfect_hash_join_candidate(&on_left, &schema)?;
+    let is_packing_candidate =
+        is_key_packing_candidate(&on_left, &schema, &config, not_in.is_some())?;
 
     let mut state = BuildSideState::try_new(
         metrics,
         reservation,
         on_left.clone(),
         &schema,
-        should_compute_dynamic_filters || is_phj_candidate,
+        should_compute_dynamic_filters || is_phj_candidate || is_packing_candidate,
     )?;
 
     let mut max_batch_rows = 0;
@@ -3223,6 +3295,7 @@ async fn collect_left_input(
         null_equality,
         not_in,
         &array_map_created_count,
+        &packed_hash_map_created_count,
         prepared,
         hash_partition_count,
     )
@@ -3255,10 +3328,13 @@ fn build_in_memory(
     null_equality: NullEquality,
     not_in: Option<NotIn>,
     array_map_created_count: &Count,
+    packed_hash_map_created_count: &Count,
     prepared: bool,
     hash_partition_count: usize,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
+    let is_packing_candidate =
+        is_key_packing_candidate(on_left, schema, config, not_in.is_some())?;
 
     let (join_hash_map, batch, left_values) = if let Some((min_val, max_val)) =
         array_map_key_range(
@@ -3292,6 +3368,12 @@ fn build_in_memory(
         // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
         let mut hashmap = new_join_hashmap(num_rows, &mut reservation, metrics)?;
 
+        let packer = if is_packing_candidate {
+            key_packer(on_left, schema, batches, bounds.as_ref(), null_equality)?
+        } else {
+            None
+        };
+
         let scratch_reservation = reservation.new_empty();
         if prepared {
             scratch_reservation.try_grow(prepared::prepared_scratch_bytes(
@@ -3311,17 +3393,29 @@ fn build_in_memory(
             offset -= batch.num_rows();
             hashes_buffer.clear();
             hashes_buffer.resize(batch.num_rows(), 0);
-            update_hash(
-                on_left,
-                batch,
-                &mut *hashmap,
-                offset,
-                random_state,
-                &mut hashes_buffer,
-                0,
-                true,
-                null_equality,
-            )?;
+            if let Some(packer) = &packer {
+                let keys = evaluate_expressions_to_arrays(on_left, batch)?;
+                update_packed_hash(
+                    &keys,
+                    packer,
+                    &mut *hashmap,
+                    offset,
+                    &mut hashes_buffer,
+                    null_equality,
+                )?;
+            } else {
+                update_hash(
+                    on_left,
+                    batch,
+                    &mut *hashmap,
+                    offset,
+                    random_state,
+                    &mut hashes_buffer,
+                    0,
+                    true,
+                    null_equality,
+                )?;
+            }
         }
 
         // Merge all batches into a single batch, so we can directly index into the arrays
@@ -3333,7 +3427,14 @@ fn build_in_memory(
 
         let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
-        (Map::HashMap(hashmap), batch, left_values)
+        let map = match packer {
+            Some(packer) => {
+                packed_hash_map_created_count.add(1);
+                Map::PackedHashMap(PackedHashMap::new(hashmap, packer))
+            }
+            None => Map::HashMap(hashmap),
+        };
+        (map, batch, left_values)
     };
 
     // Rewrite float `-0.0` to `+0.0` once here, so the per probe batch key
@@ -3443,7 +3544,9 @@ fn build_in_memory(
         }
     };
 
-    if is_phj_candidate && !should_compute_dynamic_filters {
+    // Bounds collected only to choose the map are not reported to dynamic
+    // filters that do not exist.
+    if (is_phj_candidate || is_packing_candidate) && !should_compute_dynamic_filters {
         bounds = None;
     }
 
@@ -4494,6 +4597,7 @@ mod tests {
             Arc::new(ConfigOptions::default()),
             NullEquality::NullEqualsNothing,
             None,
+            Count::new(),
             Count::new(),
             BuildMode::Ordinary,
             1,
@@ -11924,6 +12028,292 @@ mod tests {
             .await
             .unwrap_err();
         assert_contains!(error.to_string(), "Resources exhausted");
+        Ok(())
+    }
+
+    /// Two nullable Int32 key columns `a`, `b` and a payload column `c`.
+    fn packing_table(
+        a: Vec<Option<i32>>,
+        b: Vec<Option<i32>>,
+        batches: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let c: Vec<i32> = (0..a.len() as i32).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(a)),
+                Arc::new(Int32Array::from(b)),
+                Arc::new(Int32Array::from(c)),
+            ],
+        )
+        .unwrap();
+        // Several build batches exercise the row offsets of each batch.
+        let chunk = batch.num_rows().div_ceil(batches);
+        let parts = (0..batch.num_rows())
+            .step_by(chunk)
+            .map(|start| batch.slice(start, chunk.min(batch.num_rows() - start)))
+            .collect::<Vec<_>>();
+        TestMemoryExec::try_new_exec(&[parts], schema, None).unwrap()
+    }
+
+    fn packing_task_ctx(batch_size: usize, key_packing: bool) -> Arc<TaskContext> {
+        let mut session_config = SessionConfig::default().with_batch_size(batch_size);
+        let execution = &mut session_config.options_mut().execution;
+        // Never take the ArrayMap path, so single keys use a hash table too.
+        execution.perfect_hash_join_small_build_threshold = 0;
+        execution.perfect_hash_join_min_key_density = f64::INFINITY;
+        execution.hash_join_key_packing = key_packing;
+        Arc::new(TaskContext::default().with_session_config(session_config))
+    }
+
+    fn packed_maps_created(metrics: &MetricsSet) -> usize {
+        metrics
+            .sum_by_name(PACKED_HASH_MAP_CREATED_COUNT_METRIC_NAME)
+            .map(|v| v.as_usize())
+            .unwrap_or(0)
+    }
+
+    /// Runs the join with key packing on and off, and returns the sorted
+    /// output of both, and how many packed maps the run with packing built.
+    async fn packing_join(
+        left: &Arc<dyn ExecutionPlan>,
+        right: &Arc<dyn ExecutionPlan>,
+        keys: &[&str],
+        join_type: JoinType,
+        partition_mode: PartitionMode,
+        null_equality: NullEquality,
+        batch_size: usize,
+    ) -> Result<(String, String, usize)> {
+        let on: JoinOn = keys
+            .iter()
+            .map(|k| {
+                Ok((
+                    Arc::new(Column::new_with_schema(k, &left.schema())?) as _,
+                    Arc::new(Column::new_with_schema(k, &right.schema())?) as _,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let mut outputs = vec![];
+        let mut packed = 0;
+        for key_packing in [true, false] {
+            let (_, batches, metrics) = join_collect_with_partition_mode(
+                Arc::clone(left),
+                Arc::clone(right),
+                on.clone(),
+                &join_type,
+                partition_mode,
+                null_equality,
+                packing_task_ctx(batch_size, key_packing),
+            )
+            .await?;
+            if key_packing {
+                packed = packed_maps_created(&metrics);
+            } else {
+                assert_eq!(packed_maps_created(&metrics), 0);
+            }
+            outputs.push(batches_to_sort_string(&batches));
+        }
+        let unpacked = outputs.pop().unwrap();
+        Ok((outputs.pop().unwrap(), unpacked, packed))
+    }
+
+    const PACKING_JOIN_TYPES: [JoinType; 10] = [
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+        JoinType::LeftSemi,
+        JoinType::LeftAnti,
+        JoinType::RightSemi,
+        JoinType::RightAnti,
+        JoinType::LeftMark,
+        JoinType::RightMark,
+    ];
+
+    /// Packed keys give the same result as the generic hash table, with NULL
+    /// keys, negative values, duplicate keys and probe values outside the
+    /// build range of either column, in both directions.
+    #[rstest]
+    #[tokio::test]
+    async fn key_packing_matches_hash_table(
+        #[values(1, 2, 8192)] batch_size: usize,
+        #[values(PartitionMode::CollectLeft, PartitionMode::Partitioned)]
+        partition_mode: PartitionMode,
+    ) -> Result<()> {
+        let left = packing_table(
+            vec![
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(-3),
+                None,
+                Some(5),
+                Some(1000),
+                Some(2),
+                Some(-3),
+            ],
+            vec![
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(-30),
+                Some(40),
+                None,
+                Some(7),
+                Some(21),
+                Some(-30),
+            ],
+            3,
+        );
+        let right = packing_table(
+            vec![
+                Some(1),
+                Some(2),
+                Some(-3),
+                None,
+                Some(5),
+                Some(2000),
+                Some(1),
+                Some(i32::MIN),
+                Some(i32::MAX),
+                Some(2),
+                Some(-4),
+                Some(1000),
+                Some(1),
+            ],
+            vec![
+                Some(10),
+                Some(20),
+                Some(-30),
+                Some(40),
+                None,
+                Some(7),
+                Some(11),
+                Some(10),
+                Some(10),
+                Some(20),
+                Some(-30),
+                Some(i32::MAX),
+                Some(-31),
+            ],
+            2,
+        );
+        for join_type in PACKING_JOIN_TYPES {
+            for keys in [&["a", "b"][..], &["b", "a"][..], &["a"][..]] {
+                let (packed, unpacked, maps) = packing_join(
+                    &left,
+                    &right,
+                    keys,
+                    join_type,
+                    partition_mode,
+                    NullEquality::NullEqualsNothing,
+                    batch_size,
+                )
+                .await?;
+                assert_eq!(packed, unpacked, "{join_type} on {keys:?}");
+                if !cfg!(feature = "force_hash_collisions") {
+                    assert!(maps >= 1, "{join_type} on {keys:?} packed no map");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Under `NullEqualsNull`, a NULL build key falls back to the generic
+    /// hash table; without one, NULL probe keys match nothing.
+    #[rstest]
+    #[tokio::test]
+    async fn key_packing_null_equals_null(
+        #[values(1, 8192)] batch_size: usize,
+    ) -> Result<()> {
+        let probe = packing_table(
+            vec![Some(1), None, Some(2), None, Some(9)],
+            vec![Some(10), Some(20), None, None, Some(10)],
+            1,
+        );
+        let with_nulls = packing_table(
+            vec![Some(1), None, Some(2), None, Some(1)],
+            vec![Some(10), Some(20), None, None, Some(10)],
+            2,
+        );
+        let without_nulls = packing_table(
+            vec![Some(1), Some(2), Some(1)],
+            vec![Some(10), Some(20), Some(10)],
+            2,
+        );
+        for join_type in PACKING_JOIN_TYPES {
+            let (packed, unpacked, maps) = packing_join(
+                &with_nulls,
+                &probe,
+                &["a", "b"],
+                join_type,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNull,
+                batch_size,
+            )
+            .await?;
+            assert_eq!(packed, unpacked, "{join_type}");
+            assert_eq!(maps, 0, "{join_type}");
+
+            let (packed, unpacked, maps) = packing_join(
+                &without_nulls,
+                &probe,
+                &["a", "b"],
+                join_type,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNull,
+                batch_size,
+            )
+            .await?;
+            assert_eq!(packed, unpacked, "{join_type}");
+            if !cfg!(feature = "force_hash_collisions") {
+                assert_eq!(maps, 1, "{join_type}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Key ranges that need more than 64 bits together are not packed.
+    #[tokio::test]
+    async fn key_packing_needs_64_bits() -> Result<()> {
+        let wide = packing_table(
+            vec![Some(i32::MIN), Some(i32::MAX)],
+            vec![Some(i32::MIN), Some(i32::MAX)],
+            1,
+        );
+        // `a` and `b` take 32 bits each, and `c` (0 and 1) one more.
+        let (packed, unpacked, maps) = packing_join(
+            &wide,
+            &wide,
+            &["a", "b", "c"],
+            JoinType::Inner,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            8192,
+        )
+        .await?;
+        assert_eq!(packed, unpacked);
+        assert_eq!(maps, 0);
+        // Without `c` the keys fit exactly.
+        let (packed, unpacked, maps) = packing_join(
+            &wide,
+            &wide,
+            &["a", "b"],
+            JoinType::Inner,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            8192,
+        )
+        .await?;
+        assert_eq!(packed, unpacked);
+        if !cfg!(feature = "force_hash_collisions") {
+            assert_eq!(maps, 1);
+        }
         Ok(())
     }
 }

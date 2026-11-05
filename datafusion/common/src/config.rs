@@ -921,6 +921,13 @@ config_namespace! {
         /// Support for build_side.num_rows() >= u32::MAX will be added in the future.
         pub perfect_hash_join_min_key_density: f64, default = 0.15
 
+        /// When set to true, a hash join whose join keys are all integers
+        /// (Int8 to Int64, UInt8 to UInt64) packs each build key into one `u64`
+        /// relative to the build side's per-column minimum, when the key ranges
+        /// fit in 64 bits together. The packed key is hashed with a bijection,
+        /// so a hash table match needs no key comparison.
+        pub hash_join_key_packing: bool, default = true
+
         /// When set to true, record batches will be examined between each operator and
         /// small batches will be coalesced into larger batches. This is helpful when there
         /// are highly selective filters or joins that could produce tiny output batches. The

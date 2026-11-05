@@ -1,0 +1,857 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+##########
+## Hash joins on integer keys packed into one u64
+## (`datafusion.execution.hash_join_key_packing`).
+##
+## Every query runs with key packing on and off and must return the same rows.
+## The data covers NULL keys, negative values, duplicate keys and probe values
+## outside the build key range of each column.
+##########
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    (1, 10, 'b1'),
+    (2, 20, 'b2'),
+    (2, 20, 'b3'),
+    (-3, -30, 'b4'),
+    (NULL, 40, 'b5'),
+    (5, NULL, 'b6'),
+    (1000, 7, 'b7'),
+    (2, 21, 'b8'),
+    (-3, -30, 'b9')
+  ) AS v(a, b, name)
+) TO 'test_files/scratch/hash_join_key_packing/build.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    (1, 10, 'p1'),
+    (2, 20, 'p2'),
+    (-3, -30, 'p3'),
+    (NULL, 40, 'p4'),
+    (5, NULL, 'p5'),
+    (2000, 7, 'p6'),
+    (1, 11, 'p7'),
+    (-2147483648, 10, 'p8'),
+    (2147483647, 10, 'p9'),
+    (2, 20, 'p10'),
+    (-4, -30, 'p11'),
+    (1000, 2147483647, 'p12'),
+    (1, -31, 'p13'),
+    (1000, 7, 'p14')
+  ) AS v(a, b, name)
+) TO 'test_files/scratch/hash_join_key_packing/probe.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE build (a INT, b INT, name VARCHAR)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/hash_join_key_packing/build.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE probe (a INT, b INT, name VARCHAR)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/hash_join_key_packing/probe.parquet';
+
+# Probe the hash table in the dynamic filter as well, not an IN list.
+statement ok
+set datafusion.optimizer.hash_join_inlist_pushdown_max_size = 1;
+
+# Evaluate the dynamic filter on every probe row, not only for pruning.
+statement ok
+set datafusion.execution.parquet.pushdown_filters = true;
+
+statement ok
+set datafusion.explain.analyze_categories = 'rows';
+
+# The packed map is built and the probe scan filters with it.
+query TT
+EXPLAIN ANALYZE
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a = b.a AND p.b = b.b;
+----
+Plan with Metrics
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)], projection=[name@5, name@2], metrics=[output_rows=8, output_batches=1, array_map_created_count=0, build_input_batches=1, build_input_rows=9, input_batches=1, input_rows=5, packed_hash_map_created_count=1, avg_fanout=160% (8/5), probe_hit_rate=100% (5/5)]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/hash_join_key_packing/build.parquet]]}, projection=[a, b, name], file_type=parquet, metrics=[output_rows=9, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=0 total → 0 matched, page_index_rows_pruned=0 total → 0 matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=0, pushdown_rows_pruned=0, predicate_cache_inner_records=0, predicate_cache_records=0, scan_efficiency_ratio=23.08% (261/1.13 K)]
+03)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/hash_join_key_packing/probe.parquet]]}, projection=[a, b, name], file_type=parquet, predicate=DynamicFilter [ a@0 >= -3 AND a@0 <= 1000 AND b@1 >= -30 AND b@1 <= 40 AND hash_lookup ], dynamic_rg_pruning=eligible, pruning_predicate=a_null_count@1 != row_count@2 AND a_max@0 >= -3 AND a_null_count@1 != row_count@2 AND a_min@3 <= 1000 AND b_null_count@5 != row_count@2 AND b_max@4 >= -30 AND b_null_count@5 != row_count@2 AND b_min@6 <= 40, required_guarantees=[], metrics=[output_rows=5, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=0 total → 0 matched, page_index_rows_pruned=0 total → 0 matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=5, pushdown_rows_pruned=9, predicate_cache_inner_records=28, predicate_cache_records=28, scan_efficiency_ratio=27.39% (329/1.20 K)]
+
+# Every join type, with key packing on and off.
+
+# inner
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# inner, keys reversed
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.b = b.b AND p.a = b.a ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# inner, one key
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a = b.a ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p10 b8
+p12 b7
+p13 b1
+p14 b7
+p2 b2
+p2 b3
+p2 b8
+p3 b4
+p3 b9
+p5 b6
+p7 b1
+
+# inner, wide Int64 key expressions
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON CAST(p.a AS BIGINT) * 1000000000 = CAST(b.a AS BIGINT) * 1000000000 AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# left
+query TT
+SELECT p.name, b.name FROM probe p LEFT JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p11 NULL
+p12 NULL
+p13 NULL
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 NULL
+p5 NULL
+p6 NULL
+p7 NULL
+p8 NULL
+p9 NULL
+
+# right
+query TT
+SELECT p.name, b.name FROM probe p RIGHT JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+NULL b5
+NULL b6
+NULL b8
+
+# full
+query TT
+SELECT p.name, b.name FROM probe p FULL JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p11 NULL
+p12 NULL
+p13 NULL
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 NULL
+p5 NULL
+p6 NULL
+p7 NULL
+p8 NULL
+p9 NULL
+NULL b5
+NULL b6
+NULL b8
+
+# semi
+query T
+SELECT p.name FROM probe p WHERE EXISTS (SELECT 1 FROM build b WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+p1
+p10
+p14
+p2
+p3
+
+# anti
+query T
+SELECT p.name FROM probe p WHERE NOT EXISTS (SELECT 1 FROM build b WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+p11
+p12
+p13
+p4
+p5
+p6
+p7
+p8
+p9
+
+# build side semi
+query error
+SELECT b.name FROM build b WHERE EXISTS (SELECT 1 FROM probe p WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+DataFusion error: type_coercion
+caused by
+Execution error: Cannot access field at argument 1: type Int32 is not Struct, Map, or Null
+
+
+# null equals null, NULL build keys
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a IS NOT DISTINCT FROM b.a AND p.b IS NOT DISTINCT FROM b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 b5
+p5 b6
+
+# null equals null, no NULL build keys
+query TT
+SELECT p.name, b.name FROM probe p JOIN (SELECT * FROM build WHERE a IS NOT NULL AND b IS NOT NULL) b ON p.a IS NOT DISTINCT FROM b.a AND p.b IS NOT DISTINCT FROM b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+statement ok
+set datafusion.execution.hash_join_key_packing = false;
+
+# inner
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# inner, keys reversed
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.b = b.b AND p.a = b.a ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# inner, one key
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a = b.a ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p10 b8
+p12 b7
+p13 b1
+p14 b7
+p2 b2
+p2 b3
+p2 b8
+p3 b4
+p3 b9
+p5 b6
+p7 b1
+
+# inner, wide Int64 key expressions
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON CAST(p.a AS BIGINT) * 1000000000 = CAST(b.a AS BIGINT) * 1000000000 AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# left
+query TT
+SELECT p.name, b.name FROM probe p LEFT JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p11 NULL
+p12 NULL
+p13 NULL
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 NULL
+p5 NULL
+p6 NULL
+p7 NULL
+p8 NULL
+p9 NULL
+
+# right
+query TT
+SELECT p.name, b.name FROM probe p RIGHT JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+NULL b5
+NULL b6
+NULL b8
+
+# full
+query TT
+SELECT p.name, b.name FROM probe p FULL JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p11 NULL
+p12 NULL
+p13 NULL
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 NULL
+p5 NULL
+p6 NULL
+p7 NULL
+p8 NULL
+p9 NULL
+NULL b5
+NULL b6
+NULL b8
+
+# semi
+query T
+SELECT p.name FROM probe p WHERE EXISTS (SELECT 1 FROM build b WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+p1
+p10
+p14
+p2
+p3
+
+# anti
+query T
+SELECT p.name FROM probe p WHERE NOT EXISTS (SELECT 1 FROM build b WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+p11
+p12
+p13
+p4
+p5
+p6
+p7
+p8
+p9
+
+# build side semi
+query error
+SELECT b.name FROM build b WHERE EXISTS (SELECT 1 FROM probe p WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+DataFusion error: type_coercion
+caused by
+Execution error: Cannot access field at argument 1: type Int32 is not Struct, Map, or Null
+
+
+# null equals null, NULL build keys
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a IS NOT DISTINCT FROM b.a AND p.b IS NOT DISTINCT FROM b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 b5
+p5 b6
+
+# null equals null, no NULL build keys
+query TT
+SELECT p.name, b.name FROM probe p JOIN (SELECT * FROM build WHERE a IS NOT NULL AND b IS NOT NULL) b ON p.a IS NOT DISTINCT FROM b.a AND p.b IS NOT DISTINCT FROM b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+statement ok
+reset datafusion.execution.hash_join_key_packing;
+
+# Partitioned joins pack each build partition relative to its own bounds,
+# and route the dynamic filter to each partition's packed map.
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold = 0;
+
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold_rows = 0;
+
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+# inner
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# inner, keys reversed
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.b = b.b AND p.a = b.a ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# inner, one key
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a = b.a ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p10 b8
+p12 b7
+p13 b1
+p14 b7
+p2 b2
+p2 b3
+p2 b8
+p3 b4
+p3 b9
+p5 b6
+p7 b1
+
+# inner, wide Int64 key expressions
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON CAST(p.a AS BIGINT) * 1000000000 = CAST(b.a AS BIGINT) * 1000000000 AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# left
+query TT
+SELECT p.name, b.name FROM probe p LEFT JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p11 NULL
+p12 NULL
+p13 NULL
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 NULL
+p5 NULL
+p6 NULL
+p7 NULL
+p8 NULL
+p9 NULL
+
+# right
+query TT
+SELECT p.name, b.name FROM probe p RIGHT JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+NULL b5
+NULL b6
+NULL b8
+
+# full
+query TT
+SELECT p.name, b.name FROM probe p FULL JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p11 NULL
+p12 NULL
+p13 NULL
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 NULL
+p5 NULL
+p6 NULL
+p7 NULL
+p8 NULL
+p9 NULL
+NULL b5
+NULL b6
+NULL b8
+
+# semi
+query T
+SELECT p.name FROM probe p WHERE EXISTS (SELECT 1 FROM build b WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+p1
+p10
+p14
+p2
+p3
+
+# anti
+query T
+SELECT p.name FROM probe p WHERE NOT EXISTS (SELECT 1 FROM build b WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+p11
+p12
+p13
+p4
+p5
+p6
+p7
+p8
+p9
+
+# build side semi
+query error
+SELECT b.name FROM build b WHERE EXISTS (SELECT 1 FROM probe p WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+DataFusion error: type_coercion
+caused by
+Execution error: Cannot access field at argument 1: type Int32 is not Struct, Map, or Null
+
+
+# null equals null, NULL build keys
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a IS NOT DISTINCT FROM b.a AND p.b IS NOT DISTINCT FROM b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 b5
+p5 b6
+
+# null equals null, no NULL build keys
+query TT
+SELECT p.name, b.name FROM probe p JOIN (SELECT * FROM build WHERE a IS NOT NULL AND b IS NOT NULL) b ON p.a IS NOT DISTINCT FROM b.a AND p.b IS NOT DISTINCT FROM b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+statement ok
+set datafusion.execution.hash_join_key_packing = false;
+
+# inner
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# inner, keys reversed
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.b = b.b AND p.a = b.a ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# inner, one key
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a = b.a ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p10 b8
+p12 b7
+p13 b1
+p14 b7
+p2 b2
+p2 b3
+p2 b8
+p3 b4
+p3 b9
+p5 b6
+p7 b1
+
+# inner, wide Int64 key expressions
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON CAST(p.a AS BIGINT) * 1000000000 = CAST(b.a AS BIGINT) * 1000000000 AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+# left
+query TT
+SELECT p.name, b.name FROM probe p LEFT JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p11 NULL
+p12 NULL
+p13 NULL
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 NULL
+p5 NULL
+p6 NULL
+p7 NULL
+p8 NULL
+p9 NULL
+
+# right
+query TT
+SELECT p.name, b.name FROM probe p RIGHT JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+NULL b5
+NULL b6
+NULL b8
+
+# full
+query TT
+SELECT p.name, b.name FROM probe p FULL JOIN build b ON p.a = b.a AND p.b = b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p11 NULL
+p12 NULL
+p13 NULL
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 NULL
+p5 NULL
+p6 NULL
+p7 NULL
+p8 NULL
+p9 NULL
+NULL b5
+NULL b6
+NULL b8
+
+# semi
+query T
+SELECT p.name FROM probe p WHERE EXISTS (SELECT 1 FROM build b WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+p1
+p10
+p14
+p2
+p3
+
+# anti
+query T
+SELECT p.name FROM probe p WHERE NOT EXISTS (SELECT 1 FROM build b WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+p11
+p12
+p13
+p4
+p5
+p6
+p7
+p8
+p9
+
+# build side semi
+query error
+SELECT b.name FROM build b WHERE EXISTS (SELECT 1 FROM probe p WHERE b.a = p.a AND b.b = p.b) ORDER BY 1;
+----
+DataFusion error: type_coercion
+caused by
+Execution error: Cannot access field at argument 1: type Int32 is not Struct, Map, or Null
+
+
+# null equals null, NULL build keys
+query TT
+SELECT p.name, b.name FROM probe p JOIN build b ON p.a IS NOT DISTINCT FROM b.a AND p.b IS NOT DISTINCT FROM b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+p4 b5
+p5 b6
+
+# null equals null, no NULL build keys
+query TT
+SELECT p.name, b.name FROM probe p JOIN (SELECT * FROM build WHERE a IS NOT NULL AND b IS NOT NULL) b ON p.a IS NOT DISTINCT FROM b.a AND p.b IS NOT DISTINCT FROM b.b ORDER BY 1, 2;
+----
+p1 b1
+p10 b2
+p10 b3
+p14 b7
+p2 b2
+p2 b3
+p3 b4
+p3 b9
+
+statement ok
+reset datafusion.execution.hash_join_key_packing;
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold;
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold_rows;
+
+statement ok
+reset datafusion.execution.target_partitions;
+
+statement ok
+reset datafusion.optimizer.hash_join_inlist_pushdown_max_size;
+
+statement ok
+reset datafusion.execution.parquet.pushdown_filters;
+
+statement ok
+reset datafusion.explain.analyze_categories;
+
+statement ok
+DROP TABLE build;
+
+statement ok
+DROP TABLE probe;
