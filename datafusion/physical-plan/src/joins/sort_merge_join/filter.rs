@@ -20,6 +20,7 @@ use arrow::buffer::NullBuffer;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{self, filter_record_batch};
 use arrow::datatypes::SchemaRef;
+use datafusion_common::ablation::on;
 use datafusion_common::{JoinSide, JoinType, Result, internal_err};
 
 use crate::joins::utils::JoinFilter;
@@ -86,8 +87,13 @@ impl FilterMetadata {
         );
 
         // Bulk appends: `extend` would go value by value through `Option`s.
-        self.filter_mask.append_array(filter_mask);
-        self.row_indices.append_array(row_indices);
+        if on(14) {
+            self.filter_mask.append_array(filter_mask);
+            self.row_indices.append_array(row_indices);
+        } else {
+            self.filter_mask.extend(filter_mask);
+            self.row_indices.extend(row_indices);
+        }
         self.batch_ids
             .resize(self.batch_ids.len() + row_indices.len(), batch_id);
     }
@@ -195,6 +201,22 @@ pub fn get_corrected_filter_mask(
     filter_mask: &BooleanArray,
     expected_size: usize,
 ) -> Option<BooleanArray> {
+    if !on(14) {
+        if on(15)
+            && matches!(join_type, JoinType::Left | JoinType::Right | JoinType::Full)
+            && let Some(mask) =
+                one_to_one_mask(row_indices, batch_ids, filter_mask, expected_size)
+        {
+            return Some(mask);
+        }
+        return get_corrected_filter_mask_old(
+            join_type,
+            row_indices,
+            batch_ids,
+            filter_mask,
+            expected_size,
+        );
+    }
     let len = row_indices.len();
     match join_type {
         JoinType::Left | JoinType::Right | JoinType::Full => {
@@ -210,20 +232,11 @@ pub fn get_corrected_filter_mask(
             let row_nulls = row_indices.nulls();
             let mask_values = filter_mask.values();
             let mask_nulls = filter_mask.nulls();
-            // Every pair the last of its input row (no two neighbours share
-            // a row: a one-to-one join), and no nulls: each row's group is
-            // that pair alone, so the corrected mask is the filter mask.
-            if row_nulls.is_none()
-                && mask_nulls.is_none()
-                && rows
-                    .windows(2)
-                    .zip(batch_ids.windows(2))
-                    .all(|(r, b)| r[0] != r[1] || b[0] != b[1])
+            if on(15)
+                && let Some(mask) =
+                    one_to_one_mask(row_indices, batch_ids, filter_mask, expected_size)
             {
-                let mut values = BooleanBufferBuilder::new(expected_size);
-                values.append_buffer(mask_values);
-                values.append_n(expected_size - len, false);
-                return Some(BooleanArray::new(values.finish(), None));
+                return Some(mask);
             }
             let mut values = BooleanBufferBuilder::new(expected_size);
             let mut validity = BooleanBufferBuilder::new(expected_size);
@@ -266,6 +279,127 @@ pub fn get_corrected_filter_mask(
         }
         JoinType::Inner => None,
     }
+}
+
+/// Every pair the last of its input row (no two neighbours share a row: a
+/// one-to-one join), and no nulls: each row's group is that pair alone, so the
+/// corrected mask is the filter mask.
+fn one_to_one_mask(
+    row_indices: &UInt64Array,
+    batch_ids: &[usize],
+    filter_mask: &BooleanArray,
+    expected_size: usize,
+) -> Option<BooleanArray> {
+    let rows = row_indices.values();
+    if row_indices.nulls().is_some()
+        || filter_mask.nulls().is_some()
+        || !rows
+            .windows(2)
+            .zip(batch_ids.windows(2))
+            .all(|(r, b)| r[0] != r[1] || b[0] != b[1])
+    {
+        return None;
+    }
+    let mut values = BooleanBufferBuilder::new(expected_size);
+    values.append_buffer(filter_mask.values());
+    values.append_n(expected_size - row_indices.len(), false);
+    Some(BooleanArray::new(values.finish(), None))
+}
+
+/// EXPERIMENT ONLY: the original (pre-change-14) mask correction.
+fn get_corrected_filter_mask_old(
+    join_type: JoinType,
+    row_indices: &UInt64Array,
+    batch_ids: &[usize],
+    filter_mask: &BooleanArray,
+    expected_size: usize,
+) -> Option<BooleanArray> {
+    let row_indices_length = row_indices.len();
+    let mut corrected_mask: BooleanBuilder =
+        BooleanBuilder::with_capacity(row_indices_length);
+    let mut seen_true = false;
+
+    match join_type {
+        JoinType::Left | JoinType::Right | JoinType::Full => {
+            // For each input row group: keep first filter-passing row,
+            // discard (null) remaining matches, null-join if none passed.
+            // Null metadata entries are already-null-joined rows that
+            // flow through unchanged to preserve output ordering.
+            for i in 0..row_indices_length {
+                let last_index =
+                    last_index_for_row(i, row_indices, batch_ids, row_indices_length);
+                if filter_mask.is_null(i) {
+                    corrected_mask.append_value(true);
+                } else if filter_mask.value(i) {
+                    seen_true = true;
+                    corrected_mask.append_value(true);
+                } else if seen_true || !filter_mask.value(i) && !last_index {
+                    corrected_mask.append_null();
+                } else {
+                    corrected_mask.append_value(false);
+                }
+
+                if last_index {
+                    seen_true = false;
+                }
+            }
+
+            corrected_mask.append_n(expected_size - corrected_mask.len(), false);
+            Some(corrected_mask.finish())
+        }
+        JoinType::LeftMark
+        | JoinType::RightMark
+        | JoinType::LeftSemi
+        | JoinType::RightSemi
+        | JoinType::LeftAnti
+        | JoinType::RightAnti => {
+            unreachable!("Semi/anti/mark joins are handled by BitwiseSortMergeJoinStream")
+        }
+        JoinType::Inner => None,
+    }
+}
+
+fn last_index_for_row(
+    row_index: usize,
+    indices: &UInt64Array,
+    batch_ids: &[usize],
+    indices_len: usize,
+) -> bool {
+    debug_assert_eq!(
+        indices.len(),
+        indices_len,
+        "indices.len() should match indices_len parameter"
+    );
+    debug_assert_eq!(
+        batch_ids.len(),
+        indices_len,
+        "batch_ids.len() should match indices_len"
+    );
+    debug_assert!(
+        row_index < indices_len,
+        "row_index {row_index} should be < indices_len {indices_len}",
+    );
+
+    // If this is the last index overall, it's definitely the last for this row
+    if row_index == indices_len - 1 {
+        return true;
+    }
+
+    // Check if next row has different (batch_id, index) pair
+    let current_batch_id = batch_ids[row_index];
+    let next_batch_id = batch_ids[row_index + 1];
+
+    if current_batch_id != next_batch_id {
+        return true;
+    }
+
+    // Same batch_id, check if row index is different
+    // Both current and next should be non-null (already joined rows)
+    if indices.is_null(row_index) || indices.is_null(row_index + 1) {
+        return true;
+    }
+
+    indices.value(row_index) != indices.value(row_index + 1)
 }
 
 /// Applies corrected filter mask to record batch based on join type

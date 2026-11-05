@@ -124,6 +124,7 @@ use arrow::compute::{BatchCoalescer, SortOptions, filter_record_batch, not};
 use arrow::datatypes::SchemaRef;
 use arrow::util::bit_chunk_iterator::UnalignedBitChunk;
 use arrow::util::bit_util::apply_bitwise_binary_op;
+use datafusion_common::ablation::on;
 use datafusion_common::instant::Instant;
 use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, ScalarValue, internal_err,
@@ -1167,11 +1168,13 @@ impl BitwiseSortMergeJoinStream {
             let in_run = ordering == self.last_ordering;
             self.last_ordering = ordering;
             match ordering {
-                Ordering::Less if in_run || self.long_less_runs => {
+                Ordering::Less if on(1) && (in_run || (on(8) && self.long_less_runs)) => {
                     self.long_less_runs = self.skip_outer_rows_below_inner()? > 1;
                 }
                 Ordering::Less => self.skip_outer_key_group()?,
-                Ordering::Greater if in_run || self.long_greater_runs => {
+                Ordering::Greater
+                    if on(1) && (in_run || (on(8) && self.long_greater_runs)) =>
+                {
                     self.long_greater_runs = self.skip_inner_rows_below_outer()? > 1;
                 }
                 Ordering::Greater => {

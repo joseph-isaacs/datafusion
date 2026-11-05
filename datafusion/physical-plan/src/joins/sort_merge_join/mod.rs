@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::SendableRecordBatchStream;
 use crate::common::spawn_buffered;
 use crate::stream::{EmptyRecordBatchStream, RecordBatchStreamAdapter};
+use datafusion_common::ablation::on;
 use datafusion_execution::memory_pool::MemoryReservation;
 use futures::StreamExt;
 
@@ -46,11 +47,19 @@ pub(super) fn prefetch(
     stream: &mut SendableRecordBatchStream,
     reservation: &MemoryReservation,
 ) {
+    if !on(3) {
+        return;
+    }
+    let depth = if on(6) { PREFETCH_BATCHES } else { 1 };
     let schema = stream.schema();
     let input = std::mem::replace(
         stream,
         Box::pin(EmptyRecordBatchStream::new(Arc::clone(&schema))),
     );
+    if !on(10) {
+        *stream = spawn_buffered(input, depth);
+        return;
+    }
     // Each batch read ahead is reserved from when it is produced until the
     // join takes it, so the pool sees the memory the read-ahead holds.
     // Dropping the stream releases whatever is still held.
@@ -63,7 +72,7 @@ pub(super) fn prefetch(
     });
     let buffered = spawn_buffered(
         Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), input)),
-        PREFETCH_BATCHES,
+        depth,
     );
     let taken = buffered.inspect(move |batch| {
         if let Ok(batch) = batch {

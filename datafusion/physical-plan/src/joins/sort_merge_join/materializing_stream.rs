@@ -30,6 +30,7 @@ use crate::metrics::Time;
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::{EmptyRecordBatchStream, ObservedStream, RecordBatchStreamAdapter};
 use crate::{PhysicalExpr, SendableRecordBatchStream};
+use datafusion_common::ablation::on;
 
 use arrow::array::{types::UInt64Type, *};
 use arrow::buffer::{NullBuffer, ScalarBuffer};
@@ -212,10 +213,12 @@ impl StreamedBatch {
         let streamed_start = self.idx;
         let chunk = self.raw_chunk_for(Some(buffered_batch_idx), batch_size);
         match chunk.diagonal {
-            None if chunk.streamed_indices.is_empty() => {
+            None if on(9) && chunk.streamed_indices.is_empty() => {
                 chunk.diagonal = Some((streamed_start, buffered_start, len));
             }
-            Some((s, b, l)) if s + l == streamed_start && b + l == buffered_start => {
+            Some((s, b, l))
+                if on(9) && s + l == streamed_start && b + l == buffered_start =>
+            {
                 chunk.diagonal = Some((s, b, l + len));
             }
             _ => {
@@ -925,7 +928,7 @@ impl MaterializingSortMergeJoinStream {
                 // 3a. The streamed row can never match: null-join it (outer
                 //     joins emit it; inner joins drop it), then advance.
                 Ordering::Less => {
-                    let gallop = in_run || self.long_less_runs;
+                    let gallop = on(1) && (in_run || (on(8) && self.long_less_runs));
                     let handled = self.null_join_streamed_rows(gallop);
                     if gallop {
                         self.long_less_runs = handled > 1;
@@ -942,7 +945,7 @@ impl MaterializingSortMergeJoinStream {
                 //     the next key group.
                 Ordering::Greater => {
                     self.null_join_buffered_group();
-                    if in_run || self.long_greater_runs {
+                    if on(1) && (in_run || (on(8) && self.long_greater_runs)) {
                         self.long_greater_runs = self.skip_buffered_rows_below_streamed();
                     }
                     if !self.try_advance_buffered_group()? {
@@ -1033,6 +1036,9 @@ impl MaterializingSortMergeJoinStream {
     /// that.
     #[inline(always)]
     fn try_pair_unique_run(&mut self) -> bool {
+        if !on(2) {
+            return false;
+        }
         if self.unique_run_skip > 0 {
             self.unique_run_skip -= 1;
             return false;
@@ -1054,6 +1060,9 @@ impl MaterializingSortMergeJoinStream {
     /// [`Self::try_pair_unique_run`], for joins whose streamed keys are unique.
     #[inline(always)]
     fn try_pair_streamed_run(&mut self) -> bool {
+        if !on(4) {
+            return false;
+        }
         if self.streamed_run_skip > 0 {
             self.streamed_run_skip -= 1;
             return false;
@@ -1221,7 +1230,9 @@ impl MaterializingSortMergeJoinStream {
             return idx + 1;
         };
         let buffered_idx = self.buffered_data.head_batch().range.start;
-        if let Some((streamed, buffered)) = &self.gallop_i64 {
+        if on(11)
+            && let Some((streamed, buffered)) = &self.gallop_i64
+        {
             let (bound, desc) = (buffered[buffered_idx], self.sort_options[0].descending);
             return gallop_while(idx + 1, num_rows, |s| {
                 if desc {
@@ -1257,7 +1268,9 @@ impl MaterializingSortMergeJoinStream {
         let streamed_idx = self.streamed_batch.idx;
         let batch = self.buffered_data.head_batch();
         let start = batch.range.end;
-        let skip_end = if let Some((streamed, buffered)) = &self.gallop_i64 {
+        let skip_end = if on(11)
+            && let Some((streamed, buffered)) = &self.gallop_i64
+        {
             let (bound, desc) = (streamed[streamed_idx], self.sort_options[0].descending);
             gallop_while(start, batch.num_rows, |b| {
                 if desc {
@@ -1751,7 +1764,7 @@ impl MaterializingSortMergeJoinStream {
         // everything untouched for the async path.
         let batch = self.buffered_data.head_batch();
         let group_start = batch.range.end;
-        let group_end = match &self.buffered_i64 {
+        let group_end = match self.buffered_i64.as_ref().filter(|_| on(16)) {
             // A time-series key: scan the group on its values.
             Some(keys) => {
                 let key = keys[group_start];
@@ -2593,6 +2606,13 @@ impl NullColumns {
     /// `size` rows of nulls for each field of `schema`. Rebuilt, for at least
     /// `min_rows` rows, only when `size` outgrows the cached columns.
     fn get(&mut self, schema: &SchemaRef, size: usize, min_rows: usize) -> Vec<ArrayRef> {
+        if !on(13) {
+            return schema
+                .fields()
+                .iter()
+                .map(|f| new_null_array(f.data_type(), size))
+                .collect();
+        }
         let cached = self.columns.first().map_or(0, |c| c.len());
         if size > cached || self.columns.len() != schema.fields().len() {
             let rows = size.max(min_rows);
@@ -2680,7 +2700,9 @@ fn fetch_right_columns_from_batch_by_idxs(
         BufferedBatchState::InMemory(batch) => {
             if let Some(range) = is_contiguous_range(buffered_indices) {
                 Ok(batch.slice(range.start, range.len()).columns().to_vec())
-            } else if let Some(nulls) = buffered_indices.nulls() {
+            } else if on(5)
+                && let Some(nulls) = buffered_indices.nulls()
+            {
                 take_with_null_indices(batch.columns(), buffered_indices, nulls)
             } else {
                 Ok(take_arrays(batch.columns(), buffered_indices, None)?)
@@ -2822,7 +2844,8 @@ fn join_arrays(
         .iter()
         .map(|c| {
             // A plain column key is the batch's own column: skip evaluation.
-            if let Some(column) = c.downcast_ref::<Column>()
+            if on(18)
+                && let Some(column) = c.downcast_ref::<Column>()
                 && let Some(array) = batch.columns().get(column.index())
                 && batch.schema_ref().field(column.index()).name() == column.name()
             {

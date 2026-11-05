@@ -22,6 +22,7 @@ mod schema_reference;
 mod table_reference;
 mod unnest;
 
+pub mod ablation;
 pub mod alias;
 pub mod cast;
 pub mod config;

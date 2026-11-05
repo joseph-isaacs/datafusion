@@ -306,6 +306,9 @@ impl ScanState {
     /// Not used with a row limit (extra files may never be needed) or
     /// outside a multi-threaded runtime (nowhere to run the decode).
     fn plan_ahead(&mut self) {
+        if !datafusion_common::ablation::on(7) {
+            return;
+        }
         if !multi_thread_runtime()
             || !self.ready_morsels.is_empty()
             || self.pending_planner.is_some()
@@ -315,7 +318,10 @@ impl ScanState {
         if let Some(planner) = self.ready_planners.pop_front() {
             match planner.plan() {
                 Ok(Some(mut plan)) => {
-                    let reservation = self.lookahead_reservation.as_ref();
+                    let reservation = self
+                        .lookahead_reservation
+                        .as_ref()
+                        .filter(|_| datafusion_common::ablation::on(17));
                     self.ready_morsels.extend(
                         plan.take_morsels()
                             .into_iter()

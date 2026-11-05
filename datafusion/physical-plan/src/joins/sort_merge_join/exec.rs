@@ -600,7 +600,8 @@ impl ExecutionPlan for SortMergeJoinExec {
                     | JoinType::RightAnti
                     | JoinType::LeftMark
                     | JoinType::RightMark
-            ) && !needs_deferred_filtering(self.filter.as_ref(), self.join_type);
+            ) && !needs_deferred_filtering(self.filter.as_ref(), self.join_type)
+                && datafusion_common::ablation::on(12);
         let joined = sort_merge_join_stream(
             SortMergeJoinInputs {
                 schema: Arc::clone(&self.schema),
