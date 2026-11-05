@@ -103,8 +103,38 @@ pub(crate) const HASH_JOIN_SEED: SeededRandomState =
 
 const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &str = "array_map_created_count";
 
+/// The largest memory, as a multiple of the estimated memory of the
+/// `JoinHashMap` it replaces, that one partition of a hash partitioned build
+/// may spend on an [`ArrayMap`] chosen by the density of the whole build side.
+///
+/// Every partition of a hash partitioned build sees keys from (nearly) the
+/// whole key range, so each one allocates an [`ArrayMap`] over that full range.
+/// Their total memory therefore grows with the partition count, while the total
+/// memory of the hash maps stays the same. This ratio bounds the extra memory:
+/// the [`ArrayMap`]s use at most twice the memory of the hash maps (the build
+/// batches themselves are unchanged), and as the partition count grows the
+/// decision falls back to hash maps rather than letting the memory grow without
+/// bound.
+const PARTITIONED_ARRAY_MAP_MAX_MEMORY_RATIO: usize = 2;
+
 /// Decides whether the build side should be joined with an [`ArrayMap`]
 /// (perfect hash join), returning the `(min, max)` key range to build it over.
+///
+/// `hash_partition_count` is the number of partitions the whole build side is
+/// hash partitioned into on the join key, of which `batches` is one; pass `1`
+/// when `batches` is the whole build side (e.g. [`PartitionMode::CollectLeft`]).
+///
+/// An [`ArrayMap`] is chosen when the key range is small
+/// (`perfect_hash_join_small_build_threshold`) or the keys of `batches` are
+/// dense (`perfect_hash_join_min_key_density`). Hash partitioning spreads the
+/// keys of every partition over (nearly) the whole key range, so the keys of a
+/// single partition look `hash_partition_count` times sparser than those of the
+/// whole build side. For such a partition the density of the whole build side is
+/// estimated as `num_rows * hash_partition_count / (range + 1)`, and an
+/// [`ArrayMap`] is also chosen when that estimate exceeds
+/// `perfect_hash_join_min_key_density`, as long as the [`ArrayMap`] needs at most
+/// [`PARTITIONED_ARRAY_MAP_MAX_MEMORY_RATIO`] times the memory of the
+/// `JoinHashMap` it replaces and the memory can be reserved.
 ///
 /// On `Some`, the memory of the [`ArrayMap`] has already been added to
 /// `reservation`; the caller concatenates the build batches and creates the map
@@ -119,6 +149,7 @@ fn array_map_key_range(
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
+    hash_partition_count: usize,
 ) -> Result<Option<(u64, u64)>> {
     // `bounds` are also collected for dynamic filters, on any key type, so the
     // key type cannot be inferred from their presence.
@@ -176,15 +207,35 @@ fn array_map_key_range(
     }
 
     let dense_ratio = (num_row as f64) / ((range + 1) as f64);
+    let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
 
-    if range >= perfect_hash_join_small_build_threshold as u64
-        && dense_ratio <= perfect_hash_join_min_key_density
+    if range < perfect_hash_join_small_build_threshold as u64
+        || dense_ratio > perfect_hash_join_min_key_density
     {
+        reservation.try_grow(mem_size)?;
+        return Ok(Some((min_val, max_val)));
+    }
+
+    if hash_partition_count <= 1 {
         return Ok(None);
     }
 
-    let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
-    reservation.try_grow(mem_size)?;
+    let estimated_build_density = dense_ratio * hash_partition_count as f64;
+    if estimated_build_density <= perfect_hash_join_min_key_density {
+        return Ok(None);
+    }
+
+    let max_mem_size = estimate_join_hashmap_size(num_row)?
+        .saturating_mul(PARTITIONED_ARRAY_MAP_MAX_MEMORY_RATIO);
+    if mem_size > max_mem_size {
+        return Ok(None);
+    }
+
+    // The [`ArrayMap`] is larger than the hash map here, so a failure to reserve
+    // it falls back to the smaller hash map instead of failing the join.
+    if reservation.try_grow(mem_size).is_err() {
+        return Ok(None);
+    }
 
     Ok(Some((min_val, max_val)))
 }
@@ -642,6 +693,13 @@ impl From<&HashJoinExec> for HashJoinExecBuilder {
 /// With 24 partitions, each partition will only receive a subset of the 10,000 rows.
 /// The first partition might contain values like `3, 10, 18, 39, 43`, which are sparse
 /// relative to the original range, even though the overall data set is dense.
+///
+/// To account for this, a build partition of a hash partitioned build side also uses an
+/// [`ArrayMap`] when the estimated density of the whole build side (its own density times
+/// the partition count) exceeds `perfect_hash_join_min_key_density`. Since every
+/// partition then allocates an [`ArrayMap`] over (nearly) the whole key range, this is
+/// only done while the [`ArrayMap`] needs at most twice the memory of the hash map it
+/// replaces.
 ///
 /// # "Build Side" vs "Probe Side"
 ///
@@ -1727,10 +1785,17 @@ impl ExecutionPlan for HashJoinExec {
                     not_in,
                     array_map_created_count,
                     BuildMode::Ordinary,
+                    1,
                 ))
             })?,
             (None, PartitionMode::Partitioned) => {
                 let left_stream = self.left.execute(partition, Arc::clone(&context))?;
+                // Only hash partitioning on the join key spreads the keys of
+                // every partition over the whole key range.
+                let hash_partition_count = match self.left.output_partitioning() {
+                    Partitioning::Hash(_, partition_count) => *partition_count,
+                    _ => 1,
+                };
 
                 let reservation =
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
@@ -1749,6 +1814,7 @@ impl ExecutionPlan for HashJoinExec {
                     not_in,
                     array_map_created_count,
                     BuildMode::Ordinary,
+                    hash_partition_count,
                 ))
             }
             (None, PartitionMode::Auto) => {
@@ -2912,7 +2978,6 @@ pub(super) fn new_join_hashmap(
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
 ) -> Result<Box<dyn JoinHashMapType>> {
-    let fixed_size_u32 = size_of::<JoinHashMapU32>();
     let fixed_size_u64 = size_of::<JoinHashMapU64>();
 
     if num_rows > u32::MAX as usize {
@@ -2929,19 +2994,22 @@ pub(super) fn new_join_hashmap(
         metrics.build_mem_used.add(estimated_hashtable_size);
         Ok(Box::new(JoinHashMapU64::with_capacity(num_rows)))
     } else {
-        let estimated_hashtable_size =
-            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?
-                // Each build row also owns an index in the duplicate-key chain.
-                .checked_add(num_rows * size_of::<u32>())
-                .ok_or_else(|| {
-                    datafusion_common::exec_datafusion_err!(
-                        "Hash join table size overflow"
-                    )
-                })?;
+        let estimated_hashtable_size = estimate_join_hashmap_size(num_rows)?;
         reservation.try_grow(estimated_hashtable_size)?;
         metrics.build_mem_used.add(estimated_hashtable_size);
         Ok(Box::new(JoinHashMapU32::with_capacity(num_rows)))
     }
+}
+
+/// Estimates the memory [`new_join_hashmap`] reserves for a `u32` indexed
+/// `JoinHashMap` over `num_rows` build rows (`num_rows <= u32::MAX`).
+fn estimate_join_hashmap_size(num_rows: usize) -> Result<usize> {
+    estimate_memory_size::<(u32, u64)>(num_rows, size_of::<JoinHashMapU32>())?
+        // Each build row also owns an index in the duplicate-key chain.
+        .checked_add(num_rows * size_of::<u32>())
+        .ok_or_else(|| {
+            datafusion_common::exec_datafusion_err!("Hash join table size overflow")
+        })
 }
 
 /// Estimates the memory newly allocated for `array`'s share of a concatenated
@@ -3062,6 +3130,7 @@ async fn collect_left_input(
     not_in: Option<NotIn>,
     array_map_created_count: Count,
     mode: BuildMode,
+    hash_partition_count: usize,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
     let prepared = mode == BuildMode::Prepared;
@@ -3155,6 +3224,7 @@ async fn collect_left_input(
         not_in,
         &array_map_created_count,
         prepared,
+        hash_partition_count,
     )
 }
 
@@ -3186,6 +3256,7 @@ fn build_in_memory(
     not_in: Option<NotIn>,
     array_map_created_count: &Count,
     prepared: bool,
+    hash_partition_count: usize,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
@@ -3199,6 +3270,7 @@ fn build_in_memory(
             config.execution.perfect_hash_join_small_build_threshold,
             config.execution.perfect_hash_join_min_key_density,
             null_equality,
+            hash_partition_count,
         )? {
         let batch = if prepared {
             concat_batches(schema, batches.iter())?
@@ -3538,6 +3610,152 @@ mod tests {
             drop(reservation);
             assert_eq!(pool.reserved(), 0);
         }
+        Ok(())
+    }
+
+    /// Runs [`array_map_key_range`] with the default thresholds on a build
+    /// partition of `Int32` keys `0, step, 2 * step, ...` (1000 rows), returning
+    /// the decision and the reserved bytes.
+    fn decide_array_map(
+        step: i32,
+        hash_partition_count: usize,
+        pool: &Arc<dyn MemoryPool>,
+    ) -> Result<(Option<(u64, u64)>, usize)> {
+        let keys: Vec<i32> = (0..1000).map(|i| i * step).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let bounds = PartitionBounds::new(vec![ColumnBounds::new(
+            ScalarValue::Int32(Some(keys[0])),
+            ScalarValue::Int32(Some(keys[keys.len() - 1])),
+        )]);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(keys))],
+        )?;
+        let on_left: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("k", 0))];
+        let mut reservation = MemoryConsumer::new("HashJoinInput").register(pool);
+        let execution = &ConfigOptions::default().execution;
+        let decision = array_map_key_range(
+            Some(&bounds),
+            &schema,
+            &[batch],
+            &on_left,
+            &mut reservation,
+            execution.perfect_hash_join_small_build_threshold,
+            execution.perfect_hash_join_min_key_density,
+            NullEquality::NullEqualsNothing,
+            hash_partition_count,
+        )?;
+        Ok((decision, reservation.size()))
+    }
+
+    /// A partition of a hash partitioned build is judged by the estimated
+    /// density of the whole build side (`density * partition count`), as long
+    /// as its `ArrayMap` needs at most twice the memory of the hash map. A
+    /// whole build side (`hash_partition_count == 1`) is judged by its own
+    /// density, as before.
+    #[rstest]
+    // Dense keys use an `ArrayMap` however the build is partitioned.
+    #[case::dense_whole_build(1, 1, true)]
+    #[case::dense_partition(1, 4, true)]
+    // Density 0.0625 <= 0.15 for a whole build side, or as one of 2 partitions
+    // (estimated 0.125), but estimated 0.25 as one of 4 partitions.
+    #[case::partition_dense_overall_whole_build(16, 1, false)]
+    #[case::partition_sparse_overall(16, 2, false)]
+    #[case::partition_dense_overall(16, 4, true)]
+    #[case::partition_dense_overall_2(8, 2, true)]
+    // Sparse overall: estimated 0.0625.
+    #[case::sparse_overall(64, 4, false)]
+    // Estimated 0.25 like `partition_dense_overall`, but the full range
+    // `ArrayMap` (~132 KB) exceeds twice the hash map (~2 x 39 KB).
+    #[case::memory_cap(32, 8, false)]
+    #[case::memory_cap_dense_overall(64, 64, false)]
+    fn array_map_decision_uses_estimated_build_density(
+        #[case] step: i32,
+        #[case] hash_partition_count: usize,
+        #[case] use_array_map: bool,
+    ) -> Result<()> {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let (decision, reserved) = decide_array_map(step, hash_partition_count, &pool)?;
+        let max = 999 * step as u64;
+        if use_array_map {
+            assert_eq!(decision, Some((0, max)));
+            assert_eq!(reserved, ArrayMap::estimate_memory_size(0, max, 1000));
+        } else {
+            assert_eq!(decision, None);
+            assert_eq!(reserved, 0);
+        }
+        Ok(())
+    }
+
+    /// An `ArrayMap` chosen by the estimated density of the whole build side is
+    /// larger than the hash map it replaces, so failing to reserve it falls back
+    /// to the hash map. An `ArrayMap` chosen by the density of the partition
+    /// itself still reports the reservation failure.
+    #[rstest]
+    #[case::estimated_density(16, 4, false)]
+    #[case::own_density(1, 4, true)]
+    fn array_map_reservation_failure(
+        #[case] step: i32,
+        #[case] hash_partition_count: usize,
+        #[case] fails: bool,
+    ) -> Result<()> {
+        let max = 999 * step as u64;
+        let limit = ArrayMap::estimate_memory_size(0, max, 1000) - 1;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let result = decide_array_map(step, hash_partition_count, &pool);
+        if fails {
+            assert!(matches!(
+                result,
+                Err(datafusion_common::DataFusionError::ResourcesExhausted(_))
+            ));
+        } else {
+            assert_eq!(result?, (None, 0));
+        }
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// With the default thresholds, keys of density 0.25 overall are only
+    /// 0.0625 dense in each of 4 hash partitions, so each partition builds an
+    /// `ArrayMap` only by the estimated density of the whole build side. A
+    /// `CollectLeft` build sees the whole build side and its density directly.
+    /// Like TPC-H `o_orderkey`, the keys come in runs of 8 consecutive values.
+    #[rstest]
+    #[case::partitioned_dense_overall(PartitionMode::Partitioned, 32, 4)]
+    #[case::partitioned_sparse_overall(PartitionMode::Partitioned, 512, 0)]
+    #[case::collect_left_dense(PartitionMode::CollectLeft, 32, 1)]
+    #[case::collect_left_sparse(PartitionMode::CollectLeft, 512, 0)]
+    #[tokio::test]
+    async fn partitioned_join_uses_array_map_by_build_density(
+        #[case] partition_mode: PartitionMode,
+        #[case] run_stride: i32,
+        #[case] array_maps: usize,
+    ) -> Result<()> {
+        let keys: Vec<i32> = (0..4000).map(|i| i / 8 * run_stride + i % 8).collect();
+        let left = build_table(("a1", &keys), ("b1", &keys), ("c1", &keys));
+        let right = build_table(("a2", &keys), ("b2", &keys), ("c2", &keys));
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
+        )];
+        let (_, batches, metrics) = join_collect_with_partition_mode(
+            left,
+            right,
+            on,
+            &JoinType::Inner,
+            partition_mode,
+            NullEquality::NullEqualsNothing,
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        let output_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(output_rows, keys.len());
+        assert_eq!(
+            metrics
+                .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+                .map(|v| v.as_usize()),
+            Some(array_maps)
+        );
         Ok(())
     }
 
@@ -4278,6 +4496,7 @@ mod tests {
             None,
             Count::new(),
             BuildMode::Ordinary,
+            1,
         )
         .await?;
         Ok((left_data, metrics))

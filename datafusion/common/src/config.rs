@@ -911,7 +911,11 @@ config_namespace! {
         /// perfect hash join (see `HashJoinExec` for more details). Density is calculated as:
         /// `(number of rows) / (max_key - min_key + 1)`.
         /// A perfect hash join may be used if the actual key density > this
-        /// value.
+        /// value. For a build side that is hash partitioned on the join key, the
+        /// density of the whole build side is estimated as the density of one
+        /// partition times the number of partitions, and a perfect hash join may
+        /// also be used if that estimate > this value and the partition's perfect
+        /// hash map needs at most twice the memory of its hash table.
         ///
         /// Currently only supports cases where build_side.num_rows() < u32::MAX.
         /// Support for build_side.num_rows() >= u32::MAX will be added in the future.
