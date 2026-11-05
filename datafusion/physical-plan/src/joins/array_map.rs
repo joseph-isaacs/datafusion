@@ -9,6 +9,7 @@ use std::mem::size_of;
 use crate::joins::chain::traverse_chain;
 use crate::joins::join_hash_map::ProbeOffset;
 use crate::joins::join_hash_map::ProbeOffset::{AtRow, MidChain};
+use crate::joins::join_hash_map::{PREFETCH_DISTANCE, prefetch_read};
 use arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
 use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::ArrowNumericType;
@@ -201,8 +202,13 @@ impl ArrayMap {
         T::Native: AsPrimitive<u64>,
     {
         let arr = array.as_primitive::<T>();
+        let values = arr.values();
+        let data_addr = data.as_ptr().addr();
         // Iterate in reverse to maintain FIFO order when there are duplicate keys.
         for (i, val) in arr.iter().enumerate().rev() {
+            if let Some(j) = i.checked_sub(PREFETCH_DISTANCE) {
+                prefetch_slot(data_addr, values[j].as_(), offset_val);
+            }
             if let Some(val) = val {
                 let key: u64 = val.as_();
                 let Some(idx) = Self::key_to_index(key, offset_val, data.len()) else {
@@ -286,6 +292,13 @@ impl ArrayMap {
         build_indices.clear();
 
         let arr = array.as_primitive::<T>();
+        let values = arr.values();
+        let data_addr = self.data.as_ptr().addr();
+        let prefetch_ahead = |prob_idx: usize| {
+            if let Some(&val) = values.get(prob_idx + PREFETCH_DISTANCE) {
+                prefetch_slot(data_addr, val.as_(), self.offset);
+            }
+        };
 
         let have_null = arr.null_count() > 0;
 
@@ -302,6 +315,7 @@ impl ArrayMap {
                 if build_indices.len() == limit {
                     return Ok(Some(AtRow { row: prob_idx }));
                 }
+                prefetch_ahead(prob_idx);
 
                 // short circuit
                 if have_null && arr.is_null(prob_idx) {
@@ -346,6 +360,7 @@ impl ArrayMap {
                 if remaining_output == 0 {
                     return Ok(Some(AtRow { row: prob_side_idx }));
                 }
+                prefetch_ahead(prob_side_idx);
 
                 if have_null && arr.is_null(prob_side_idx) {
                     continue;
@@ -401,7 +416,12 @@ impl ArrayMap {
         T::Native: AsPrimitive<u64>,
     {
         let arr = array.as_primitive::<T>();
+        let values = arr.values();
+        let data_addr = self.data.as_ptr().addr();
         let buffer = BooleanBuffer::collect_bool(arr.len(), |i| {
+            if let Some(&val) = values.get(i + PREFETCH_DISTANCE) {
+                prefetch_slot(data_addr, val.as_(), self.offset);
+            }
             if arr.is_null(i) {
                 return false;
             }
@@ -411,6 +431,16 @@ impl ArrayMap {
         });
         Ok(BooleanArray::new(buffer, None))
     }
+}
+
+/// Prefetches the slot of `key` in a `data` array starting at `data_addr`, for
+/// a map whose smallest key is `offset`. The address is not range checked: a
+/// key outside the map, or the arbitrary value under a NULL, gives an address
+/// outside `data`, which is harmless because a prefetch never faults.
+#[inline(always)]
+fn prefetch_slot(data_addr: usize, key: u64, offset: u64) {
+    let idx = key.wrapping_sub(offset) as usize;
+    prefetch_read(data_addr.wrapping_add(idx.wrapping_mul(size_of::<u32>())));
 }
 
 #[cfg(test)]
