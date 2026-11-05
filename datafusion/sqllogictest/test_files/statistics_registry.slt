@@ -17,6 +17,8 @@
 # conservative estimate 10*10 = 100 > 50 swaps dim_small to the build side.
 #
 # Threshold settings force Partitioned mode so statistics alone drive the swap.
+# The perfect hash join (ArrayMap) CollectLeft rule is disabled as well: these
+# small dense integer keys would otherwise be collected into one partition.
 
 statement ok
 set datafusion.explain.physical_plan_only = true;
@@ -26,6 +28,9 @@ set datafusion.optimizer.hash_join_single_partition_threshold = 1;
 
 statement ok
 set datafusion.optimizer.hash_join_single_partition_threshold_rows = 1;
+
+statement ok
+set datafusion.optimizer.hash_join_array_map_single_partition_threshold_rows = 0;
 
 # -- Create test data --------------------------------------------------------
 
@@ -153,6 +158,9 @@ set datafusion.optimizer.hash_join_single_partition_threshold = 4194304;
 
 statement ok
 set datafusion.optimizer.hash_join_single_partition_threshold_rows = 131072;
+
+statement ok
+reset datafusion.optimizer.hash_join_array_map_single_partition_threshold_rows;
 
 statement ok
 DROP TABLE orders;

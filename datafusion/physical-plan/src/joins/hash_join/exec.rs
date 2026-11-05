@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::mem::size_of;
@@ -72,8 +73,8 @@ use datafusion_common::utils::memory::{
     RecordBatchMemoryCounter, estimate_memory_size, get_record_batch_memory_size,
 };
 use datafusion_common::{
-    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
-    plan_err, project_schema,
+    JoinSide, JoinType, NullEquality, Result, ScalarValue, assert_or_internal_err,
+    internal_err, plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -161,25 +162,15 @@ fn array_map_key_range(
         return Ok(None);
     };
 
-    let range = ArrayMap::calculate_range(min_val, max_val);
     let num_row: usize = batches.iter().map(|x| x.num_rows()).sum();
 
-    // TODO: support create ArrayMap<u64>
-    if num_row >= u32::MAX as usize {
-        return Ok(None);
-    }
-
-    // When the key range spans the full integer domain (e.g. i64::MIN to i64::MAX),
-    // range is u64::MAX and `range + 1` below would overflow.
-    if range == usize::MAX as u64 {
-        return Ok(None);
-    }
-
-    let dense_ratio = (num_row as f64) / ((range + 1) as f64);
-
-    if range >= perfect_hash_join_small_build_threshold as u64
-        && dense_ratio <= perfect_hash_join_min_key_density
-    {
+    if !array_map_size_and_density_ok(
+        num_row,
+        min_val,
+        max_val,
+        perfect_hash_join_small_build_threshold,
+        perfect_hash_join_min_key_density,
+    ) {
         return Ok(None);
     }
 
@@ -187,6 +178,33 @@ fn array_map_key_range(
     reservation.try_grow(mem_size)?;
 
     Ok(Some((min_val, max_val)))
+}
+
+/// The row-count and key-density part of the [`ArrayMap`] decision made by
+/// [`array_map_key_range`], for `num_row` build rows with keys in
+/// `[min_val, max_val]` (as mapped by [`ArrayMap::key_to_u64`]).
+fn array_map_size_and_density_ok(
+    num_row: usize,
+    min_val: u64,
+    max_val: u64,
+    perfect_hash_join_small_build_threshold: usize,
+    perfect_hash_join_min_key_density: f64,
+) -> bool {
+    // TODO: support create ArrayMap<u64>
+    if num_row >= u32::MAX as usize {
+        return false;
+    }
+
+    let range = ArrayMap::calculate_range(min_val, max_val);
+    // When the key range spans the full integer domain (e.g. i64::MIN to i64::MAX),
+    // range is u64::MAX and `range + 1` below would overflow.
+    if range == usize::MAX as u64 {
+        return false;
+    }
+
+    let dense_ratio = (num_row as f64) / ((range + 1) as f64);
+    range < perfect_hash_join_small_build_threshold as u64
+        || dense_ratio > perfect_hash_join_min_key_density
 }
 
 /// Immutable build buffers and their durable reservation.
@@ -1132,6 +1150,42 @@ impl HashJoinExec {
     /// The partitioning mode of this hash join
     pub fn partition_mode(&self) -> &PartitionMode {
         &self.mode
+    }
+
+    /// Returns `true` if a build side of `num_rows` rows whose single join key
+    /// of type `key_type` lies in `[min, max]` would be joined with an
+    /// `ArrayMap` (perfect hash join) instead of a hash table, given the
+    /// `perfect_hash_join_*` options.
+    ///
+    /// This applies the same row-count and key-density rule the build uses at
+    /// execution time, so planners can predict the choice from statistics.
+    /// The runtime decision still uses the actual rows of each build
+    /// partition, and also rejects builds with `NULL` keys under
+    /// [`NullEquality::NullEqualsNull`].
+    pub fn would_use_array_map(
+        key_type: &DataType,
+        num_rows: usize,
+        min: &ScalarValue,
+        max: &ScalarValue,
+        perfect_hash_join_small_build_threshold: usize,
+        perfect_hash_join_min_key_density: f64,
+    ) -> bool {
+        if !ArrayMap::is_supported_type(key_type)
+            || !matches!(min.partial_cmp(max), Some(Ordering::Less | Ordering::Equal))
+        {
+            return false;
+        }
+        let Some((min, max)) = ArrayMap::key_to_u64(min).zip(ArrayMap::key_to_u64(max))
+        else {
+            return false;
+        };
+        array_map_size_and_density_ok(
+            num_rows,
+            min,
+            max,
+            perfect_hash_join_small_build_threshold,
+            perfect_hash_join_min_key_density,
+        )
     }
 
     /// Get null_equality

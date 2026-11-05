@@ -1207,6 +1207,229 @@ async fn test_join_selection_partitioned() {
     check_join_partition_mode(big, empty, join_on, false, PartitionMode::Partitioned);
 }
 
+/// A single-column input with `num_rows` rows whose values lie in `[min, max]`.
+fn key_range_exec(
+    name: &str,
+    data_type: DataType,
+    num_rows: usize,
+    min: ScalarValue,
+    max: ScalarValue,
+) -> Arc<StatisticsExec> {
+    Arc::new(StatisticsExec::new(
+        Statistics {
+            num_rows: Precision::Inexact(num_rows),
+            total_byte_size: Precision::Inexact(num_rows * 8),
+            column_statistics: vec![ColumnStatistics {
+                min_value: Precision::Inexact(min),
+                max_value: Precision::Inexact(max),
+                ..Default::default()
+            }],
+        },
+        Schema::new(vec![Field::new(name, data_type, false)]),
+    ))
+}
+
+fn int64_key_range_exec(
+    name: &str,
+    num_rows: usize,
+    min: i64,
+    max: i64,
+) -> Arc<StatisticsExec> {
+    key_range_exec(
+        name,
+        DataType::Int64,
+        num_rows,
+        ScalarValue::Int64(Some(min)),
+        ScalarValue::Int64(Some(max)),
+    )
+}
+
+/// Optimizes an `Auto` inner join of `left` and `right` on their only columns
+/// and returns the chosen mode and whether the inputs were swapped.
+fn auto_join_mode(
+    left: Arc<StatisticsExec>,
+    right: Arc<StatisticsExec>,
+    config: &ConfigOptions,
+) -> Result<(PartitionMode, bool)> {
+    let on = vec![(
+        Arc::new(Column::new_with_schema(
+            left.schema().field(0).name(),
+            &left.schema(),
+        )?) as _,
+        Arc::new(Column::new_with_schema(
+            right.schema().field(0).name(),
+            &right.schema(),
+        )?) as _,
+    )];
+    let join = Arc::new(HashJoinExec::try_new(
+        left,
+        right,
+        on,
+        None,
+        &JoinType::Inner,
+        None,
+        PartitionMode::Auto,
+        NullEquality::NullEqualsNothing,
+        false,
+    )?);
+    let optimized = JoinSelection::new().optimize(join, config)?;
+    let (join, swapped) = match optimized.downcast_ref::<ProjectionExec>() {
+        Some(projection) => (Arc::clone(projection.input()), true),
+        None => (optimized, false),
+    };
+    let join = join
+        .downcast_ref::<HashJoinExec>()
+        .expect("the join should remain a HashJoinExec");
+    Ok((*join.partition_mode(), swapped))
+}
+
+/// A build side too big for `hash_join_single_partition_threshold(_rows)` is
+/// collected into one partition when its key statistics predict an `ArrayMap`
+/// over all its rows, so the probe side is not repartitioned and the key range
+/// is allocated once.
+#[rstest]
+// Global density 0.25 > 0.15: one ArrayMap, although each of 4 partitions
+// would only see a density of 0.0625 and build a hash table.
+#[case::dense_global(15_000_000, 1, 60_000_000, PartitionMode::CollectLeft)]
+#[case::dense(1_500_000, 1, 1_500_000, PartitionMode::CollectLeft)]
+#[case::negative_keys(1_500_000, -1_000_000, 499_999, PartitionMode::CollectLeft)]
+// Density 0.1 <= 0.15: a hash table either way.
+#[case::sparse(1_000_000, 0, 10_000_000, PartitionMode::Partitioned)]
+// Above `hash_join_array_map_single_partition_threshold_rows` (32Mi).
+#[case::too_many_rows(40_000_000, 0, 40_000_000, PartitionMode::Partitioned)]
+#[case::full_domain(1_000_000, i64::MIN, i64::MAX, PartitionMode::Partitioned)]
+fn test_array_map_build_collect_left(
+    #[case] build_rows: usize,
+    #[case] min: i64,
+    #[case] max: i64,
+    #[case] expected: PartitionMode,
+) -> Result<()> {
+    let build = int64_key_range_exec("build_col", build_rows, min, max);
+    let probe = int64_key_range_exec("probe_col", 60_000_000, min, max);
+    assert_eq!(
+        auto_join_mode(build, probe, &ConfigOptions::new())?,
+        (expected, false)
+    );
+    Ok(())
+}
+
+/// The build side is the one `Partitioned` mode would pick: here the smaller
+/// right input, so the join is swapped and collected.
+#[test]
+fn test_array_map_build_collect_left_swapped() -> Result<()> {
+    let probe = int64_key_range_exec("probe_col", 60_000_000, 1, 60_000_000);
+    let build = int64_key_range_exec("build_col", 15_000_000, 1, 60_000_000);
+    assert_eq!(
+        auto_join_mode(probe, build, &ConfigOptions::new())?,
+        (PartitionMode::CollectLeft, true)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_array_map_build_collect_left_disabled() -> Result<()> {
+    let mut config = ConfigOptions::new();
+    config
+        .optimizer
+        .hash_join_array_map_single_partition_threshold_rows = 0;
+    let build = int64_key_range_exec("build_col", 15_000_000, 1, 60_000_000);
+    let probe = int64_key_range_exec("probe_col", 60_000_000, 1, 60_000_000);
+    assert_eq!(
+        auto_join_mode(build, probe, &config)?,
+        (PartitionMode::Partitioned, false)
+    );
+    Ok(())
+}
+
+/// The density threshold is the one the build applies at execution time.
+#[test]
+fn test_array_map_build_collect_left_follows_min_key_density() -> Result<()> {
+    let mut config = ConfigOptions::new();
+    config.execution.perfect_hash_join_min_key_density = 0.5;
+    let build = int64_key_range_exec("build_col", 15_000_000, 1, 60_000_000);
+    let probe = int64_key_range_exec("probe_col", 60_000_000, 1, 60_000_000);
+    assert_eq!(
+        auto_join_mode(build, probe, &config)?,
+        (PartitionMode::Partitioned, false)
+    );
+    Ok(())
+}
+
+/// A build side without a byte size estimate (e.g. a join output, whose row
+/// estimate is unreliable) or above
+/// `hash_join_array_map_single_partition_threshold` stays partitioned.
+#[rstest]
+#[case::no_size_estimate(Precision::Absent, PartitionMode::Partitioned)]
+#[case::too_big(Precision::Inexact(2 << 30), PartitionMode::Partitioned)]
+#[case::small_enough(Precision::Inexact(1 << 30), PartitionMode::CollectLeft)]
+fn test_array_map_build_collect_left_needs_size_estimate(
+    #[case] total_byte_size: Precision<usize>,
+    #[case] expected: PartitionMode,
+) -> Result<()> {
+    let exec = |name: &str, num_rows: usize, total_byte_size: Precision<usize>| {
+        Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(num_rows),
+                total_byte_size,
+                column_statistics: vec![ColumnStatistics {
+                    min_value: Precision::Inexact(ScalarValue::Int64(Some(1))),
+                    max_value: Precision::Inexact(ScalarValue::Int64(Some(60_000_000))),
+                    ..Default::default()
+                }],
+            },
+            Schema::new(vec![Field::new(name, DataType::Int64, false)]),
+        ))
+    };
+    let build = exec("build_col", 15_000_000, total_byte_size);
+    let probe = exec("probe_col", 60_000_000, Precision::Inexact(4 << 30));
+    assert_eq!(
+        auto_join_mode(build, probe, &ConfigOptions::new())?,
+        (expected, false)
+    );
+    Ok(())
+}
+
+/// Keys an `ArrayMap` cannot index, and missing key statistics, keep the
+/// partitioned join.
+#[test]
+fn test_array_map_build_collect_left_unsupported() -> Result<()> {
+    let config = ConfigOptions::new();
+    let probe = || int64_key_range_exec("probe_col", 60_000_000, 1, 60_000_000);
+
+    let utf8_build = key_range_exec(
+        "build_col",
+        DataType::Utf8,
+        1_500_000,
+        ScalarValue::from("a"),
+        ScalarValue::from("z"),
+    );
+    let utf8_probe = key_range_exec(
+        "probe_col",
+        DataType::Utf8,
+        60_000_000,
+        ScalarValue::from("a"),
+        ScalarValue::from("z"),
+    );
+    assert_eq!(
+        auto_join_mode(utf8_build, utf8_probe, &config)?,
+        (PartitionMode::Partitioned, false)
+    );
+
+    let no_key_stats = Arc::new(StatisticsExec::new(
+        Statistics {
+            num_rows: Precision::Inexact(1_500_000),
+            total_byte_size: Precision::Inexact(12_000_000),
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        },
+        Schema::new(vec![Field::new("build_col", DataType::Int64, false)]),
+    ));
+    assert_eq!(
+        auto_join_mode(no_key_stats, probe(), &config)?,
+        (PartitionMode::Partitioned, false)
+    );
+    Ok(())
+}
+
 fn check_join_partition_mode(
     left: Arc<StatisticsExec>,
     right: Arc<StatisticsExec>,

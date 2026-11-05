@@ -1856,6 +1856,22 @@ config_namespace! {
         /// will be collected into a single partition
         pub hash_join_single_partition_threshold_rows: usize, default = 1024 * 128
 
+        /// The maximum estimated size in bytes of the build side of a HashJoin
+        /// that is collected into a single partition, regardless of
+        /// `hash_join_single_partition_threshold(_rows)`, when its statistics
+        /// show a single integer join key dense enough for the build to use a
+        /// perfect hash join (see `execution.perfect_hash_join_min_key_density`).
+        /// One shared perfect hash table then replaces one full-range table per
+        /// partition, and neither input is hash repartitioned. Build sides
+        /// without a size estimate are not considered. Set to 0 to disable.
+        pub hash_join_array_map_single_partition_threshold: usize, default = 1024 * 1024 * 1024
+
+        /// The maximum estimated size in rows of the build side of a HashJoin
+        /// that is collected into a single partition when it would use a perfect
+        /// hash join, see `hash_join_array_map_single_partition_threshold`.
+        /// Set to 0 to disable.
+        pub hash_join_array_map_single_partition_threshold_rows: usize, default = 32 * 1024 * 1024
+
         /// Maximum size in bytes for the build side of a hash join to be pushed down as an InList expression for dynamic filtering.
         /// Build sides larger than this will use hash table lookups instead.
         /// Set to 0 to always use hash table lookups.

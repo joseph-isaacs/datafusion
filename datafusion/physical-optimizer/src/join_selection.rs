@@ -16,7 +16,7 @@ use datafusion_common::Statistics;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{JoinSide, JoinType, internal_err};
+use datafusion_common::{JoinSide, JoinType, NullEquality, internal_err};
 use datafusion_expr_common::sort_properties::SortProperties;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::expressions::Column;
@@ -233,6 +233,117 @@ pub(crate) fn try_collect_left(
     }
 }
 
+/// Tries to create a [`HashJoinExec`] in [`PartitionMode::CollectLeft`] when the
+/// statistics of the side that would be built in [`PartitionMode::Partitioned`]
+/// mode show that a single build over all its rows would use an `ArrayMap`
+/// (perfect hash join), see [`HashJoinExec::would_use_array_map`].
+///
+/// A partitioned join hash repartitions both inputs and builds one map per
+/// partition, each covering the full key range. For an `ArrayMap` the shared
+/// `CollectLeft` build needs no repartitioning, allocates the key range once,
+/// and sees the density of all build rows rather than `1 / partitions` of
+/// them, so it may also turn a hash table into an `ArrayMap`. Its cost is a
+/// build that runs on one thread, so it is bounded by
+/// `optimizer.hash_join_array_map_single_partition_threshold(_rows)`.
+///
+/// Statistics are estimates: if they overstate the key density, the build
+/// falls back to a hash table at execution time, still on one thread.
+///
+/// Used configurations
+/// - `optimizer.hash_join_array_map_single_partition_threshold`
+/// - `optimizer.hash_join_array_map_single_partition_threshold_rows`
+/// - `execution.perfect_hash_join_small_build_threshold`
+/// - `execution.perfect_hash_join_min_key_density`
+/// - `optimizer.join_reordering`: allows or forbids input swapping
+fn try_collect_left_for_array_map(
+    hash_join: &HashJoinExec,
+    context: &dyn PhysicalOptimizerContext,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let config = context.config_options();
+    let max_bytes = config
+        .optimizer
+        .hash_join_array_map_single_partition_threshold;
+    let max_rows = config
+        .optimizer
+        .hash_join_array_map_single_partition_threshold_rows;
+    // A null-aware join is already planned in `CollectLeft` mode. The runtime
+    // rejects an `ArrayMap` for `NULL` keys that compare equal, which the
+    // statistics cannot rule out reliably.
+    if max_bytes == 0
+        || max_rows == 0
+        || hash_join.null_aware
+        || hash_join.null_equality() == NullEquality::NullEqualsNull
+        || hash_join.on().len() != 1
+    {
+        return Ok(None);
+    }
+
+    // Keep the build side `partitioned_hash_join` would choose.
+    let left = hash_join.left();
+    let right = hash_join.right();
+    let swap =
+        can_swap_hash_join(hash_join) && should_swap_join_order(left, right, context)?;
+    let (build, build_key) = if swap {
+        (right, &hash_join.on()[0].1)
+    } else {
+        (left, &hash_join.on()[0].0)
+    };
+    if build.boundedness().is_unbounded() {
+        return Ok(None);
+    }
+    let Some(key) = build_key.downcast_ref::<Column>() else {
+        return Ok(None);
+    };
+
+    let Ok(stats) = get_stats(build, context) else {
+        return Ok(None);
+    };
+    // Require a size estimate as well: operators that cannot estimate their
+    // output size (such as joins) also tend to misestimate their row count.
+    // TPC-H Q18 estimates 15M rows for a 60M-row join output, which would
+    // be a single-threaded build of several GB.
+    let (Some(&num_rows), Some(&num_bytes)) = (
+        stats.num_rows.get_value(),
+        stats.total_byte_size.get_value(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(key_stats) = stats.column_statistics.get(key.index()) else {
+        return Ok(None);
+    };
+    let (Some(min), Some(max)) = (
+        key_stats.min_value.get_value(),
+        key_stats.max_value.get_value(),
+    ) else {
+        return Ok(None);
+    };
+    let key_type = build.schema().field(key.index()).data_type().clone();
+    if num_rows > max_rows
+        || num_bytes > max_bytes
+        || !HashJoinExec::would_use_array_map(
+            &key_type,
+            num_rows,
+            min,
+            max,
+            config.execution.perfect_hash_join_small_build_threshold,
+            config.execution.perfect_hash_join_min_key_density,
+        )
+    {
+        return Ok(None);
+    }
+
+    if swap {
+        hash_join.swap_inputs(PartitionMode::CollectLeft).map(Some)
+    } else {
+        Ok(Some(Arc::new(
+            hash_join
+                .builder()
+                .with_partition_mode(PartitionMode::CollectLeft)
+                .build()?,
+        )))
+    }
+}
+
 /// Creates a partitioned hash join execution plan, swapping inputs if beneficial.
 ///
 /// Checks if the join order should be swapped based on the join type and input statistics.
@@ -290,11 +401,14 @@ fn statistical_join_selection_subrule(
             None
         } else {
             match hash_join.partition_mode() {
-                PartitionMode::Auto => try_collect_left(hash_join, false, context)?
-                    .map_or_else(
-                        || partitioned_hash_join(hash_join, context).map(Some),
-                        |v| Ok(Some(v)),
-                    )?,
+                PartitionMode::Auto => match try_collect_left(hash_join, false, context)?
+                {
+                    Some(plan) => Some(plan),
+                    None => match try_collect_left_for_array_map(hash_join, context)? {
+                        Some(plan) => Some(plan),
+                        None => Some(partitioned_hash_join(hash_join, context)?),
+                    },
+                },
                 PartitionMode::CollectLeft => try_collect_left(hash_join, true, context)?
                     .map_or_else(
                         || partitioned_hash_join(hash_join, context).map(Some),
