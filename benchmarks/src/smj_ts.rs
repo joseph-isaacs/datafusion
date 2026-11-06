@@ -54,6 +54,12 @@ pub struct RunOpt {
     #[arg(long = "hash-join")]
     hash_join: bool,
 
+    /// Let the planner choose the sort-merge join at the configured
+    /// partition count (hash-repartitioning both ordered inputs while
+    /// keeping their order) instead of the single-partition plan.
+    #[arg(long = "parallel")]
+    parallel: bool,
+
     /// Directory holding (or receiving) the generated Parquet tables
     #[arg(short = 'p', long = "path", default_value = "data/smj_ts")]
     path: PathBuf,
@@ -147,6 +153,11 @@ impl RunOpt {
 
         let config = if self.scan_queries || self.hash_join {
             self.common.config()?
+        } else if self.parallel {
+            self.common
+                .config()?
+                .set_bool("datafusion.optimizer.prefer_hash_join", false)
+                .set_bool("datafusion.optimizer.prefer_existing_sort", true)
         } else {
             self.common
                 .config()?
@@ -228,7 +239,7 @@ impl RunOpt {
         ctx: &SessionContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        if self.hash_join {
+        if self.hash_join || self.parallel {
             return Ok(plan);
         }
         plan.transform_up(|node| {
@@ -259,12 +270,19 @@ impl RunOpt {
         let plan = self.plan(sql, ctx).await?;
         let plan_string = displayable(plan.as_ref()).indent(true).to_string();
         let merge_join = !self.scan_queries && !self.hash_join;
+        if self.parallel && plan_string.contains("HashJoinExec") {
+            return Err(exec_datafusion_err!(
+                "Query {query_id} still uses a hash join: {plan_string}"
+            ));
+        }
         if merge_join && !plan_string.contains("SortMergeJoinExec") {
             return Err(exec_datafusion_err!(
                 "Query {query_id} does not use a sort-merge join: {plan_string}"
             ));
         }
-        if merge_join && plan_string.contains("SortExec") {
+        // The single-partition plan must not sort; the planner's parallel
+        // plan sorts wherever the inputs' ordering does not cover the keys.
+        if merge_join && !self.parallel && plan_string.contains("SortExec") {
             return Err(exec_datafusion_err!(
                 "Query {query_id} sorts its pre-sorted input: {plan_string}"
             ));
