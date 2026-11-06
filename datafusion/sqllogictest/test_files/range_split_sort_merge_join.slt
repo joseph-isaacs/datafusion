@@ -142,6 +142,91 @@ SELECT count(*), sum(l.v), sum(r.w), count(r.k) FROM l LEFT JOIN r ON l.k = r.k 
 ----
 80 3160 130 20
 
+# Two join keys, files sorted on the first only: each range joins on the
+# first key and filters on the second. Duplicate first keys carry
+# different second keys, so pairing on the first alone would be wrong.
+statement ok
+COPY (SELECT value / 3 AS k, (value * 7) % 3 AS g, value AS v FROM range(0, 30) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/l2/0.parquet';
+
+statement ok
+COPY (SELECT value / 3 AS k, (value * 7) % 3 AS g, value AS v FROM range(30, 60) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/l2/1.parquet';
+
+statement ok
+COPY (SELECT value / 2 AS k, value % 2 AS g, value AS w FROM range(0, 40) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/r2/0.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE l2 (k BIGINT NOT NULL, g BIGINT, v BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/l2/' WITH ORDER (k ASC NULLS LAST);
+
+statement ok
+CREATE EXTERNAL TABLE r2 (k BIGINT NOT NULL, g BIGINT, w BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/r2/' WITH ORDER (k ASC NULLS LAST);
+
+query TT
+EXPLAIN SELECT l2.v, r2.w FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+logical_plan
+01)Projection: l2.v, r2.w
+02)--Inner Join: l2.k = r2.k, l2.g = r2.g
+03)----TableScan: l2 projection=[k, g, v]
+04)----TableScan: r2 projection=[k, g, w]
+physical_plan
+01)ProjectionExec: expr=[v@2 as v, w@5 as w]
+02)--CooperativeExec
+03)----RangeSplitJoinExec: ranges=2, bounds=[0, 10, 20], join=SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)], filter=__range_split_key_0@0 = __range_split_key_1@1
+
+statement ok
+set datafusion.optimizer.range_split_sort_merge_join = 0;
+
+query IIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(DISTINCT l2.k) FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+40 1160 780 20
+
+query IIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(r2.k) FROM l2 LEFT JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+60 1770 780 40
+
+query IIIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(l2.k), count(r2.k) FROM l2 FULL JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+60 1770 780 60 40
+
+query III
+SELECT count(*), sum(l2.v), sum(r2.w) FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g AND r2.w > l2.v / 3
+----
+39 1160 780
+
+statement ok
+set datafusion.optimizer.range_split_sort_merge_join = 4;
+
+query IIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(DISTINCT l2.k) FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+40 1160 780 20
+
+query IIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(r2.k) FROM l2 LEFT JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+60 1770 780 40
+
+query IIIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(l2.k), count(r2.k) FROM l2 FULL JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+60 1770 780 60 40
+
+query III
+SELECT count(*), sum(l2.v), sum(r2.w) FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g AND r2.w > l2.v / 3
+----
+39 1160 780
+
+statement ok
+DROP TABLE l2;
+
+statement ok
+DROP TABLE r2;
+
 # Files whose key ranges overlap cannot be split: a plain merge join.
 statement ok
 COPY (SELECT value AS k, value AS w FROM range(0, 30) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/o/0.parquet';

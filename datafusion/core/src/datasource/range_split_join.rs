@@ -13,20 +13,24 @@ use arrow::array::RecordBatch;
 use arrow::buffer::ScalarBuffer;
 use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
+use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{Result, ScalarValue};
+use datafusion_common::{JoinSide, NullEquality, Result, ScalarValue, internal_err};
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::TaskContext;
+use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::BinaryExpr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr,
 };
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::joins::SortMergeJoinExec;
+use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
@@ -36,8 +40,9 @@ use futures::StreamExt;
 
 /// Splits `join`, a sort-merge join whose inputs are both file scans, into
 /// `n` joins over disjoint ranges of its first key, when the scans' files
-/// prove the split is exact: every file is sorted ascending on the join
-/// keys, has exact min/max statistics and no nulls for the first key, and
+/// prove the split is exact: every file is sorted ascending on a prefix of
+/// the join keys (any later keys move into the join filter), has exact
+/// min/max statistics and no nulls for the first key, and
 /// each side's files cover non-overlapping key ranges. Returns `None`
 /// otherwise.
 ///
@@ -58,9 +63,16 @@ pub(crate) fn try_range_split(
     ) else {
         return Ok(None);
     };
-    if left.options != right.options {
+    // Join each range on the leading keys both inputs are ordered on, with
+    // the same null placement; the rest move into the filter.
+    let Some((options, ordered)) = [false, true].into_iter().find_map(|nulls_first| {
+        let i = usize::from(nulls_first);
+        let m = left.prefixes[i].min(right.prefixes[i]);
+        (m > 0).then(|| (SortOptions::new(false, nulls_first), m))
+    }) else {
         return Ok(None);
-    }
+    };
+    let filter = keys_into_filter(join, ordered)?;
     let (min, max) = left
         .files
         .iter()
@@ -94,15 +106,16 @@ pub(crate) fn try_range_split(
     if bounds.len() < 3 {
         return Ok(None);
     }
-    let sort_options = vec![left.options; join.on().len()];
-    let ranges = (0..n)
-        .map(|i| {
-            let (lo, hi) = (bounds[i], bounds[i + 1]);
+    let sort_options = vec![options; ordered];
+    let ranges = bounds
+        .windows(2)
+        .map(|w| {
+            let (lo, hi) = (w[0], w[1]);
             let joined = SortMergeJoinExec::try_new(
                 left.range(lo, hi),
                 right.range(lo, hi),
-                join.on().to_vec(),
-                join.filter().clone(),
+                join.on()[..ordered].to_vec(),
+                filter.clone(),
                 join.join_type(),
                 sort_options.clone(),
                 join.null_equality(),
@@ -112,6 +125,55 @@ pub(crate) fn try_range_split(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(Arc::new(RangeSplitJoinExec::new(ranges, bounds))))
+}
+
+/// `join`'s filter, with the equalities of its join keys from `ordered` on
+/// added to it. Joining on the leading keys and filtering on the others
+/// matches the same pairs, for every join type: a pair the filter rejects is
+/// unmatched, as a pair whose other keys differ is.
+fn keys_into_filter(
+    join: &SortMergeJoinExec,
+    ordered: usize,
+) -> Result<Option<JoinFilter>> {
+    let rest = &join.on()[ordered..];
+    if rest.is_empty() {
+        return Ok(join.filter().clone());
+    }
+    let (left_schema, right_schema) = (join.left().schema(), join.right().schema());
+    let (mut expression, mut column_indices, mut fields) = match join.filter() {
+        Some(f) => (
+            Some(Arc::clone(f.expression())),
+            f.column_indices().to_vec(),
+            f.schema().fields().iter().cloned().collect::<Vec<_>>(),
+        ),
+        None => (None, vec![], vec![]),
+    };
+    let op = match join.null_equality() {
+        NullEquality::NullEqualsNothing => Operator::Eq,
+        NullEquality::NullEqualsNull => Operator::IsNotDistinctFrom,
+    };
+    for (l, r) in rest {
+        let (Some(l), Some(r)) = (l.downcast_ref::<Column>(), r.downcast_ref::<Column>())
+        else {
+            return internal_err!("range split keys must be columns");
+        };
+        let mut column = |side: JoinSide, index: usize, schema: &SchemaRef| {
+            column_indices.push(ColumnIndex { index, side });
+            let field = schema.field(index);
+            let name = format!("__range_split_key_{}", fields.len());
+            fields.push(Arc::new(field.clone().with_name(name.clone())));
+            Arc::new(Column::new(&name, fields.len() - 1)) as Arc<dyn PhysicalExpr>
+        };
+        let lhs = column(JoinSide::Left, l.index(), &left_schema);
+        let rhs = column(JoinSide::Right, r.index(), &right_schema);
+        let eq = Arc::new(BinaryExpr::new(lhs, op, rhs)) as Arc<dyn PhysicalExpr>;
+        expression = Some(match expression {
+            Some(e) => Arc::new(BinaryExpr::new(e, Operator::And, eq)),
+            None => eq,
+        });
+    }
+    Ok(expression
+        .map(|e| JoinFilter::new(e, column_indices, Arc::new(Schema::new(fields)))))
 }
 
 /// A file with the exact min and max of the first join key.
@@ -128,7 +190,9 @@ struct SortedScan {
     config: FileScanConfig,
     /// The first key's column index in the scan's output.
     key: usize,
-    options: SortOptions,
+    /// How many leading join keys each file is ordered on, ascending with
+    /// nulls last (`[0]`) and nulls first (`[1]`).
+    prefixes: [usize; 2],
     /// In key order, non-overlapping.
     files: Vec<KeyedFile>,
 }
@@ -164,21 +228,31 @@ impl SortedScan {
         ) {
             return Ok(None);
         }
-        // The files must each be ordered on every join key (ascending).
-        let Some(options) = [false, true].into_iter().find_map(|nulls_first| {
-            let options = SortOptions::new(false, nulls_first);
-            let required = LexOrdering::new(
-                keys.iter()
-                    .map(|k| PhysicalSortExpr::new(Arc::new((*k).clone()), options)),
-            )?;
-            let eq = EquivalenceProperties::new_with_orderings(
-                Arc::clone(&projected),
-                config.output_ordering.clone(),
-            );
-            eq.ordering_satisfy(required).ok()?.then_some(options)
-        }) else {
+        // The files must each be ordered (ascending) on a prefix of the join
+        // keys: the longest such prefix, for each null placement.
+        let eq = EquivalenceProperties::new_with_orderings(
+            Arc::clone(&projected),
+            config.output_ordering.clone(),
+        );
+        let mut prefixes = [0; 2];
+        for (nulls_first, prefix) in prefixes.iter_mut().enumerate() {
+            let options = SortOptions::new(false, nulls_first == 1);
+            *prefix =
+                (1..=keys.len())
+                    .rev()
+                    .find(|&m| {
+                        LexOrdering::new(keys[..m].iter().map(|k| {
+                            PhysicalSortExpr::new(Arc::new((*k).clone()), options)
+                        }))
+                        .is_some_and(|required| {
+                            eq.ordering_satisfy(required).unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(0);
+        }
+        if prefixes == [0, 0] {
             return Ok(None);
-        };
+        }
         let Ok(stats_index) = config.file_schema().index_of(key.name()) else {
             return Ok(None);
         };
@@ -228,7 +302,7 @@ impl SortedScan {
         Ok(Some(Self {
             config: config.clone(),
             key: key.index(),
-            options,
+            prefixes,
             files,
         }))
     }
