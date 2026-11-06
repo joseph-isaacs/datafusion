@@ -76,6 +76,9 @@ pub(super) struct ScanState {
     /// Where batches decoded ahead by a morsel opened in advance are
     /// reserved while they wait for the consumer, if the stream has a pool.
     lookahead_reservation: Option<MemoryReservation>,
+    /// Whether to open and decode the next file ahead; see
+    /// [`Self::plan_ahead`].
+    lookahead: bool,
 }
 
 impl ScanState {
@@ -86,6 +89,7 @@ impl ScanState {
         on_error: OnError,
         metrics: FileStreamMetrics,
         lookahead_reservation: Option<MemoryReservation>,
+        lookahead: bool,
     ) -> Self {
         Self {
             work_source,
@@ -98,6 +102,7 @@ impl ScanState {
             pending_planner: None,
             metrics,
             lookahead_reservation,
+            lookahead,
         }
     }
 
@@ -303,10 +308,15 @@ impl ScanState {
     /// [`LOOKAHEAD_BATCHES`] batches ahead. Files still start in order, so
     /// the partition's batches keep their order.
     ///
-    /// Not used with a row limit (extra files may never be needed) or
-    /// outside a multi-threaded runtime (nowhere to run the decode).
+    /// Not used with a row limit (extra files may never be needed), outside
+    /// a multi-threaded runtime (nowhere to run the decode), or for a scan
+    /// with more than one partition: there every core is already decoding a
+    /// partition of its own, so the extra decode tasks only add contention
+    /// (TPC-H SF1, 4 partitions: Q3 +7.6%, Q21 +14.1% with hash joins; Q17
+    /// +9.9%, Q18 +10.2% with sort-merge joins).
     fn plan_ahead(&mut self) {
-        if !multi_thread_runtime()
+        if !self.lookahead
+            || !multi_thread_runtime()
             || !self.ready_morsels.is_empty()
             || self.pending_planner.is_some()
         {

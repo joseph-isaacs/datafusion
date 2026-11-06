@@ -1890,4 +1890,43 @@ mod tests {
         assert_eq!(pool.reserved(), 0, "lookahead reservation leaked");
         Ok(())
     }
+
+    /// A scan with more than one partition reads no file ahead: its other
+    /// partitions already keep the cores busy decoding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_partition_scans_do_not_read_ahead() -> Result<()> {
+        use datafusion_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let group = |files: std::ops::Range<usize>| {
+            files
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect()
+        };
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(group(0..4))
+        .with_file_group(group(4..8))
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file: None,
+            }))
+            .with_metrics(&metrics_set)
+            .with_memory_pool(Arc::clone(&pool))
+            .build()?;
+        // Far past the point where a single-partition scan reads ahead.
+        for _ in 0..6 {
+            stream.next().await.unwrap()?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(pool.reserved(), 0, "a multi-partition scan read ahead");
+        Ok(())
+    }
 }
