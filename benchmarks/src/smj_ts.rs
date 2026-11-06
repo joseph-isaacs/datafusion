@@ -48,6 +48,12 @@ pub struct RunOpt {
     #[arg(long = "scan-queries")]
     scan_queries: bool,
 
+    /// Run the join queries with DataFusion's default plan (hash joins at the
+    /// configured partition count) instead of the single-partition sort-merge
+    /// join: the baseline a user gets without asking for a merge join.
+    #[arg(long = "hash-join")]
+    hash_join: bool,
+
     /// Directory holding (or receiving) the generated Parquet tables
     #[arg(short = 'p', long = "path", default_value = "data/smj_ts")]
     path: PathBuf,
@@ -139,7 +145,7 @@ impl RunOpt {
             None => 1..=queries.len(),
         };
 
-        let config = if self.scan_queries {
+        let config = if self.scan_queries || self.hash_join {
             self.common.config()?
         } else {
             self.common
@@ -222,6 +228,9 @@ impl RunOpt {
         ctx: &SessionContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        if self.hash_join {
+            return Ok(plan);
+        }
         plan.transform_up(|node| {
             let Some(hj) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
@@ -249,12 +258,13 @@ impl RunOpt {
     ) -> Result<Vec<QueryResult>> {
         let plan = self.plan(sql, ctx).await?;
         let plan_string = displayable(plan.as_ref()).indent(true).to_string();
-        if !self.scan_queries && !plan_string.contains("SortMergeJoinExec") {
+        let merge_join = !self.scan_queries && !self.hash_join;
+        if merge_join && !plan_string.contains("SortMergeJoinExec") {
             return Err(exec_datafusion_err!(
                 "Query {query_id} does not use a sort-merge join: {plan_string}"
             ));
         }
-        if !self.scan_queries && plan_string.contains("SortExec") {
+        if merge_join && plan_string.contains("SortExec") {
             return Err(exec_datafusion_err!(
                 "Query {query_id} sorts its pre-sorted input: {plan_string}"
             ));
