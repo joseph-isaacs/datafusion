@@ -71,12 +71,27 @@ pub(crate) fn try_range_split(
     if max == i64::MAX {
         return Ok(None);
     }
+    // Cut the ranges where the larger input's files start, so that input
+    // decodes each file once: a range boundary inside a file makes both
+    // ranges decode the part of it before the boundary.
+    let larger = if left.rows() >= right.rows() {
+        &left
+    } else {
+        &right
+    };
+    let total = larger.rows().max(1);
+    let mut bounds = vec![min];
+    let mut seen = 0;
+    for file in &larger.files {
+        let next = bounds.len();
+        if next < n && seen * n >= total * next && file.min > *bounds.last().unwrap() {
+            bounds.push(file.min);
+        }
+        seen += file.rows;
+    }
     // Half-open ranges covering `min..=max`.
-    let span = (max as i128) - (min as i128) + 1;
-    let bounds: Vec<i64> = (0..=n)
-        .map(|i| (min as i128 + span * i as i128 / n as i128) as i64)
-        .collect();
-    if bounds.windows(2).any(|w| w[0] >= w[1]) {
+    bounds.push(max + 1);
+    if bounds.len() < 3 {
         return Ok(None);
     }
     let sort_options = vec![left.options; join.on().len()];
@@ -104,6 +119,8 @@ struct KeyedFile {
     file: PartitionedFile,
     min: i64,
     max: i64,
+    /// Its row count, 1 when the statistics do not say.
+    rows: usize,
 }
 
 /// One join input: a file scan whose files are each sorted on the join keys.
@@ -192,10 +209,16 @@ impl SortedScan {
             if col.null_count != Precision::Exact(0) {
                 return Ok(None);
             }
+            let rows = file
+                .statistics
+                .as_ref()
+                .and_then(|s| s.num_rows.get_value().copied())
+                .unwrap_or(1);
             files.push(KeyedFile {
                 file: file.clone(),
                 min,
                 max,
+                rows,
             });
         }
         files.sort_by_key(|f| (f.min, f.max));
@@ -208,6 +231,10 @@ impl SortedScan {
             options,
             files,
         }))
+    }
+
+    fn rows(&self) -> usize {
+        self.files.iter().map(|f| f.rows).sum()
     }
 
     /// This input's rows with keys in `lo..hi`.

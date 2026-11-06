@@ -100,7 +100,7 @@ logical_plan
 physical_plan
 01)ProjectionExec: expr=[v@1 as v, w@3 as w]
 02)--CooperativeExec
-03)----RangeSplitJoinExec: ranges=4, bounds=[0, 15, 30, 45, 60], join=SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)]
+03)----RangeSplitJoinExec: ranges=4, bounds=[0, 10, 20, 30, 60], join=SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)]
 
 query IIII
 SELECT count(*), sum(l.v), sum(r.w), count(DISTINCT l.k) FROM l JOIN r ON l.k = r.k
