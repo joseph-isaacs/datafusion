@@ -1,0 +1,259 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+# Hash partitioned joins on a single integer key that is dense over the whole
+# build side but sparse in each hash partition: the build partitions share one
+# ArrayMap (`array_map_created_count` counts every partition) and the dynamic
+# filter looks keys up in it without routing. Every join type must return the
+# same rows as with hash tables.
+
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold = 0;
+
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold_rows = 0;
+
+# Build side: runs of 8 keys every 32 (0.25 dense overall, 0.0625 in each of 4
+# partitions), 400 duplicated keys and 20 NULL keys, in 4 files so that both
+# sides are hash repartitioned.
+statement ok
+COPY (
+  SELECT
+    CASE
+      WHEN v < 4000 THEN (v / 8) * 32 + v % 8
+      WHEN v < 4400 THEN ((v - 4000) / 8) * 32 + (v - 4000) % 8
+      ELSE NULL
+    END AS k,
+    v AS bv
+  FROM generate_series(0, 1104) AS t(v)
+) TO 'test_files/scratch/hash_join_shared_array_map/build/0.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT
+    CASE
+      WHEN v < 4000 THEN (v / 8) * 32 + v % 8
+      WHEN v < 4400 THEN ((v - 4000) / 8) * 32 + (v - 4000) % 8
+      ELSE NULL
+    END AS k,
+    v AS bv
+  FROM generate_series(1105, 2209) AS t(v)
+) TO 'test_files/scratch/hash_join_shared_array_map/build/1.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT
+    CASE
+      WHEN v < 4000 THEN (v / 8) * 32 + v % 8
+      WHEN v < 4400 THEN ((v - 4000) / 8) * 32 + (v - 4000) % 8
+      ELSE NULL
+    END AS k,
+    v AS bv
+  FROM generate_series(2210, 3314) AS t(v)
+) TO 'test_files/scratch/hash_join_shared_array_map/build/2.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT
+    CASE
+      WHEN v < 4000 THEN (v / 8) * 32 + v % 8
+      WHEN v < 4400 THEN ((v - 4000) / 8) * 32 + (v - 4000) % 8
+      ELSE NULL
+    END AS k,
+    v AS bv
+  FROM generate_series(3315, 4419) AS t(v)
+) TO 'test_files/scratch/hash_join_shared_array_map/build/3.parquet'
+STORED AS PARQUET;
+
+# Probe side: every third key from -15 to 18000 (misses below, between and
+# above the build keys) and 10 NULL keys.
+statement ok
+COPY (
+  SELECT CASE WHEN v < 6006 THEN (v - 5) * 3 ELSE NULL END AS k, v AS pv
+  FROM generate_series(0, 1503) AS t(v)
+) TO 'test_files/scratch/hash_join_shared_array_map/probe/0.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT CASE WHEN v < 6006 THEN (v - 5) * 3 ELSE NULL END AS k, v AS pv
+  FROM generate_series(1504, 3007) AS t(v)
+) TO 'test_files/scratch/hash_join_shared_array_map/probe/1.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT CASE WHEN v < 6006 THEN (v - 5) * 3 ELSE NULL END AS k, v AS pv
+  FROM generate_series(3008, 4511) AS t(v)
+) TO 'test_files/scratch/hash_join_shared_array_map/probe/2.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT CASE WHEN v < 6006 THEN (v - 5) * 3 ELSE NULL END AS k, v AS pv
+  FROM generate_series(4512, 6015) AS t(v)
+) TO 'test_files/scratch/hash_join_shared_array_map/probe/3.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE b (k BIGINT, bv BIGINT)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/hash_join_shared_array_map/build/';
+
+statement ok
+CREATE EXTERNAL TABLE p (k BIGINT, pv BIGINT)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/hash_join_shared_array_map/probe/';
+
+statement ok
+set datafusion.explain.analyze_categories = 'rows';
+
+# All 4 build partitions build an ArrayMap (the shared one): each alone is
+# too sparse for its own.
+query TT
+EXPLAIN ANALYZE SELECT count(*) FROM p JOIN b ON p.k = b.k;
+----
+Plan with Metrics
+<slt:ignore>HashJoinExec: mode=Partitioned, join_type=Inner, on=[(k@0, k@0)], projection=[], metrics=[output_rows=1.47 K, <slt:ignore>, array_map_created_count=4, <slt:ignore>, build_input_rows=4.42 K, <slt:ignore>
+<slt:ignore>RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=4<slt:ignore>
+<slt:ignore>RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=4<slt:ignore>predicate=DynamicFilter [ k@0 >= 0 AND k@0 <= 15975 AND hash_lookup ]<slt:ignore>
+
+statement ok
+reset datafusion.explain.analyze_categories;
+
+# Each query runs twice: with the shared ArrayMap, then with hash tables only.
+# Both must agree (and match the counts computed independently).
+
+query IIII
+SELECT count(*), count(DISTINCT b.k), sum(b.bv), sum(p.pv) FROM p JOIN b ON p.k = b.k;
+----
+1468 1334 3230066 3594290
+
+query IIII
+SELECT count(*), count(b.k), sum(b.bv), sum(p.pv) FROM p LEFT JOIN b ON p.k = b.k;
+----
+6150 1468 3230066 18128965
+
+query IIII
+SELECT count(*), count(p.k), sum(b.bv), sum(p.pv) FROM b LEFT JOIN p ON p.k = b.k;
+----
+4420 1468 9765990 3594290
+
+query IIII
+SELECT count(*), count(p.k), sum(b.bv), sum(p.pv) FROM p FULL JOIN b ON p.k = b.k;
+----
+9102 6140 9765990 18128965
+
+query II
+SELECT count(*), sum(p.pv) FROM p WHERE p.k IN (SELECT k FROM b);
+----
+1334 3558445
+
+query II
+SELECT count(*), sum(b.bv) FROM b WHERE b.k IN (SELECT k FROM p);
+----
+1468 3230066
+
+query II
+SELECT count(*), sum(p.pv) FROM p WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = p.k);
+----
+4682 14534675
+
+query II
+SELECT count(*), sum(b.bv) FROM b WHERE NOT EXISTS (SELECT 1 FROM p WHERE b.k = p.k);
+----
+2952 6535924
+
+query II
+SELECT count(*), sum(p.pv) FROM p WHERE EXISTS (SELECT 1 FROM b WHERE b.k = p.k) OR p.pv < 100;
+----
+1410 3562255
+
+query II
+SELECT count(*), sum(b.bv) FROM b WHERE EXISTS (SELECT 1 FROM p WHERE b.k = p.k) OR b.bv < 100;
+----
+1534 3233333
+
+statement ok
+set datafusion.execution.perfect_hash_join_small_build_threshold = 0;
+
+statement ok
+set datafusion.execution.perfect_hash_join_min_key_density = 1.0;
+
+query IIII
+SELECT count(*), count(DISTINCT b.k), sum(b.bv), sum(p.pv) FROM p JOIN b ON p.k = b.k;
+----
+1468 1334 3230066 3594290
+
+query IIII
+SELECT count(*), count(b.k), sum(b.bv), sum(p.pv) FROM p LEFT JOIN b ON p.k = b.k;
+----
+6150 1468 3230066 18128965
+
+query IIII
+SELECT count(*), count(p.k), sum(b.bv), sum(p.pv) FROM b LEFT JOIN p ON p.k = b.k;
+----
+4420 1468 9765990 3594290
+
+query IIII
+SELECT count(*), count(p.k), sum(b.bv), sum(p.pv) FROM p FULL JOIN b ON p.k = b.k;
+----
+9102 6140 9765990 18128965
+
+query II
+SELECT count(*), sum(p.pv) FROM p WHERE p.k IN (SELECT k FROM b);
+----
+1334 3558445
+
+query II
+SELECT count(*), sum(b.bv) FROM b WHERE b.k IN (SELECT k FROM p);
+----
+1468 3230066
+
+query II
+SELECT count(*), sum(p.pv) FROM p WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = p.k);
+----
+4682 14534675
+
+query II
+SELECT count(*), sum(b.bv) FROM b WHERE NOT EXISTS (SELECT 1 FROM p WHERE b.k = p.k);
+----
+2952 6535924
+
+query II
+SELECT count(*), sum(p.pv) FROM p WHERE EXISTS (SELECT 1 FROM b WHERE b.k = p.k) OR p.pv < 100;
+----
+1410 3562255
+
+query II
+SELECT count(*), sum(b.bv) FROM b WHERE EXISTS (SELECT 1 FROM p WHERE b.k = p.k) OR b.bv < 100;
+----
+1534 3233333
+
+statement ok
+reset datafusion.execution.perfect_hash_join_small_build_threshold;
+
+statement ok
+reset datafusion.execution.perfect_hash_join_min_key_density;
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold;
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold_rows;
+
+statement ok
+reset datafusion.execution.target_partitions;
+
+statement ok
+DROP TABLE b;
+
+statement ok
+DROP TABLE p;

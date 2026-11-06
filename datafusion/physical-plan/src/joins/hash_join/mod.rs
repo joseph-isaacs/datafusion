@@ -18,5 +18,6 @@ mod exec;
 mod inlist_builder;
 mod not_in;
 mod partitioned_hash_eval;
+mod shared_array_map;
 mod shared_bounds;
 mod stream;

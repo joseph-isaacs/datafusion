@@ -20,6 +20,9 @@ use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::not_in::{NotIn, NotInBuild};
+use crate::joins::hash_join::shared_array_map::{
+    PartitionKeys, SharedArrayMapBuild, SharedArrayMapHandle, SharedArrayMapPart,
+};
 use crate::joins::hash_join::shared_bounds::{
     ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
 };
@@ -126,13 +129,9 @@ fn array_map_key_range(
         return Ok(None);
     }
 
-    if null_equality == NullEquality::NullEqualsNull {
-        for batch in batches.iter() {
-            let arrays = evaluate_expressions_to_arrays(on_left, batch)?;
-            if arrays[0].null_count() > 0 {
-                return Ok(None);
-            }
-        }
+    if null_equality == NullEquality::NullEqualsNull && keys_have_null(batches, on_left)?
+    {
+        return Ok(None);
     }
 
     let (min_val, max_val) = if let Some(bounds) = bounds {
@@ -1074,6 +1073,33 @@ impl HashJoinExec {
         true
     }
 
+    /// The barrier letting the build partitions of a hash partitioned join on
+    /// a single integer key share one [`ArrayMap`], see
+    /// [`SharedArrayMapBuild`]. Only called for a join with a dynamic filter
+    /// accumulator, whose probe side already waits for every build partition.
+    fn shared_array_map_build(
+        &self,
+        on_left: &[PhysicalExprRef],
+        context: &TaskContext,
+    ) -> Option<Arc<SharedArrayMapBuild>> {
+        let Partitioning::Hash(_, partitions) = self.left.output_partitioning() else {
+            return None;
+        };
+        let candidate = self.mode == PartitionMode::Partitioned
+            && self.prepared_build.is_none()
+            && *partitions > 1
+            && is_perfect_hash_join_candidate(on_left, &self.left.schema())
+                .unwrap_or(false);
+        let execution = &context.session_config().options().execution;
+        candidate.then(|| {
+            Arc::new(SharedArrayMapBuild::new(
+                *partitions,
+                execution.perfect_hash_join_small_build_threshold,
+                execution.perfect_hash_join_min_key_density,
+            ))
+        })
+    }
+
     fn has_partitioned_dynamic_filter_routing(&self) -> bool {
         match (
             self.left.output_partitioning(),
@@ -1681,17 +1707,22 @@ impl ExecutionPlan for HashJoinExec {
                         .map(|(_, right_expr)| Arc::clone(right_expr))
                         .collect::<Vec<_>>();
                     Some(Arc::clone(df.build_accumulator.get_or_init(|| {
-                        Arc::new(SharedBuildAccumulator::new_from_partition_mode(
-                            self.mode,
-                            self.left.as_ref(),
-                            self.right.as_ref(),
-                            filter,
-                            on_right,
-                            repartition_random_state,
-                            self.null_equality,
-                            not_in,
-                            &context.session_config().options().optimizer,
-                        ))
+                        Arc::new(
+                            SharedBuildAccumulator::new_from_partition_mode(
+                                self.mode,
+                                self.left.as_ref(),
+                                self.right.as_ref(),
+                                filter,
+                                on_right,
+                                repartition_random_state,
+                                self.null_equality,
+                                not_in,
+                                &context.session_config().options().optimizer,
+                            )
+                            .with_shared_array_map(
+                                self.shared_array_map_build(&on_left, &context),
+                            ),
+                        )
                     })))
                 })
             })
@@ -1727,10 +1758,17 @@ impl ExecutionPlan for HashJoinExec {
                     not_in,
                     array_map_created_count,
                     BuildMode::Ordinary,
+                    None,
                 ))
             })?,
             (None, PartitionMode::Partitioned) => {
                 let left_stream = self.left.execute(partition, Arc::clone(&context))?;
+                // Created here, so that dropping the stream before it is polled
+                // still releases the other partitions.
+                let shared_array_map = build_accumulator
+                    .as_ref()
+                    .and_then(|acc| acc.shared_array_map())
+                    .map(|build| SharedArrayMapHandle::new(Arc::clone(build), partition));
 
                 let reservation =
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
@@ -1749,6 +1787,7 @@ impl ExecutionPlan for HashJoinExec {
                     not_in,
                     array_map_created_count,
                     BuildMode::Ordinary,
+                    shared_array_map,
                 ))
             }
             (None, PartitionMode::Auto) => {
@@ -3062,6 +3101,7 @@ async fn collect_left_input(
     not_in: Option<NotIn>,
     array_map_created_count: Count,
     mode: BuildMode,
+    shared_array_map: Option<SharedArrayMapHandle>,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
     let prepared = mode == BuildMode::Prepared;
@@ -3105,7 +3145,7 @@ async fn collect_left_input(
 
     // Bind the reservation first so error paths release allocations before their charge.
     let BuildSideState {
-        reservation,
+        mut reservation,
         mut batches,
         num_rows,
         metrics,
@@ -3135,6 +3175,37 @@ async fn collect_left_input(
         _ => None,
     };
 
+    // Waits for every other build partition: see `SharedArrayMapBuild`.
+    let mut input_bytes = input_bytes;
+    let shared_array_map = match shared_array_map {
+        Some(handle) => {
+            // Only inserting the keys needs the shared map, so concatenate
+            // the batches before waiting for the other partitions: the
+            // copies of the partitions that finish first overlap the others'
+            // input instead of all running at once after the wait. Building
+            // from the single batch afterwards does not copy it again.
+            if batches.len() > 1 {
+                let batch = concat_build_batches(
+                    &schema,
+                    &mut batches,
+                    input_bytes,
+                    &mut reservation,
+                    &metrics,
+                )?;
+                input_bytes = get_record_batch_memory_size(&batch);
+            }
+            let keys = shared_array_map_keys(
+                bounds.as_ref(),
+                &batches,
+                num_rows,
+                &on_left,
+                null_equality,
+            )?;
+            handle.report_and_wait(keys, num_rows, &reservation).await
+        }
+        None => None,
+    };
+
     build_in_memory(
         &random_state,
         &schema,
@@ -3155,7 +3226,46 @@ async fn collect_left_input(
         not_in,
         &array_map_created_count,
         prepared,
+        shared_array_map,
     )
+}
+
+/// The keys one build partition reports to a [`SharedArrayMapBuild`]: the
+/// bounds of its keys, if they can be joined with an [`ArrayMap`].
+fn shared_array_map_keys(
+    bounds: Option<&PartitionBounds>,
+    batches: &[RecordBatch],
+    num_rows: usize,
+    on_left: &[PhysicalExprRef],
+    null_equality: NullEquality,
+) -> Result<PartitionKeys> {
+    if num_rows >= u32::MAX as usize
+        || (null_equality == NullEquality::NullEqualsNull
+            && keys_have_null(batches, on_left)?)
+    {
+        return Ok(PartitionKeys::Ineligible);
+    }
+    Ok(
+        match bounds.and_then(|bounds| bounds.get_column_bounds(0)) {
+            Some(cb) if !cb.min.is_null() && !cb.max.is_null() => PartitionKeys::Range {
+                min: cb.min.clone(),
+                max: cb.max.clone(),
+            },
+            // No rows, or only NULL keys, which are never matched.
+            _ => PartitionKeys::None,
+        },
+    )
+}
+
+/// Whether the first join key of `batches` holds a NULL.
+fn keys_have_null(batches: &[RecordBatch], on_left: &[PhysicalExprRef]) -> Result<bool> {
+    for batch in batches {
+        let arrays = evaluate_expressions_to_arrays(on_left, batch)?;
+        if arrays[0].null_count() > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Builds the hash table (or perfect-hash [`ArrayMap`]) and the bitmaps over
@@ -3186,20 +3296,47 @@ fn build_in_memory(
     not_in: Option<NotIn>,
     array_map_created_count: &Count,
     prepared: bool,
+    shared_array_map: Option<SharedArrayMapPart>,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
+    let shared = shared_array_map.is_some();
 
-    let (join_hash_map, batch, left_values) = if let Some((min_val, max_val)) =
-        array_map_key_range(
-            bounds.as_ref(),
+    let (join_hash_map, batch, left_values) = if let Some(part) = shared_array_map {
+        // The shared slots are reserved once for all partitions; this
+        // partition only holds its duplicate-key chain.
+        reservation.try_grow(num_rows * size_of::<u32>())?;
+        let batch = concat_build_batches(
             schema,
             batches,
-            on_left,
+            input_bytes,
             &mut reservation,
-            config.execution.perfect_hash_join_small_build_threshold,
-            config.execution.perfect_hash_join_min_key_density,
-            null_equality,
-        )? {
+            metrics,
+        )?;
+        let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+        if part.charge_slots {
+            metrics.build_mem_used.add(part.slots.size());
+        }
+        let array_map = ArrayMap::try_new_in_slots(
+            &left_values[0],
+            part.slots,
+            part.offset,
+            part.base,
+        )?;
+
+        array_map_created_count.add(1);
+        metrics.build_mem_used.add(array_map.size());
+
+        (Map::ArrayMap(array_map), batch, left_values)
+    } else if let Some((min_val, max_val)) = array_map_key_range(
+        bounds.as_ref(),
+        schema,
+        batches,
+        on_left,
+        &mut reservation,
+        config.execution.perfect_hash_join_small_build_threshold,
+        config.execution.perfect_hash_join_min_key_density,
+        null_equality,
+    )? {
         let batch = if prepared {
             concat_batches(schema, batches.iter())?
         } else {
@@ -3330,7 +3467,10 @@ fn build_in_memory(
             .map(|arr| arr.get_array_memory_size())
             .sum::<usize>();
 
-        let pushdown_inlist = !left_values.is_empty()
+        // Shared slots merge into one filter over every partition, which an
+        // IN list of this partition's keys would prevent.
+        let pushdown_inlist = !shared
+            && !left_values.is_empty()
             && !left_values[0].is_empty()
             && estimated_size <= config.optimizer.hash_join_inlist_pushdown_max_size
             && map.num_of_distinct_key()
@@ -4278,6 +4418,7 @@ mod tests {
             None,
             Count::new(),
             BuildMode::Ordinary,
+            None,
         )
         .await?;
         Ok((left_data, metrics))
@@ -11705,6 +11846,289 @@ mod tests {
             .await
             .unwrap_err();
         assert_contains!(error.to_string(), "Resources exhausted");
+        Ok(())
+    }
+
+    /// A nullable `Int32` table `(a, key, c)` of `keys`.
+    fn nullable_key_table(
+        names: [&str; 3],
+        keys: Vec<Option<i32>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(names[0], DataType::Int32, false),
+            Field::new(names[1], DataType::Int32, true),
+            Field::new(names[2], DataType::Int32, false),
+        ]));
+        let rows = keys.len() as i32;
+        // Two batches, so builds concatenate.
+        let half = keys.len() / 2;
+        let batches = [&keys[..half], &keys[half..]]
+            .into_iter()
+            .enumerate()
+            .map(|(b, keys)| {
+                let start = (b * half) as i32;
+                let len = keys.len() as i32;
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(start..start + len)),
+                        Arc::new(Int32Array::from(keys.to_vec())),
+                        Arc::new(Int32Array::from_iter_values(
+                            (start..start + len).map(|v| rows - v),
+                        )),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(TestMemoryExec::try_new_exec(&[batches], schema, None)?)
+    }
+
+    /// Runs a hash partitioned (4 partitions) join on `b1 = b2` with a dynamic
+    /// filter, executing every partition concurrently, and returns the sorted
+    /// output, the join metrics and the final dynamic filter.
+    async fn run_partitioned_dynamic_filter_join(
+        left_keys: Vec<Option<i32>>,
+        right_keys: Vec<Option<i32>>,
+        join_type: JoinType,
+        null_equality: NullEquality,
+        config: SessionConfig,
+    ) -> Result<(String, MetricsSet, String)> {
+        let left = nullable_key_table(["a1", "b1", "c1"], left_keys)?;
+        let right = nullable_key_table(["a2", "b2", "c2"], right_keys)?;
+        let left_key: PhysicalExprRef =
+            Arc::new(Column::new_with_schema("b1", &left.schema())?);
+        let right_key: PhysicalExprRef =
+            Arc::new(Column::new_with_schema("b2", &right.schema())?);
+        let left = Arc::new(RepartitionExec::try_new(
+            left,
+            Partitioning::Hash(vec![Arc::clone(&left_key)], 4),
+        )?);
+        let right = Arc::new(RepartitionExec::try_new(
+            right,
+            Partitioning::Hash(vec![Arc::clone(&right_key)], 4),
+        )?);
+        let on = vec![(left_key, right_key)];
+        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let consumer: Arc<dyn PhysicalExpr> = Arc::clone(&dynamic_filter) as _;
+        let right = Arc::new(FilterExecBuilder::new(consumer, right).build()?);
+        let mut join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &join_type,
+            None,
+            PartitionMode::Partitioned,
+            null_equality,
+            false,
+        )?;
+        join.dynamic_filter = Some(HashJoinExecDynamicFilter {
+            filter: Arc::clone(&dynamic_filter),
+            build_accumulator: OnceLock::new(),
+        });
+        let join = Arc::new(join);
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+        let batches = crate::collect_partitioned(Arc::clone(&join) as _, task_ctx)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        Ok((
+            batches_to_sort_string(&batches),
+            join.metrics().unwrap(),
+            format!("{}", dynamic_filter.current()?),
+        ))
+    }
+
+    /// Keys like TPC-H `o_orderkey`: runs of 8 consecutive values every 32,
+    /// dense (0.25) overall but only 0.0625 in each of 4 hash partitions, with
+    /// duplicates of the first keys and some NULLs.
+    fn dense_overall_keys() -> Vec<Option<i32>> {
+        let mut keys = (0..2000)
+            .map(|i| Some(i / 8 * 32 + i % 8))
+            .collect::<Vec<_>>();
+        keys.extend((0..200).map(|i| Some(i / 8 * 32 + i % 8)));
+        keys.extend((0..50).map(|_| None));
+        keys
+    }
+
+    fn probe_keys() -> Vec<Option<i32>> {
+        let mut keys = (-10..8100).step_by(3).map(Some).collect::<Vec<_>>();
+        keys.extend((0..30).map(|_| None));
+        keys
+    }
+
+    /// The build partitions of a hash partitioned join whose keys are dense
+    /// overall share one `ArrayMap` when a dynamic filter makes them wait for
+    /// each other, and every join type returns what hash tables return.
+    #[rstest]
+    #[tokio::test]
+    async fn partitioned_join_shares_array_map(
+        #[values(
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::LeftSemi,
+            JoinType::RightSemi,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+            JoinType::LeftMark,
+            JoinType::RightMark
+        )]
+        join_type: JoinType,
+        #[values(NullEquality::NullEqualsNothing, NullEquality::NullEqualsNull)]
+        null_equality: NullEquality,
+        // Dense overall (shared), only 6 distinct keys (small range, so some
+        // partitions are empty and the chains long), and sparse overall.
+        #[values("dense", "small", "sparse")] keys: &str,
+    ) -> Result<()> {
+        let left_keys = match keys {
+            "dense" => dense_overall_keys(),
+            "small" => (0..600).map(|i| Some(i % 6)).collect(),
+            _ => (0..2000).map(|i| Some(i * 37)).collect(),
+        };
+        let right_keys = probe_keys();
+        let hash_tables = SessionConfig::default()
+            .with_batch_size(64)
+            .set_usize(
+                "datafusion.execution.perfect_hash_join_small_build_threshold",
+                0,
+            )
+            .set_str(
+                "datafusion.execution.perfect_hash_join_min_key_density",
+                "1.0",
+            );
+        let (expected, _, _) = run_partitioned_dynamic_filter_join(
+            left_keys.clone(),
+            right_keys.clone(),
+            join_type,
+            null_equality,
+            hash_tables,
+        )
+        .await?;
+        let (actual, metrics, filter) = run_partitioned_dynamic_filter_join(
+            left_keys.clone(),
+            right_keys,
+            join_type,
+            null_equality,
+            SessionConfig::default().with_batch_size(64),
+        )
+        .await?;
+        assert_eq!(actual, expected);
+
+        let has_filter = join_type.on_lr_is_preserved().1;
+        let shared = has_filter
+            && keys != "sparse"
+            && !(null_equality == NullEquality::NullEqualsNull
+                && left_keys.iter().any(Option::is_none));
+        let array_maps = metrics
+            .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+            .map(|v| v.as_usize());
+        if shared {
+            // Every partition, empty ones included, uses the shared map, and
+            // the filter looks keys up in it without routing.
+            assert_eq!(array_maps, Some(4), "{filter}");
+            assert_contains!(&filter, "hash_lookup");
+            assert!(!filter.contains("routed"), "{filter}");
+            assert!(!filter.contains("CASE"), "{filter}");
+        } else if keys == "dense" || keys == "sparse" {
+            // Too sparse in each partition for its own map.
+            assert_eq!(array_maps, Some(0), "{filter}");
+        }
+        Ok(())
+    }
+
+    /// The shared slots are reserved and reported once, not once per
+    /// partition, and released with the join.
+    #[tokio::test]
+    async fn shared_array_map_memory_is_counted_once() -> Result<()> {
+        // 8000 rows over 0..=31999: the shared slots take 128000 bytes; one
+        // per partition would take 4 x 128000.
+        let left_keys = (0..8000).map(|i| Some(i / 8 * 32 + i % 8)).collect();
+        let right_keys = (0..100).map(Some).collect();
+        let (_, metrics, _) = run_partitioned_dynamic_filter_join(
+            left_keys,
+            right_keys,
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            SessionConfig::default(),
+        )
+        .await?;
+        assert_eq!(
+            metrics
+                .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+                .map(|v| v.as_usize()),
+            Some(4)
+        );
+        let build_mem_used = metrics.sum_by_name("build_mem_used").unwrap().as_usize();
+        let (_, hash_metrics, _) = run_partitioned_dynamic_filter_join(
+            (0..8000).map(|i| Some(i / 8 * 32 + i % 8)).collect(),
+            (0..100).map(Some).collect(),
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            SessionConfig::default()
+                .set_usize(
+                    "datafusion.execution.perfect_hash_join_small_build_threshold",
+                    0,
+                )
+                .set_str(
+                    "datafusion.execution.perfect_hash_join_min_key_density",
+                    "1.0",
+                ),
+        )
+        .await?;
+        let hash_mem_used = hash_metrics
+            .sum_by_name("build_mem_used")
+            .unwrap()
+            .as_usize();
+        let per_partition = metrics
+            .iter()
+            .filter(|m| m.value().name() == "build_mem_used")
+            .map(|m| m.value().as_usize())
+            .collect::<Vec<_>>();
+        assert_eq!(per_partition.len(), 4);
+        // Exactly one partition accounts for the slots.
+        let slots = 32000 * size_of::<u32>();
+        let max = *per_partition.iter().max().unwrap();
+        let min = *per_partition.iter().min().unwrap();
+        assert!(max - min >= slots - 1024, "{per_partition:?}");
+        assert!(max - min < 2 * slots, "{per_partition:?}");
+        // One array over the key range takes less than the 4 hash tables.
+        assert!(
+            build_mem_used < hash_mem_used,
+            "{build_mem_used} {hash_mem_used}"
+        );
+        Ok(())
+    }
+
+    /// Partitions executed one after another (no dynamic filter, so no
+    /// barrier) keep building their own maps.
+    #[tokio::test]
+    async fn sequential_partitions_do_not_share_array_map() -> Result<()> {
+        let keys = (0..4000).map(|i| i / 8 * 32 + i % 8).collect::<Vec<_>>();
+        let left = build_table(("a1", &keys), ("b1", &keys), ("c1", &keys));
+        let right = build_table(("a2", &keys), ("b2", &keys), ("c2", &keys));
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
+        )];
+        let (_, batches, metrics) = partitioned_join_collect(
+            left,
+            right,
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4000);
+        assert_eq!(
+            metrics
+                .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+                .map(|v| v.as_usize()),
+            Some(0)
+        );
         Ok(())
     }
 }

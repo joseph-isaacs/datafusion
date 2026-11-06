@@ -3,8 +3,11 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use arrow_schema::DataType;
+use datafusion_execution::memory_pool::MemoryReservation;
 use num_traits::AsPrimitive;
-use std::mem::size_of;
+use std::mem::{align_of, size_of};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::joins::chain::traverse_chain;
 use crate::joins::join_hash_map::ProbeOffset;
@@ -89,15 +92,65 @@ macro_rules! downcast_supported_integer {
 /// This correctly maps `-5` to index `0`, `0` to index `5`, etc.
 #[derive(Debug)]
 pub struct ArrayMap {
-    // data[probSideVal-offset] -> valIdxInBuildSide + 1; 0 for absent
-    data: Vec<u32>,
+    // data[probSideVal-offset] -> base + valIdxInBuildSide + 1; 0 for absent
+    slots: Arc<ArrayMapSlots>,
     // min val in buildSide
     offset: u64,
+    // Row ids in `slots` are `base + valIdxInBuildSide + 1`. `base` is 0 unless
+    // the slots are shared by the partitions of a hash partitioned build side,
+    // where each partition owns the row ids `base + 1..=base + num_rows`.
+    base: u32,
+    // Number of build-side rows of this map (its own partition)
+    num_rows: u32,
     // next[buildSideIdx] -> next matching valIdxInBuildSide + 1; 0 for end of chain.
     // If next is empty, it means there are no duplicate keys (no conflicts).
     // It uses the same chain-based conflict resolution as [`JoinHashMapType`].
     next: Vec<u32>,
     num_of_distinct_key: usize,
+}
+
+/// The `data` array of one or more [`ArrayMap`]s: one slot per key of the key
+/// range, holding a row id (`0` for absent).
+///
+/// A hash partitioned build side can share one [`ArrayMapSlots`] between all its
+/// partitions: every key is routed to exactly one partition, so the partitions
+/// fill disjoint slots, concurrently, and tell their own row ids apart by their
+/// `base`. Slots are atomics so that the partitions can fill them through a
+/// shared reference; `Relaxed` accesses compile to plain loads and stores.
+#[derive(Debug)]
+pub(crate) struct ArrayMapSlots {
+    data: Box<[AtomicU32]>,
+    /// Holds the memory of shared slots, which no single partition accounts
+    /// for; `None` for the slots of a single [`ArrayMap`].
+    reservation: Option<MemoryReservation>,
+}
+
+impl ArrayMapSlots {
+    /// Allocates `len` empty slots.
+    pub(crate) fn zeroed(len: usize, reservation: Option<MemoryReservation>) -> Self {
+        const {
+            assert!(align_of::<AtomicU32>() == align_of::<u32>());
+            assert!(size_of::<AtomicU32>() == size_of::<u32>());
+        }
+        // `vec![0; len]` asks the allocator for zeroed memory, which is only
+        // touched when it is first written.
+        let zeroed = vec![0u32; len].into_boxed_slice();
+        // SAFETY: `AtomicU32` has the same size and bit validity as `u32`, and
+        // (asserted above) the same alignment, so a `[u32]` allocation is a
+        // valid `[AtomicU32]` allocation of the same layout.
+        let data = unsafe { Box::from_raw(Box::into_raw(zeroed) as *mut [AtomicU32]) };
+        Self { data, reservation }
+    }
+
+    /// Memory of the slots in bytes.
+    pub(crate) fn size(&self) -> usize {
+        self.data.len() * size_of::<AtomicU32>()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.data.len()
+    }
 }
 
 impl ArrayMap {
@@ -166,8 +219,29 @@ impl ArrayMap {
             return internal_err!("ArrayMap key range is too large to be allocated.");
         }
         let size = (range + 1) as usize;
+        let slots = Arc::new(ArrayMapSlots::zeroed(size, None));
+        Self::try_new_in_slots(array, slots, min_val, 0)
+    }
 
-        let mut data: Vec<u32> = vec![0; size];
+    /// Creates a new [`ArrayMap`] over `slots`, which cover the keys from
+    /// `min_val` on, recording the row `i` of `array` as row id `base + i + 1`.
+    ///
+    /// `slots` may be shared with the [`ArrayMap`]s of other build partitions,
+    /// built concurrently: every partition must hold different keys, and own a
+    /// different range of row ids. A slot already holding a row id of another
+    /// partition is an error.
+    pub(crate) fn try_new_in_slots(
+        array: &ArrayRef,
+        slots: Arc<ArrayMapSlots>,
+        min_val: u64,
+        base: u32,
+    ) -> Result<Self> {
+        let Some(num_rows) = u32::try_from(array.len())
+            .ok()
+            .filter(|rows| rows.checked_add(base).is_some_and(|end| end < u32::MAX))
+        else {
+            return internal_err!("ArrayMap row ids do not fit in u32");
+        };
         let mut next: Vec<u32> = vec![];
         let mut num_of_distinct_key = 0;
 
@@ -176,15 +250,18 @@ impl ArrayMap {
                 fill_data,
                 array,
                 min_val,
-                &mut data,
+                &slots.data,
+                base,
                 &mut next,
                 &mut num_of_distinct_key
             )
         )?;
 
         Ok(Self {
-            data,
+            slots,
             offset: min_val,
+            base,
+            num_rows,
             next,
             num_of_distinct_key,
         })
@@ -193,7 +270,8 @@ impl ArrayMap {
     fn fill_data<T: ArrowNumericType>(
         array: &ArrayRef,
         offset_val: u64,
-        data: &mut [u32],
+        data: &[AtomicU32],
+        base: u32,
         next: &mut Vec<u32>,
         num_of_distinct_key: &mut usize,
     ) -> Result<()>
@@ -201,6 +279,7 @@ impl ArrayMap {
         T::Native: AsPrimitive<u64>,
     {
         let arr = array.as_primitive::<T>();
+        let num_rows = arr.len() as u32;
         // Iterate in reverse to maintain FIFO order when there are duplicate keys.
         for (i, val) in arr.iter().enumerate().rev() {
             if let Some(val) = val {
@@ -209,27 +288,61 @@ impl ArrayMap {
                     return internal_err!("failed build Array idx >= data.len()");
                 };
 
-                if data[idx] != 0 {
+                let slot = &data[idx];
+                let current = slot.load(Ordering::Relaxed);
+                if current != 0 {
+                    let Some(local) = Self::local_row_id(current, base, num_rows) else {
+                        return internal_err!(
+                            "ArrayMap slot of key {key} is shared by build partitions: \
+                             the build side is not partitioned by the join key"
+                        );
+                    };
                     if next.is_empty() {
                         *next = vec![0; array.len()]
                     }
-                    next[i] = data[idx]
+                    next[i] = local
                 } else {
                     *num_of_distinct_key += 1;
                 }
-                data[idx] = (i) as u32 + 1;
+                slot.store(base + i as u32 + 1, Ordering::Relaxed);
             }
         }
         Ok(())
+    }
+
+    /// Converts the row id held by a slot to a 1-based row index of the map
+    /// owning row ids `base + 1..=base + num_rows`, or `None` for an empty slot
+    /// or a row of another partition.
+    #[inline(always)]
+    fn local_row_id(row_id: u32, base: u32, num_rows: u32) -> Option<u32> {
+        let local = row_id.wrapping_sub(base);
+        // An empty slot (0) wraps to above `num_rows`, as `base + num_rows < u32::MAX`.
+        (local.wrapping_sub(1) < num_rows).then_some(local)
     }
 
     pub fn num_of_distinct_key(&self) -> usize {
         self.num_of_distinct_key
     }
 
-    /// Returns the memory usage of this [`ArrayMap`] in bytes.
+    /// Returns the memory usage of this [`ArrayMap`] in bytes. Shared slots
+    /// are accounted for by their own reservation and not included.
     pub fn size(&self) -> usize {
-        self.data.capacity() * size_of::<u32>() + self.next.capacity() * size_of::<u32>()
+        let slots = if self.is_shared() {
+            0
+        } else {
+            self.slots.size()
+        };
+        slots + self.next.capacity() * size_of::<u32>()
+    }
+
+    /// Whether the slots of this map are shared with other build partitions.
+    pub(crate) fn is_shared(&self) -> bool {
+        self.slots.reservation.is_some()
+    }
+
+    /// Whether `self` and `other` look keys up in the same slots.
+    pub(crate) fn shares_slots_with(&self, other: &ArrayMap) -> bool {
+        Arc::ptr_eq(&self.slots, &other.slots)
     }
 
     pub fn get_matched_indices_with_limit_offset(
@@ -262,13 +375,19 @@ impl ArrayMap {
     }
 
     /// Looks up `key` (a raw probe value cast to `u64`) in the build side,
-    /// returning the 1-based build-side slot if the key maps to a non-empty
-    /// bucket, or `None` otherwise.
+    /// returning the 1-based build-side row index if the key maps to a row of
+    /// this map, or `None` otherwise.
     #[inline]
-    fn get_value(&self, key: u64) -> Option<u32> {
-        let idx = Self::key_to_index(key, self.offset, self.data.len())?;
-        let value = self.data[idx];
-        (value != 0).then_some(value)
+    fn get_value(&self, data: &[AtomicU32], key: u64) -> Option<u32> {
+        let idx = Self::key_to_index(key, self.offset, data.len())?;
+        Self::local_row_id(data[idx].load(Ordering::Relaxed), self.base, self.num_rows)
+    }
+
+    /// Whether any map sharing these slots holds `key`.
+    #[inline]
+    fn contains_key(&self, data: &[AtomicU32], key: u64) -> bool {
+        Self::key_to_index(key, self.offset, data.len())
+            .is_some_and(|idx| data[idx].load(Ordering::Relaxed) != 0)
     }
 
     fn lookup_and_get_indices<T: ArrowNumericType>(
@@ -286,6 +405,7 @@ impl ArrayMap {
         build_indices.clear();
 
         let arr = array.as_primitive::<T>();
+        let data: &[AtomicU32] = &self.slots.data;
 
         let have_null = arr.null_count() > 0;
 
@@ -309,7 +429,7 @@ impl ArrayMap {
                 }
                 // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
                 let prob_val: u64 = unsafe { arr.value_unchecked(prob_idx) }.as_();
-                let Some(build_value) = self.get_value(prob_val) else {
+                let Some(build_value) = self.get_value(data, prob_val) else {
                     continue;
                 };
                 build_indices.push((build_value - 1) as u64);
@@ -355,7 +475,7 @@ impl ArrayMap {
 
                 // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
                 let prob_val: u64 = unsafe { arr.value_unchecked(prob_side_idx) }.as_();
-                let Some(build_idx) = self.get_value(prob_val) else {
+                let Some(build_idx) = self.get_value(data, prob_val) else {
                     continue;
                 };
 
@@ -375,6 +495,9 @@ impl ArrayMap {
         Ok(None)
     }
 
+    /// Whether each of `probe_side_keys` is a build-side key. For shared slots
+    /// this covers the keys of every partition sharing them, which is exact
+    /// for a filter over the whole probe side.
     pub fn contain_keys(&self, probe_side_keys: &[ArrayRef]) -> Result<BooleanArray> {
         if probe_side_keys.len() != 1 {
             return internal_err!(
@@ -401,13 +524,14 @@ impl ArrayMap {
         T::Native: AsPrimitive<u64>,
     {
         let arr = array.as_primitive::<T>();
+        let data: &[AtomicU32] = &self.slots.data;
         let buffer = BooleanBuffer::collect_bool(arr.len(), |i| {
             if arr.is_null(i) {
                 return false;
             }
             // SAFETY: i is within bounds [0, arr.len())
             let key: u64 = unsafe { arr.value_unchecked(i) }.as_();
-            self.get_value(key).is_some()
+            self.contains_key(data, key)
         });
         Ok(BooleanArray::new(buffer, None))
     }

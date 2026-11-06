@@ -19,6 +19,7 @@ use crate::joins::hash_join::not_in::NotIn;
 use crate::joins::hash_join::partitioned_hash_eval::{
     HashExpr, HashTableLookupExpr, PartitionRouter, SeededRandomState,
 };
+use crate::joins::hash_join::shared_array_map::SharedArrayMapBuild;
 use crate::joins::join_hash_map::{JoinHashMapType, JoinHashMapU32};
 use crate::joins::key_range_bitmap::{KeyRangeBitmap, KeyRangePart};
 use crate::repartition::RangeExpr;
@@ -174,6 +175,20 @@ fn create_membership_predicate(
     }
 }
 
+/// The shared [`ArrayMap`](crate::joins::array_map::ArrayMap) a partition
+/// pushes down, if any.
+fn shared_array_map(
+    pushdown: &PushdownStrategy,
+) -> Option<&crate::joins::array_map::ArrayMap> {
+    match pushdown {
+        PushdownStrategy::Map(map, _) => match map.as_ref() {
+            Map::ArrayMap(array_map) if array_map.is_shared() => Some(array_map),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Creates a bounds predicate from partition bounds.
 ///
 /// Returns `None` if no column bounds are available.
@@ -303,6 +318,10 @@ pub(crate) struct SharedBuildAccumulator {
     /// Largest merged IN list, in values, that partitioned filters keep as an IN
     /// list: `hash_join_inlist_pushdown_max_distinct_values`, as for a single build.
     in_list_max_values: usize,
+    /// Lets the build partitions of a hash partitioned join share one
+    /// `ArrayMap`. Only set alongside this accumulator: it makes every build
+    /// partition wait for the others, which the probe side already does here.
+    shared_array_map: Option<Arc<SharedArrayMapBuild>>,
 }
 
 /// Strategy for filter pushdown (decided at collection time)
@@ -475,7 +494,22 @@ impl SharedBuildAccumulator {
             not_in,
             in_list_max_size: optimizer.hash_join_inlist_pushdown_max_size,
             in_list_max_values: optimizer.hash_join_inlist_pushdown_max_distinct_values,
+            shared_array_map: None,
         }
+    }
+
+    /// Lets the build partitions share one `ArrayMap` through `shared_array_map`.
+    pub(crate) fn with_shared_array_map(
+        mut self,
+        shared_array_map: Option<Arc<SharedArrayMapBuild>>,
+    ) -> Self {
+        self.shared_array_map = shared_array_map;
+        self
+    }
+
+    /// The barrier deciding whether the build partitions share one `ArrayMap`.
+    pub(crate) fn shared_array_map(&self) -> Option<&Arc<SharedArrayMapBuild>> {
+        self.shared_array_map.as_ref()
     }
 
     /// Report build-side data from a partition
@@ -722,9 +756,11 @@ impl SharedBuildAccumulator {
                     real_partition_ids.push(partition_id);
                     keys_have_null |= partition_keys_have_null;
                     let mergeable = match &pushdown {
-                        PushdownStrategy::Map(map, _) => {
-                            matches!(map.as_ref(), Map::HashMap(_))
-                        }
+                        PushdownStrategy::Map(map, _) => match map.as_ref() {
+                            Map::HashMap(_) => true,
+                            // Shared slots hold the keys of every partition.
+                            Map::ArrayMap(array_map) => array_map.is_shared(),
+                        },
                         PushdownStrategy::InList(_) => true,
                         PushdownStrategy::Empty => false,
                     };
@@ -765,6 +801,20 @@ impl SharedBuildAccumulator {
                 }
             }
         }
+
+        // Shared `ArrayMap` slots merge only with the maps sharing them: one
+        // lookup in them covers every partition.
+        let members = members.filter(|members| {
+            let shared = members
+                .iter()
+                .find_map(|(_, pushdown, _)| shared_array_map(pushdown));
+            shared.is_none_or(|shared| {
+                members.iter().all(|(_, pushdown, _)| {
+                    shared_array_map(pushdown)
+                        .is_some_and(|map| map.shares_slots_with(shared))
+                })
+            })
+        });
 
         let all_partitions_canceled = has_canceled_unknown
             && real_partition_ids.is_empty()
@@ -900,6 +950,19 @@ impl SharedBuildAccumulator {
                 self.probe_schema.as_ref(),
             )?
             .expect("an IN list always has a membership predicate")
+        } else if let [(_, PushdownStrategy::Map(map, _), _), ..] = members
+            && matches!(map.as_ref(), Map::ArrayMap(_))
+        {
+            // Every member shares these slots (checked when collecting them), and
+            // they hold the keys of every partition: no routing needed.
+            Arc::new(HashTableLookupExpr::new(
+                self.on_right.clone(),
+                HASH_JOIN_SEED,
+                None,
+                vec![Some(Arc::clone(map))],
+                String::from("hash_lookup"),
+                self.merged_pruning_bitmap(members, merged_bounds.as_ref()),
+            )?)
         } else {
             // Each probe row is looked up in the table of the partition its key
             // routes to, so the partitions' tables are shared as they are: no
@@ -1100,6 +1163,7 @@ pub(super) fn make_partitioned_accumulator_for_test(
         not_in: None,
         in_list_max_size: 128 * 1024,
         in_list_max_values: 150,
+        shared_array_map: None,
     }
 }
 
@@ -1169,6 +1233,7 @@ mod tests {
             not_in: None,
             in_list_max_size: 128 * 1024,
             in_list_max_values: 150,
+            shared_array_map: None,
         }
     }
 
@@ -1813,6 +1878,7 @@ mod tests {
             }),
             in_list_max_size: 128 * 1024,
             in_list_max_values: 150,
+            shared_array_map: None,
         }
     }
 
@@ -2030,6 +2096,7 @@ mod tests {
                 }),
                 in_list_max_size: 128 * 1024,
                 in_list_max_values: 150,
+                shared_array_map: None,
             };
 
             let bounds = PartitionBounds::new(
