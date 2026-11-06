@@ -34,6 +34,27 @@ use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{exec_datafusion_err, exec_err};
 use futures::StreamExt;
 
+use arrow::array::RecordBatch;
+use arrow::buffer::ScalarBuffer;
+use arrow::datatypes::DataType;
+use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::{
+    FileGroup, FileScanConfig, FileScanConfigBuilder,
+};
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, Partitioning, PlanProperties, SendableRecordBatchStream,
+};
+use datafusion_common::ScalarValue;
+use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::TreeNodeRecursion;
+
 /// Run sort-merge joins over pre-sorted time-series Parquet.
 #[derive(Debug, Args, Clone)]
 #[command(verbatim_doc_comment)]
@@ -59,6 +80,14 @@ pub struct RunOpt {
     /// keeping their order) instead of the single-partition plan.
     #[arg(long = "parallel")]
     parallel: bool,
+
+    /// Split the single-partition sort-merge join into this many joins over
+    /// disjoint ranges of the first join key (cut from the files' min/max
+    /// statistics): each range scans only the files that overlap it, slices
+    /// its boundary batches, and joins on its own core. DataFusion has no
+    /// range `Partitioning` to plan this itself; the harness builds it.
+    #[arg(long = "range-partitions")]
+    range_partitions: Option<usize>,
 
     /// Directory holding (or receiving) the generated Parquet tables
     #[arg(short = 'p', long = "path", default_value = "data/smj_ts")]
@@ -242,23 +271,28 @@ impl RunOpt {
         if self.hash_join || self.parallel {
             return Ok(plan);
         }
-        plan.transform_up(|node| {
-            let Some(hj) = node.downcast_ref::<HashJoinExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let smj = SortMergeJoinExec::try_new(
-                Arc::clone(hj.left()),
-                Arc::clone(hj.right()),
-                hj.on().to_vec(),
-                hj.filter().cloned(),
-                *hj.join_type(),
-                vec![SortOptions::new(false, false); hj.on().len()],
-                hj.null_equality(),
-            )?
-            .with_projection(hj.projection.as_deref().map(<[usize]>::to_vec))?;
-            Ok(Transformed::yes(Arc::new(smj) as Arc<dyn ExecutionPlan>))
-        })
-        .data()
+        let plan = plan
+            .transform_up(|node| {
+                let Some(hj) = node.downcast_ref::<HashJoinExec>() else {
+                    return Ok(Transformed::no(node));
+                };
+                let smj = SortMergeJoinExec::try_new(
+                    Arc::clone(hj.left()),
+                    Arc::clone(hj.right()),
+                    hj.on().to_vec(),
+                    hj.filter().cloned(),
+                    *hj.join_type(),
+                    vec![SortOptions::new(false, false); hj.on().len()],
+                    hj.null_equality(),
+                )?
+                .with_projection(hj.projection.as_deref().map(<[usize]>::to_vec))?;
+                Ok(Transformed::yes(Arc::new(smj) as Arc<dyn ExecutionPlan>))
+            })
+            .data()?;
+        match self.range_partitions {
+            Some(n) if n > 1 => range_partition_joins(plan, n),
+            _ => Ok(plan),
+        }
     }
 
     async fn benchmark_query(
@@ -307,5 +341,231 @@ impl RunOpt {
             results.push(QueryResult { elapsed, row_count });
         }
         Ok(results)
+    }
+}
+
+/// Rewrites every sort-merge join over two ordered file scans into `n`
+/// joins over disjoint ranges of its first key, merged into one output
+/// partition (row order across ranges is not kept).
+fn range_partition_joins(
+    plan: Arc<dyn ExecutionPlan>,
+    n: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        let Some(smj) = node.downcast_ref::<SortMergeJoinExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let key = |e: &Arc<dyn PhysicalExpr>| {
+            e.downcast_ref::<Column>()
+                .map(Column::index)
+                .ok_or_else(|| exec_datafusion_err!("range split needs a column key"))
+        };
+        let (left_key, right_key) = (key(&smj.on()[0].0)?, key(&smj.on()[0].1)?);
+        let (left, right) = (scan_files(smj.left())?, scan_files(smj.right())?);
+        let (min, max) = left
+            .1
+            .iter()
+            .chain(&right.1)
+            .fold((i64::MAX, i64::MIN), |(lo, hi), (_, a, b)| {
+                (lo.min(*a), hi.max(*b))
+            });
+        let span = (max - min) as i128 + 1;
+        let bounds: Vec<i64> = (0..=n)
+            .map(|i| (min as i128 + span * i as i128 / n as i128) as i64)
+            .collect();
+        let split =
+            |(config, files): (&FileScanConfig, Vec<(PartitionedFile, i64, i64)>),
+             key: usize|
+             -> Result<Arc<dyn ExecutionPlan>> {
+                let groups = (0..n)
+                    .map(|i| {
+                        FileGroup::new(
+                            files
+                                .iter()
+                                .filter(|(_, lo, hi)| {
+                                    *hi >= bounds[i] && *lo < bounds[i + 1]
+                                })
+                                .map(|(f, ..)| f.clone())
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                let config = FileScanConfigBuilder::from(config.clone())
+                    .with_file_groups(groups)
+                    .build();
+                Ok(Arc::new(RangeSliceExec::new(
+                    DataSourceExec::from_data_source(config),
+                    key,
+                    bounds.clone(),
+                )))
+            };
+        let joined = SortMergeJoinExec::try_new(
+            split(left, left_key)?,
+            split(right, right_key)?,
+            smj.on().to_vec(),
+            smj.filter().clone(),
+            smj.join_type(),
+            smj.sort_options().to_vec(),
+            smj.null_equality(),
+        )?
+        .with_projection(smj.projection.as_deref().map(<[usize]>::to_vec))?;
+        Ok(Transformed::yes(
+            Arc::new(CoalescePartitionsExec::new(Arc::new(joined))) as _,
+        ))
+    })
+    .data()
+}
+
+/// A file with the min and max of its first column.
+type KeyedFile = (PartitionedFile, i64, i64);
+
+/// A join input's single-partition file scan, with each file's key range
+/// (the first table column, from the file statistics).
+fn scan_files(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<(&FileScanConfig, Vec<KeyedFile>)> {
+    let config = plan
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+        .ok_or_else(|| exec_datafusion_err!("range split needs file scan inputs"))?;
+    let bound = |p: &Precision<ScalarValue>| -> Result<i64> {
+        match p.get_value().map(|v| v.cast_to(&DataType::Int64)) {
+            Some(Ok(ScalarValue::Int64(Some(v)))) => Ok(v),
+            _ => exec_err!("range split needs key min/max statistics"),
+        }
+    };
+    let files = config
+        .file_groups
+        .iter()
+        .flat_map(|g| g.files())
+        .map(|f| {
+            let stats = f
+                .statistics
+                .as_ref()
+                .ok_or_else(|| exec_datafusion_err!("file without statistics"))?;
+            let col = &stats.column_statistics[0];
+            Ok((f.clone(), bound(&col.min_value)?, bound(&col.max_value)?))
+        })
+        .collect::<Result<_>>()?;
+    Ok((config, files))
+}
+
+/// Partition `i` of its input, restricted to the rows whose 64-bit key
+/// (ascending, null-free) lies in `bounds[i]..bounds[i + 1]` (the last
+/// range includes its upper bound). Stops reading once past the range.
+#[derive(Debug)]
+struct RangeSliceExec {
+    input: Arc<dyn ExecutionPlan>,
+    key: usize,
+    bounds: Vec<i64>,
+    properties: Arc<PlanProperties>,
+}
+
+impl RangeSliceExec {
+    fn new(input: Arc<dyn ExecutionPlan>, key: usize, bounds: Vec<i64>) -> Self {
+        let properties = PlanProperties::new(
+            input.properties().equivalence_properties().clone(),
+            Partitioning::UnknownPartitioning(bounds.len() - 1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            input,
+            key,
+            bounds,
+            properties: Arc::new(properties),
+        }
+    }
+}
+
+impl DisplayAs for RangeSliceExec {
+    fn fmt_as(
+        &self,
+        _: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(
+            f,
+            "RangeSliceExec: key={}, bounds={:?}",
+            self.key, self.bounds
+        )
+    }
+}
+
+impl ExecutionPlan for RangeSliceExec {
+    fn name(&self) -> &str {
+        "RangeSliceExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            self.key,
+            self.bounds.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let input = self.input.execute(partition, context)?;
+        let schema = input.schema();
+        let (lo, hi) = (self.bounds[partition], self.bounds[partition + 1]);
+        let last = partition + 2 == self.bounds.len();
+        let key = self.key;
+        let stream = input
+            .map(move |batch| {
+                let batch = batch?;
+                let data = batch.column(key).to_data();
+                let keys = ScalarBuffer::<i64>::new(
+                    data.buffers()[0].clone(),
+                    data.offset(),
+                    data.len(),
+                );
+                let start = keys.partition_point(|k| *k < lo);
+                let end = if last {
+                    keys.len()
+                } else {
+                    keys.partition_point(|k| *k < hi)
+                };
+                // `None`: the batch starts at or past the range's end.
+                Ok(if start == end && end < keys.len() {
+                    None
+                } else {
+                    Some(batch.slice(start, end - start))
+                })
+            })
+            .take_while(|b: &Result<Option<RecordBatch>>| {
+                futures::future::ready(!matches!(b, Ok(None)))
+            })
+            .filter_map(|b| {
+                futures::future::ready(match b {
+                    Ok(Some(b)) if b.num_rows() == 0 => None,
+                    Ok(Some(b)) => Some(Ok(b)),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                })
+            });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
