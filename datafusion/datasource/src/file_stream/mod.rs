@@ -1891,6 +1891,68 @@ mod tests {
         Ok(())
     }
 
+    /// A memory pool that cannot spare the deep lookahead keeps it at the
+    /// minimum depth, and the scan still returns every batch in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_opened_ahead_respect_the_memory_limit() -> Result<()> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        const LIMIT: usize = 4096;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(LIMIT));
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(
+            (0..4)
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect(),
+        )
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file: None,
+            }))
+            .with_metrics(&metrics_set)
+            .with_memory_pool(Arc::clone(&pool))
+            .build()?;
+        let mut batches = vec![];
+        let mut max_reserved = 0;
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+            max_reserved = max_reserved.max(pool.reserved());
+        }
+        let batch_size = batches[0].get_array_memory_size();
+        assert!(
+            super::scan_state::LOOKAHEAD_MAX_BATCHES * batch_size > LIMIT,
+            "the deep lookahead must not fit the pool for this test to mean anything"
+        );
+        assert!(
+            max_reserved
+                <= LIMIT.max(super::scan_state::LOOKAHEAD_MIN_BATCHES * batch_size),
+            "reserved {max_reserved} bytes, over the {LIMIT} byte pool"
+        );
+        assert_eq!(batches.len(), 4 * 7);
+        let values: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(values.is_sorted(), "batches out of order");
+        drop(stream);
+        Ok(())
+    }
+
     /// A scan with more than one partition reads no file ahead: its other
     /// partitions already keep the cores busy decoding.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

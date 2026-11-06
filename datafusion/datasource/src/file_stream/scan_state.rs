@@ -305,7 +305,7 @@ impl ScanState {
     /// when nothing else is queued or in flight (keeping the single
     /// outstanding I/O), so at most one file is ever opened ahead, and its
     /// stream is spawned with [`spawn_morsel`], which reads at most
-    /// [`LOOKAHEAD_BATCHES`] batches ahead. Files still start in order, so
+    /// [`LOOKAHEAD_BYTES`] ahead. Files still start in order, so
     /// the partition's batches keep their order.
     ///
     /// Not used with a row limit (extra files may never be needed), outside
@@ -326,10 +326,13 @@ impl ScanState {
             match planner.plan() {
                 Ok(Some(mut plan)) => {
                     let reservation = self.lookahead_reservation.as_ref();
+                    let morsels = plan.take_morsels();
+                    // The file's budget is shared by its morsels.
+                    let budget = LOOKAHEAD_BYTES / morsels.len().max(1);
                     self.ready_morsels.extend(
-                        plan.take_morsels()
+                        morsels
                             .into_iter()
-                            .map(|morsel| spawn_morsel(morsel, reservation)),
+                            .map(|morsel| spawn_morsel(morsel, reservation, budget)),
                     );
                     self.ready_planners.extend(plan.take_ready_planners());
                     self.pending_planner = plan.take_pending_planner();
@@ -357,10 +360,18 @@ impl ScanState {
     }
 }
 
-/// Batches a morsel opened ahead may decode before the scan reaches it. They
-/// are reserved in the stream's memory pool while they wait; the depth stays
-/// small all the same.
-const LOOKAHEAD_BATCHES: usize = 2;
+/// Bytes of decoded batches a file opened ahead may hold before the scan
+/// reaches it, shared by the file's morsels. A deep lookahead is what lets
+/// the next file decode alongside the current one: two batches ahead, its
+/// decoder stalls almost at once. On smj-ts (one ordered partition per join
+/// input), 16 MiB is 12% to 33% faster than two batches on 8 of 9 joins (the
+/// ninth unchanged), against 4 MiB (3% to 14%) and 8 MiB (13% to 28%); the
+/// pool peak is 51-69 MB, where the default hash join's is 52-646 MB.
+const LOOKAHEAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// The depth bounds, in batches, whatever the batch size.
+pub(super) const LOOKAHEAD_MIN_BATCHES: usize = 2;
+pub(super) const LOOKAHEAD_MAX_BATCHES: usize = 128;
 
 fn multi_thread_runtime() -> bool {
     tokio::runtime::Handle::try_current().is_ok_and(|handle| {
@@ -368,39 +379,51 @@ fn multi_thread_runtime() -> bool {
     })
 }
 
-/// Decodes `morsel` in its own task, up to [`LOOKAHEAD_BATCHES`] ahead of its
-/// consumer. Dropping the returned morsel, or its stream, stops the task.
+/// Decodes `morsel` in its own task, ahead of its consumer. Dropping the
+/// returned morsel, or its stream, stops the task.
 ///
-/// With a `reservation`, the lookahead's capacity (`LOOKAHEAD_BATCHES` times
-/// the first batch's size) is reserved from it while the morsel decodes, so
-/// the memory pool sees what the lookahead can hold; it is released when the
-/// morsel's stream is dropped.
+/// The task may run [`LOOKAHEAD_MIN_BATCHES`] batches ahead until the first
+/// batch is decoded; its size then sets the depth to [`LOOKAHEAD_BYTES`]
+/// worth of batches, within the depth bounds. With a `reservation`, that
+/// capacity is reserved from it with `try_grow`: if the pool cannot spare it,
+/// the depth stays at the minimum (whose capacity is still counted). It is
+/// released when the morsel's stream is dropped.
 fn spawn_morsel(
     morsel: Box<dyn Morsel>,
     reservation: Option<&MemoryReservation>,
+    budget: usize,
 ) -> Box<dyn Morsel> {
-    let (tx, rx) = tokio::sync::mpsc::channel(LOOKAHEAD_BATCHES);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // One permit per batch that may exist ahead of the consumer, held by the
+    // batch until the consumer takes it.
+    let slots = Arc::new(tokio::sync::Semaphore::new(LOOKAHEAD_MIN_BATCHES));
     let mut stream = morsel.into_stream();
     let held = reservation.map(|r| Arc::new(r.new_empty()));
     let producer = held.clone();
     let task = SpawnedTask::spawn(async move {
-        // Reserve a slot before decoding, so at most `LOOKAHEAD_BATCHES`
-        // batches exist ahead of the consumer.
-        while let Ok(permit) = tx.reserve().await {
-            match stream.next().await {
-                Some(item) => {
-                    // Reserve the buffer's whole capacity once, sized by the
-                    // first batch, rather than growing and shrinking the
-                    // pool (which may lock) for every batch.
-                    if let (Some(reservation), Ok(batch)) = (&producer, &item)
-                        && reservation.size() == 0
+        let mut sized = false;
+        while let Ok(slot) = Arc::clone(&slots).acquire_owned().await {
+            let Some(item) = stream.next().await else {
+                break;
+            };
+            if !sized && let Ok(batch) = &item {
+                sized = true;
+                let batch_size = batch.get_array_memory_size().max(1);
+                let depth = (budget / batch_size)
+                    .clamp(LOOKAHEAD_MIN_BATCHES, LOOKAHEAD_MAX_BATCHES);
+                let depth = match &producer {
+                    Some(reservation)
+                        if reservation.try_grow(depth * batch_size).is_err() =>
                     {
-                        reservation
-                            .grow(LOOKAHEAD_BATCHES * batch.get_array_memory_size());
+                        reservation.grow(LOOKAHEAD_MIN_BATCHES * batch_size);
+                        LOOKAHEAD_MIN_BATCHES
                     }
-                    permit.send(item)
-                }
-                None => break,
+                    _ => depth,
+                };
+                slots.add_permits(depth - LOOKAHEAD_MIN_BATCHES);
+            }
+            if tx.send((item, slot)).is_err() {
+                break;
             }
         }
     });
@@ -408,7 +431,9 @@ fn spawn_morsel(
     // covering batches still waiting in the channel after decoding ends.
     let stream =
         futures::stream::unfold((rx, task, held), |(mut rx, task, held)| async move {
-            rx.recv().await.map(|item| (item, (rx, task, held)))
+            rx.recv()
+                .await
+                .map(|(item, _slot)| (item, (rx, task, held)))
         });
     Box::new(SpawnedMorsel(stream.boxed()))
 }
