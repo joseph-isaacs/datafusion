@@ -46,7 +46,9 @@ pub mod execution_props {
 }
 
 pub use aggregate::groups_accumulator::{GroupsAccumulatorAdapter, NullState};
-pub use analysis::{AnalysisContext, ExprBoundaries, analyze};
+pub use analysis::{
+    AnalysisContext, ExprBoundaries, analyze, analyze_with_fallback_selectivity,
+};
 pub use datafusion_common::SplitPoint;
 pub use equivalence::{
     AcrossPartitions, ConstExpr, EquivalenceProperties, calculate_union,

@@ -148,11 +148,39 @@ impl ExprBoundaries {
 /// # Returns
 ///
 /// * `AnalysisContext` constructed by pruned boundaries and a selectivity value.
+///
+/// A column whose range the expression narrows but whose initial range has no
+/// known cardinality (for example a column without min/max statistics)
+/// contributes a factor of 1.0 to the selectivity. Use
+/// [`analyze_with_fallback_selectivity`] to choose that factor.
 pub fn analyze(
     expr: &Arc<dyn PhysicalExpr>,
     context: AnalysisContext,
     schema: &Schema,
 ) -> Result<AnalysisContext> {
+    analyze_with_fallback_selectivity(expr, context, schema, 1.0)
+}
+
+/// Like [`analyze`], but uses `fallback_selectivity` for the columns whose
+/// selectivity the boundaries cannot determine.
+///
+/// The selectivity of a column is the ratio of the cardinalities of its pruned
+/// and initial ranges. When the expression narrows a column whose initial range
+/// has no known cardinality, such as an unbounded range from a column without
+/// min/max statistics, that ratio is undefined: the boundaries say nothing
+/// about how many rows fall in the narrowed range. Those columns together
+/// contribute `fallback_selectivity` once, in the same way a filter applies its
+/// default selectivity to predicates interval analysis does not support.
+pub fn analyze_with_fallback_selectivity(
+    expr: &Arc<dyn PhysicalExpr>,
+    context: AnalysisContext,
+    schema: &Schema,
+    fallback_selectivity: f64,
+) -> Result<AnalysisContext> {
+    assert_or_internal_err!(
+        (0.0..=1.0).contains(&fallback_selectivity),
+        "Fallback selectivity is out of limit: {fallback_selectivity}",
+    );
     let initial_boundaries = &context.boundaries;
 
     if initial_boundaries
@@ -201,9 +229,12 @@ pub fn analyze(
         }
 
         match graph.update_ranges(&mut target_indices_and_boundaries, Interval::TRUE)? {
-            PropagationResult::Success => {
-                shrink_boundaries(&graph, target_boundaries, &target_expr_and_indices)
-            }
+            PropagationResult::Success => shrink_boundaries(
+                &graph,
+                target_boundaries,
+                &target_expr_and_indices,
+                fallback_selectivity,
+            ),
             PropagationResult::Infeasible => {
                 // If the propagation result is infeasible, set intervals to None
                 for bound in &mut target_boundaries {
@@ -226,6 +257,7 @@ fn shrink_boundaries(
     graph: &ExprIntervalGraph,
     mut target_boundaries: Vec<ExprBoundaries>,
     target_expr_and_indices: &[(Arc<dyn PhysicalExpr>, usize)],
+    fallback_selectivity: f64,
 ) -> Result<AnalysisContext> {
     let initial_boundaries = target_boundaries.clone();
     for (expr, i) in target_expr_and_indices {
@@ -238,7 +270,11 @@ fn shrink_boundaries(
         }
     }
 
-    let selectivity = calculate_selectivity(&target_boundaries, &initial_boundaries)?;
+    let selectivity = calculate_selectivity(
+        &target_boundaries,
+        &initial_boundaries,
+        fallback_selectivity,
+    )?;
 
     assert_or_internal_err!(
         (0.0..=1.0).contains(&selectivity),
@@ -289,9 +325,13 @@ fn singleton_selectivity(
 /// This function calculates the filter predicate's selectivity by comparing
 /// the initial and pruned column boundaries. Selectivity is defined as the
 /// ratio of rows in a table that satisfy the filter's predicate.
+///
+/// Columns that were narrowed from a range of unknown cardinality contribute
+/// `fallback_selectivity` once, however many there are.
 fn calculate_selectivity(
     target_boundaries: &[ExprBoundaries],
     initial_boundaries: &[ExprBoundaries],
+    fallback_selectivity: f64,
 ) -> Result<f64> {
     // Since the intervals are assumed uniform and the values
     // are not correlated, we need to multiply the selectivities
@@ -302,6 +342,7 @@ fn calculate_selectivity(
         ));
     }
     let mut acc: f64 = 1.0;
+    let mut narrowed_unknown_range = false;
     for (initial, target) in initial_boundaries.iter().zip(target_boundaries) {
         match (initial.interval.as_ref(), target.interval.as_ref()) {
             (Some(initial_interval), Some(target_interval)) => {
@@ -316,6 +357,12 @@ fn calculate_selectivity(
                     acc *= s;
                     continue;
                 }
+                if initial_interval.cardinality().is_none()
+                    && initial_interval != target_interval
+                {
+                    narrowed_unknown_range = true;
+                    continue;
+                }
                 acc *= cardinality_ratio(initial_interval, target_interval);
             }
             (None, Some(_)) => {
@@ -325,6 +372,9 @@ fn calculate_selectivity(
             }
             _ => return Ok(0.0),
         }
+    }
+    if narrowed_unknown_range {
+        acc *= fallback_selectivity;
     }
 
     Ok(acc)
@@ -344,7 +394,10 @@ mod tests {
 
     use crate::{AnalysisContext, create_physical_expr, expressions::Column};
 
-    use super::{ExprBoundaries, analyze, calculate_selectivity, singleton_selectivity};
+    use super::{
+        ExprBoundaries, analyze, analyze_with_fallback_selectivity,
+        calculate_selectivity, singleton_selectivity,
+    };
 
     fn make_field(name: &str, data_type: DataType) -> Field {
         let nullable = false;
@@ -555,13 +608,15 @@ mod tests {
         let selectivity = calculate_selectivity(
             std::slice::from_ref(&already_singleton),
             std::slice::from_ref(&already_singleton),
+            1.0,
         )
         .unwrap();
 
         let wide_initial = make_boundary(1, 100, 50);
         let same_singleton_target = make_boundary(7, 7, 50);
         let selectivity_new =
-            calculate_selectivity(&[same_singleton_target], &[wide_initial]).unwrap();
+            calculate_selectivity(&[same_singleton_target], &[wide_initial], 1.0)
+                .unwrap();
         assert!(
             (selectivity_new - 0.02).abs() < 1e-10,
             "expected selectivity 1/NDV = 0.02, got {selectivity_new}"
@@ -570,7 +625,8 @@ mod tests {
         let singleton_initial = make_boundary(7, 7, 50);
         let singleton_target = make_boundary(7, 7, 50);
         let selectivity_no_new_filter =
-            calculate_selectivity(&[singleton_target], &[singleton_initial]).unwrap();
+            calculate_selectivity(&[singleton_target], &[singleton_initial], 1.0)
+                .unwrap();
         assert!(
             (selectivity_no_new_filter - 1.0).abs() < 1e-10,
             "expected selectivity 1.0 when initial was already the same singleton, got {selectivity_no_new_filter}"
@@ -828,6 +884,71 @@ mod tests {
             Some(0.0),
             "selectivity should be 0.0 for an infeasible predicate, got {:?}",
             out.selectivity
+        );
+        Ok(())
+    }
+
+    /// A column without min/max statistics has an unbounded range, so the
+    /// ratio of its narrowed and initial cardinalities is undefined. Those
+    /// columns contribute the fallback selectivity, applied once; columns with
+    /// known ranges keep their cardinality ratio.
+    #[rstest::rstest]
+    // `a` has the range [1, 100]; `b` has no known range.
+    #[case::known_range(col("a").gt(lit(50_i64)), 0.5, 0.5)]
+    #[case::unknown_range(col("b").gt(lit(300_i64)), 1.0, 0.2)]
+    #[case::unknown_range_twice(col("b").gt(lit(300_i64)).and(col("b").lt(lit(400_i64))), 1.0, 0.2)]
+    #[case::known_and_unknown(col("a").gt(lit(50_i64)).and(col("b").gt(lit(300_i64))), 0.5, 0.1)]
+    fn test_analyze_fallback_selectivity_for_unknown_range(
+        #[case] predicate: Expr,
+        #[case] expected_default: f64,
+        #[case] expected_with_fallback: f64,
+    ) -> datafusion_common::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            make_field("a", DataType::Int64),
+            make_field("b", DataType::Int64),
+        ]));
+        let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
+        let boundaries = vec![
+            ExprBoundaries {
+                column: Column::new("a", 0),
+                interval: Some(Interval::make(Some(1_i64), Some(100_i64))?),
+                distinct_count: Precision::Absent,
+            },
+            ExprBoundaries {
+                column: Column::new("b", 1),
+                interval: Some(Interval::make_unbounded(&DataType::Int64)?),
+                distinct_count: Precision::Absent,
+            },
+        ];
+        let phys = create_physical_expr(
+            &predicate,
+            &df_schema,
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )?;
+
+        let selectivity = |fallback: Option<f64>| -> datafusion_common::Result<f64> {
+            let ctx = AnalysisContext::new(boundaries.clone());
+            let out = match fallback {
+                Some(fallback) => analyze_with_fallback_selectivity(
+                    &phys,
+                    ctx,
+                    df_schema.as_ref(),
+                    fallback,
+                )?,
+                None => analyze(&phys, ctx, df_schema.as_ref())?,
+            };
+            Ok(out.selectivity.unwrap())
+        };
+        let default = selectivity(None)?;
+        let with_fallback = selectivity(Some(0.2))?;
+        assert!(
+            (default - expected_default).abs() < 1e-10,
+            "expected {expected_default} from analyze, got {default}"
+        );
+        assert!(
+            (with_fallback - expected_with_fallback).abs() < 1e-10,
+            "expected {expected_with_fallback} with fallback 0.2, got {with_fallback}"
         );
         Ok(())
     }

@@ -56,8 +56,8 @@ use datafusion_physical_expr::expressions::{
 use datafusion_physical_expr::intervals::utils::check_statistics_support;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
-    AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr, analyze,
-    conjunction, split_conjunction,
+    AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr,
+    analyze_with_fallback_selectivity, conjunction, split_conjunction,
 };
 
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
@@ -394,7 +394,15 @@ impl FilterExec {
                     schema,
                     &input_stats.column_statistics,
                 )?;
-                let analysis_ctx = analyze(predicate, input_analysis_ctx, schema)?;
+                // Narrowing a column of unknown range (e.g. an aggregate
+                // result without min/max statistics) says nothing about how
+                // many rows remain, so such columns use the default selectivity.
+                let analysis_ctx = analyze_with_fallback_selectivity(
+                    predicate,
+                    input_analysis_ctx,
+                    schema,
+                    default_selectivity as f64 / 100.0,
+                )?;
                 let selectivity = analysis_ctx.selectivity.unwrap_or(1.0);
                 let filtered_num_rows =
                     input_num_rows.with_estimated_selectivity(selectivity);
@@ -2271,6 +2279,79 @@ mod tests {
                 ..Default::default()
             }]
         );
+
+        Ok(())
+    }
+
+    /// A comparison on a column without min/max statistics, such as
+    /// `HAVING sum(x) > 300` on an aggregate result, narrows an unbounded
+    /// range, which says nothing about how many rows survive. It must use the
+    /// default selectivity rather than keep every row.
+    #[test]
+    fn test_filter_statistics_unknown_range_uses_default_selectivity() -> Result<()> {
+        let cases = [
+            (
+                DataType::Decimal128(38, 2),
+                ScalarValue::Decimal128(Some(30000), 38, 2),
+            ),
+            (DataType::Int64, ScalarValue::Int64(Some(300))),
+        ];
+        for (data_type, threshold) in cases {
+            // Table:
+            //      a: Int64, min=1, max=1000
+            //      b: no min/max
+            let schema = Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", data_type.clone(), true),
+            ]);
+            let input = Arc::new(StatisticsExec::new(
+                Statistics {
+                    num_rows: Precision::Inexact(1000),
+                    total_byte_size: Precision::Inexact(32000),
+                    column_statistics: vec![
+                        ColumnStatistics {
+                            min_value: Precision::Inexact(ScalarValue::Int64(Some(1))),
+                            max_value: Precision::Inexact(ScalarValue::Int64(Some(1000))),
+                            ..Default::default()
+                        },
+                        ColumnStatistics::new_unknown(),
+                    ],
+                },
+                schema.clone(),
+            ));
+
+            // WHERE b > 300
+            let predicate = binary(
+                col("b", &schema)?,
+                Operator::Gt,
+                lit(threshold.clone()),
+                &schema,
+            )?;
+            let filter: Arc<dyn ExecutionPlan> =
+                Arc::new(FilterExec::try_new(predicate, Arc::clone(&input) as _)?);
+            let statistics = StatisticsContext::new()
+                .compute(filter.as_ref(), &StatisticsArgs::new())?;
+            assert_eq!(statistics.num_rows, Precision::Inexact(200), "{data_type}");
+            assert_eq!(
+                statistics.total_byte_size,
+                Precision::Inexact(6400),
+                "{data_type}"
+            );
+
+            // WHERE a <= 500 AND b > 300: the known range of `a` keeps half the
+            // rows and the default selectivity applies to `b`.
+            let predicate = binary(
+                binary(col("a", &schema)?, Operator::LtEq, lit(500i64), &schema)?,
+                Operator::And,
+                binary(col("b", &schema)?, Operator::Gt, lit(threshold), &schema)?,
+                &schema,
+            )?;
+            let filter: Arc<dyn ExecutionPlan> =
+                Arc::new(FilterExec::try_new(predicate, input)?);
+            let statistics = StatisticsContext::new()
+                .compute(filter.as_ref(), &StatisticsArgs::new())?;
+            assert_eq!(statistics.num_rows, Precision::Inexact(100), "{data_type}");
+        }
 
         Ok(())
     }
