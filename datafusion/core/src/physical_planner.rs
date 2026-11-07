@@ -1874,7 +1874,7 @@ impl DefaultPhysicalPlanner {
                 {
                     // Use SortMergeJoin if hash join is not preferred
                     let join_on_len = join_on.len();
-                    Arc::new(SortMergeJoinExec::try_new(
+                    let join = SortMergeJoinExec::try_new(
                         physical_left,
                         physical_right,
                         join_on,
@@ -1882,7 +1882,18 @@ impl DefaultPhysicalPlanner {
                         *join_type,
                         vec![SortOptions::default(); join_on_len],
                         *null_equality,
-                    )?)
+                    )?;
+                    let ranges = session
+                        .config()
+                        .options()
+                        .optimizer
+                        .range_split_sort_merge_join;
+                    match crate::datasource::range_split_join::try_range_split(
+                        &join, ranges,
+                    )? {
+                        Some(split) => split,
+                        None => Arc::new(join),
+                    }
                 } else {
                     // Null-aware joins need global probe-side state, so keep
                     // them in CollectLeft mode.

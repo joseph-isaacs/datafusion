@@ -1,0 +1,313 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+##########
+## Sort-merge joins split by ranges of the first join key
+## (datafusion.optimizer.range_split_sort_merge_join)
+##########
+
+statement ok
+set datafusion.optimizer.prefer_hash_join = false;
+
+statement ok
+set datafusion.execution.batch_size = 3;
+
+# Left: keys 0..40 in four sorted files, with duplicate keys.
+statement ok
+COPY (SELECT value / 2 AS k, value AS v FROM range(0, 20) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/l/0.parquet';
+
+statement ok
+COPY (SELECT value / 2 AS k, value AS v FROM range(20, 40) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/l/1.parquet';
+
+statement ok
+COPY (SELECT value / 2 AS k, value AS v FROM range(40, 60) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/l/2.parquet';
+
+statement ok
+COPY (SELECT value / 2 AS k, value AS v FROM range(60, 80) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/l/3.parquet';
+
+# Right: every third key from 5 to 59, in two sorted files.
+statement ok
+COPY (SELECT value * 3 + 5 AS k, value AS w FROM range(0, 9) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/r/0.parquet';
+
+statement ok
+COPY (SELECT value * 3 + 5 AS k, value AS w FROM range(9, 19) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/r/1.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE l (k BIGINT NOT NULL, v BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/l/' WITH ORDER (k ASC NULLS LAST);
+
+statement ok
+CREATE EXTERNAL TABLE r (k BIGINT NOT NULL, w BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/r/' WITH ORDER (k ASC NULLS LAST);
+
+# Reference results, without the split.
+statement ok
+set datafusion.optimizer.range_split_sort_merge_join = 0;
+
+query IIII
+SELECT count(*), sum(l.v), sum(r.w), count(DISTINCT l.k) FROM l JOIN r ON l.k = r.k
+----
+24 1044 132 12
+
+query IIII
+SELECT count(*), sum(l.v), sum(r.w), count(r.k) FROM l LEFT JOIN r ON l.k = r.k
+----
+80 3160 132 24
+
+query IIII
+SELECT count(*), sum(l.v), sum(r.w), count(l.k) FROM l RIGHT JOIN r ON l.k = r.k
+----
+31 1044 237 24
+
+query IIIII
+SELECT count(*), sum(l.v), sum(r.w), count(l.k), count(r.k) FROM l FULL JOIN r ON l.k = r.k
+----
+87 3160 237 80 31
+
+query III
+SELECT count(*), sum(l.v), sum(r.w) FROM l JOIN r ON l.k = r.k AND l.v % 2 = 0
+----
+12 516 66
+
+query II
+SELECT count(*), sum(l.v) FROM l WHERE EXISTS (SELECT 1 FROM r WHERE r.k = l.k)
+----
+24 1044
+
+query II
+SELECT count(*), sum(l.v) FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k)
+----
+56 2116
+
+query IIII
+SELECT count(*), sum(l.v), sum(r.w), count(r.k) FROM l LEFT JOIN r ON l.k = r.k AND r.w >= l.v / 8
+----
+80 3160 130 20
+
+# The same joins split into four key ranges give the same results.
+statement ok
+set datafusion.optimizer.range_split_sort_merge_join = 4;
+
+query TT
+EXPLAIN SELECT l.v, r.w FROM l JOIN r ON l.k = r.k
+----
+logical_plan
+01)Projection: l.v, r.w
+02)--Inner Join: l.k = r.k
+03)----TableScan: l projection=[k, v]
+04)----TableScan: r projection=[k, w]
+physical_plan
+01)ProjectionExec: expr=[v@1 as v, w@3 as w]
+02)--CooperativeExec
+03)----RangeSplitJoinExec: ranges=4, bounds=[0, 10, 20, 30, 60], join=SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)]
+
+query IIII
+SELECT count(*), sum(l.v), sum(r.w), count(DISTINCT l.k) FROM l JOIN r ON l.k = r.k
+----
+24 1044 132 12
+
+query IIII
+SELECT count(*), sum(l.v), sum(r.w), count(r.k) FROM l LEFT JOIN r ON l.k = r.k
+----
+80 3160 132 24
+
+query IIII
+SELECT count(*), sum(l.v), sum(r.w), count(l.k) FROM l RIGHT JOIN r ON l.k = r.k
+----
+31 1044 237 24
+
+query IIIII
+SELECT count(*), sum(l.v), sum(r.w), count(l.k), count(r.k) FROM l FULL JOIN r ON l.k = r.k
+----
+87 3160 237 80 31
+
+query III
+SELECT count(*), sum(l.v), sum(r.w) FROM l JOIN r ON l.k = r.k AND l.v % 2 = 0
+----
+12 516 66
+
+query II
+SELECT count(*), sum(l.v) FROM l WHERE EXISTS (SELECT 1 FROM r WHERE r.k = l.k)
+----
+24 1044
+
+query II
+SELECT count(*), sum(l.v) FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k)
+----
+56 2116
+
+query IIII
+SELECT count(*), sum(l.v), sum(r.w), count(r.k) FROM l LEFT JOIN r ON l.k = r.k AND r.w >= l.v / 8
+----
+80 3160 130 20
+
+# Two join keys, files sorted on the first only: each range joins on the
+# first key and filters on the second. Duplicate first keys carry
+# different second keys, so pairing on the first alone would be wrong.
+statement ok
+COPY (SELECT value / 3 AS k, (value * 7) % 3 AS g, value AS v FROM range(0, 30) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/l2/0.parquet';
+
+statement ok
+COPY (SELECT value / 3 AS k, (value * 7) % 3 AS g, value AS v FROM range(30, 60) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/l2/1.parquet';
+
+statement ok
+COPY (SELECT value / 2 AS k, value % 2 AS g, value AS w FROM range(0, 40) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/r2/0.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE l2 (k BIGINT NOT NULL, g BIGINT, v BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/l2/' WITH ORDER (k ASC NULLS LAST);
+
+statement ok
+CREATE EXTERNAL TABLE r2 (k BIGINT NOT NULL, g BIGINT, w BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/r2/' WITH ORDER (k ASC NULLS LAST);
+
+query TT
+EXPLAIN SELECT l2.v, r2.w FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+logical_plan
+01)Projection: l2.v, r2.w
+02)--Inner Join: l2.k = r2.k, l2.g = r2.g
+03)----TableScan: l2 projection=[k, g, v]
+04)----TableScan: r2 projection=[k, g, w]
+physical_plan
+01)ProjectionExec: expr=[v@2 as v, w@5 as w]
+02)--CooperativeExec
+03)----RangeSplitJoinExec: ranges=2, bounds=[0, 10, 20], join=SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)], filter=__range_split_key_0@0 = __range_split_key_1@1
+
+statement ok
+set datafusion.optimizer.range_split_sort_merge_join = 0;
+
+query IIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(DISTINCT l2.k) FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+40 1160 780 20
+
+query IIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(r2.k) FROM l2 LEFT JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+60 1770 780 40
+
+query IIIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(l2.k), count(r2.k) FROM l2 FULL JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+60 1770 780 60 40
+
+query III
+SELECT count(*), sum(l2.v), sum(r2.w) FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g AND r2.w > l2.v / 3
+----
+39 1160 780
+
+statement ok
+set datafusion.optimizer.range_split_sort_merge_join = 4;
+
+query IIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(DISTINCT l2.k) FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+40 1160 780 20
+
+query IIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(r2.k) FROM l2 LEFT JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+60 1770 780 40
+
+query IIIII
+SELECT count(*), sum(l2.v), sum(r2.w), count(l2.k), count(r2.k) FROM l2 FULL JOIN r2 ON l2.k = r2.k AND l2.g = r2.g
+----
+60 1770 780 60 40
+
+query III
+SELECT count(*), sum(l2.v), sum(r2.w) FROM l2 JOIN r2 ON l2.k = r2.k AND l2.g = r2.g AND r2.w > l2.v / 3
+----
+39 1160 780
+
+statement ok
+DROP TABLE l2;
+
+statement ok
+DROP TABLE r2;
+
+# Files whose key ranges overlap cannot be split: a plain merge join.
+statement ok
+COPY (SELECT value AS k, value AS w FROM range(0, 30) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/o/0.parquet';
+
+statement ok
+COPY (SELECT value AS k, value AS w FROM range(20, 50) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/o/1.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE o (k BIGINT NOT NULL, w BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/o/' WITH ORDER (k ASC NULLS LAST);
+
+query TT
+EXPLAIN SELECT l.v, o.w FROM l JOIN o ON l.k = o.k
+----
+logical_plan
+01)Projection: l.v, o.w
+02)--Inner Join: l.k = o.k
+03)----TableScan: l projection=[k, v]
+04)----TableScan: o projection=[k, w]
+physical_plan
+01)SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)], projection=[v@1, w@3]
+02)--SortExec: expr=[k@0 ASC], preserve_partitioning=[true]
+03)----RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=4
+04)------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/l/0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/l/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/l/2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/l/3.parquet]]}, projection=[k, v], output_ordering=[k@0 ASC NULLS LAST], file_type=parquet
+05)--SortExec: expr=[k@0 ASC], preserve_partitioning=[true]
+06)----RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=4
+07)------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/o/0.parquet:0..438], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/o/1.parquet:0..443], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/o/1.parquet:443..887], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/o/0.parquet:438..877]]}, projection=[k, w], output_ordering=[k@0 ASC NULLS LAST], file_type=parquet
+
+query I
+SELECT count(*) FROM l JOIN o ON l.k = o.k
+----
+100
+
+# A key column with nulls cannot be split either.
+statement ok
+COPY (SELECT CASE WHEN value = 0 THEN NULL ELSE value END AS k, value AS w FROM range(0, 10) ORDER BY k NULLS LAST)
+TO 'test_files/scratch/range_split_sort_merge_join/n/0.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE n (k BIGINT, w BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/n/' WITH ORDER (k ASC NULLS LAST);
+
+query TT
+EXPLAIN SELECT l.v, n.w FROM l FULL JOIN n ON l.k = n.k
+----
+logical_plan
+01)Projection: l.v, n.w
+02)--Full Join: l.k = n.k
+03)----TableScan: l projection=[k, v]
+04)----TableScan: n projection=[k, w]
+physical_plan
+01)SortMergeJoinExec: join_type=Full, on=[(k@0, k@0)], projection=[v@1, w@3]
+02)--SortExec: expr=[k@0 ASC], preserve_partitioning=[true]
+03)----RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=4
+04)------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/l/0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/l/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/l/2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/l/3.parquet]]}, projection=[k, v], output_ordering=[k@0 ASC NULLS LAST], file_type=parquet
+05)--SortExec: expr=[k@0 ASC], preserve_partitioning=[true]
+06)----RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=1
+07)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/n/0.parquet]]}, projection=[k, w], file_type=parquet, sort_order_for_reorder=[k@0 ASC]
+
+query III
+SELECT count(*), count(l.k), count(n.k) FROM l FULL JOIN n ON l.k = n.k
+----
+81 80 18
+
+statement ok
+DROP TABLE l;
+
+statement ok
+DROP TABLE r;
+
+statement ok
+DROP TABLE o;
+
+statement ok
+DROP TABLE n;
+
+statement ok
+RESET datafusion.optimizer.range_split_sort_merge_join;
+
+statement ok
+RESET datafusion.optimizer.prefer_hash_join;
+
+statement ok
+RESET datafusion.execution.batch_size;

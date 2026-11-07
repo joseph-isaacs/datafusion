@@ -32,8 +32,8 @@ use crate::{
     joins::sort_merge_join::materializing_stream::JoinedRecordBatches,
 };
 use arrow::array::{
-    BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray,
-    Int32Array, RecordBatch, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray,
+    Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
 };
 use arrow::compute::{BatchCoalescer, SortOptions, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -4055,6 +4055,7 @@ fn build_joined_record_batches() -> Result<JoinedRecordBatches> {
     let mut batches = JoinedRecordBatches {
         joined_batches: BatchCoalescer::new(Arc::clone(&schema), 8192),
         filter_metadata: crate::joins::sort_merge_join::filter::FilterMetadata::new(),
+        projection: None,
     };
 
     // Insert already prejoined non-filtered rows
@@ -5316,8 +5317,8 @@ async fn join_key_type_batch_boundaries(
     #[values(1, 2)] input_batch_size: usize,
 ) -> Result<()> {
     // Single-digit keys so Utf8 dictionary values sort like the integers.
-    let keys = |unmatched_key| -> Result<arrow::array::ArrayRef> {
-        let keys = arrow::array::Int64Array::from(vec![
+    let keys = |unmatched_key| -> Result<ArrayRef> {
+        let keys = Int64Array::from(vec![
             None,
             Some(1),
             Some(2),
@@ -5350,15 +5351,15 @@ async fn join_key_type_batch_boundaries(
 /// batches. Row 0 must be null, row 4 must differ between the sides, and all
 /// remaining rows must match.
 async fn assert_key_batch_boundaries(
-    left_keys: arrow::array::ArrayRef,
-    right_keys: arrow::array::ArrayRef,
+    left_keys: ArrayRef,
+    right_keys: ArrayRef,
     join_type: JoinType,
     null_equality: NullEquality,
     descending: bool,
     input_batch_size: usize,
 ) -> Result<()> {
     let key_type = left_keys.data_type().clone();
-    let input = |mut keys: arrow::array::ArrayRef| -> Result<Arc<dyn ExecutionPlan>> {
+    let input = |mut keys: ArrayRef| -> Result<Arc<dyn ExecutionPlan>> {
         let mut ids: Vec<i32> = (0..keys.len() as i32).collect();
         if descending {
             ids.reverse();
@@ -5371,10 +5372,7 @@ async fn assert_key_batch_boundaries(
             )?;
         }
         let batch = RecordBatch::try_from_iter(vec![
-            (
-                "id",
-                Arc::new(Int32Array::from(ids)) as arrow::array::ArrayRef,
-            ),
+            ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
             ("key", keys),
         ])?;
         Ok(build_table_from_batches(
@@ -5899,6 +5897,7 @@ fn materializing_join_time_test_join(
         reservation,
         spill_manager,
         runtime_env,
+        None,
     )
     .unwrap();
     (stream, metrics)
@@ -8028,5 +8027,266 @@ async fn left_join_with_partial_filter_preserves_streamed_order() -> Result<()> 
         "LEFT JOIN output must stay ordered on the streamed side, \
          with every surviving match present exactly once"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_empty_streamed_side_never_polls_buffered_side_multi_thread() -> Result<()> {
+    // On a multi-threaded runtime the join reads its inputs ahead in their own
+    // tasks; the buffered side's read-ahead must still wait for a streamed row.
+    for join_type in [Inner, Left, LeftSemi, LeftAnti, LeftMark] {
+        let (left, right) = empty_left_and_panicking_right();
+        let on = on_b1(&left, &right)?;
+        let (_, batches) = join_collect(left, right, on, join_type).await?;
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            0,
+            "{join_type:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A sorted `(key, payload)` table split into batches of `batch_rows` rows.
+fn sorted_key_table(
+    key_name: &str,
+    payload_name: &str,
+    keys: &[i64],
+    batch_rows: usize,
+    utf8_keys: bool,
+) -> Arc<dyn ExecutionPlan> {
+    let key_type = if utf8_keys {
+        DataType::Utf8
+    } else {
+        DataType::Int64
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(key_name, key_type, false),
+        Field::new(payload_name, DataType::Int64, false),
+    ]));
+    let batches = keys
+        .iter()
+        .enumerate()
+        .chunks(batch_rows)
+        .into_iter()
+        .map(|chunk| {
+            let (payload, keys): (Vec<i64>, Vec<i64>) =
+                chunk.map(|(i, k)| (i as i64, *k)).unzip();
+            let keys: ArrayRef = if utf8_keys {
+                // Zero-padded, so the strings sort like the numbers.
+                Arc::new(StringArray::from_iter_values(
+                    keys.iter().map(|k| format!("{k:012}")),
+                ))
+            } else {
+                Arc::new(Int64Array::from(keys))
+            };
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![keys, Arc::new(Int64Array::from(payload))],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    TestMemoryExec::try_new_exec(&[batches], schema, None).unwrap()
+}
+
+/// Sort-merge joins over time-series-shaped keys, checked against a hash
+/// join. The shapes drive the merge loop through runs of unmatched rows on
+/// either side (which it gallops over), dense one-to-one runs (which it pairs
+/// in bulk), duplicate keys, and runs that cross input-batch and output-batch
+/// boundaries; the multi-threaded runtime also runs the inputs' read-ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_time_series_shapes_match_hash_join() -> Result<()> {
+    let n = 600i64;
+    // (left keys, right keys)
+    let shapes: Vec<(&str, Vec<i64>, Vec<i64>)> = vec![
+        ("dense 1:1", (0..n).collect(), (0..n).collect()),
+        (
+            "left every 10th",
+            (0..n / 10).map(|i| i * 10).collect(),
+            (0..n).collect(),
+        ),
+        (
+            "right every 10th",
+            (0..n).collect(),
+            (0..n / 10).map(|i| i * 10).collect(),
+        ),
+        (
+            "left 3:1 dups",
+            (0..n).map(|i| (i / 3) * 7).collect(),
+            (0..n).collect(),
+        ),
+        (
+            "gapped overlap",
+            (0..n).filter(|i| i % 50 < 30).collect(),
+            (0..n).filter(|i| i % 70 >= 20).map(|i| i + 5).collect(),
+        ),
+        ("disjoint", (0..n / 2).collect(), (n..n + n / 2).collect()),
+        (
+            "dense runs with breaks",
+            (0..n).filter(|i| i % 97 != 0).collect(),
+            (0..n).filter(|i| i % 89 != 0).collect(),
+        ),
+    ];
+    let join_types = [
+        Inner, Left, Right, Full, LeftSemi, LeftAnti, RightSemi, RightAnti, LeftMark,
+    ];
+    for (shape, left_keys, right_keys) in &shapes {
+        // Descending keys run the same merge with every comparison reversed.
+        for (utf8_keys, descending) in [(false, false), (true, false), (false, true)] {
+            for (input_rows, batch_size) in
+                [(1, 3), (7, 5), (64, 2), (97, 64), (1000, 8192)]
+            {
+                let table = |keys: &[i64], k: &str, p: &str| {
+                    let mut keys = keys.to_vec();
+                    if descending {
+                        keys.reverse();
+                    }
+                    sorted_key_table(k, p, &keys, input_rows, utf8_keys)
+                };
+                let left = table(left_keys, "k1", "p1");
+                let right = table(right_keys, "k2", "p2");
+                let on: JoinOn = vec![(
+                    Arc::new(Column::new_with_schema("k1", &left.schema())?) as _,
+                    Arc::new(Column::new_with_schema("k2", &right.schema())?) as _,
+                )];
+                // `p1 % 3 <> p2 % 3`: drops some matches, keeping their rows.
+                let filter = JoinFilter::new(
+                    Arc::new(BinaryExpr::new(
+                        Arc::new(BinaryExpr::new(
+                            Arc::new(Column::new("p1", 0)),
+                            Operator::Modulo,
+                            Arc::new(Literal::new(ScalarValue::Int64(Some(3)))),
+                        )),
+                        Operator::NotEq,
+                        Arc::new(BinaryExpr::new(
+                            Arc::new(Column::new("p2", 1)),
+                            Operator::Modulo,
+                            Arc::new(Literal::new(ScalarValue::Int64(Some(3)))),
+                        )),
+                    )),
+                    vec![
+                        ColumnIndex {
+                            index: 1,
+                            side: JoinSide::Left,
+                        },
+                        ColumnIndex {
+                            index: 1,
+                            side: JoinSide::Right,
+                        },
+                    ],
+                    Arc::new(Schema::new(vec![
+                        Field::new("p1", DataType::Int64, false),
+                        Field::new("p2", DataType::Int64, false),
+                    ])),
+                );
+                for join_type in join_types {
+                    for filter in [None, Some(filter.clone())] {
+                        let has_filter = filter.is_some();
+                        let task_ctx =
+                            Arc::new(TaskContext::default().with_session_config(
+                                SessionConfig::default().with_batch_size(batch_size),
+                            ));
+                        let collect_sorted = |plan: Arc<dyn ExecutionPlan>| {
+                            let task_ctx = Arc::clone(&task_ctx);
+                            async move {
+                                let schema = plan.schema();
+                                let batches =
+                                    common::collect(plan.execute(0, task_ctx)?).await?;
+                                let rows: usize =
+                                    batches.iter().map(|b| b.num_rows()).sum();
+                                let sorted = if rows == 0 {
+                                    RecordBatch::new_empty(schema)
+                                } else {
+                                    prepare_record_batches_for_cmp(batches)
+                                };
+                                Ok::<_, DataFusionError>(sorted)
+                            }
+                        };
+                        let expected = collect_sorted(Arc::new(HashJoinExec::try_new(
+                            Arc::clone(&left),
+                            Arc::clone(&right),
+                            on.clone(),
+                            filter.clone(),
+                            &join_type,
+                            None,
+                            PartitionMode::Partitioned,
+                            NullEquality::NullEqualsNothing,
+                            false,
+                        )?))
+                        .await?;
+                        let actual =
+                            collect_sorted(Arc::new(SortMergeJoinExec::try_new(
+                                Arc::clone(&left),
+                                Arc::clone(&right),
+                                on.clone(),
+                                filter,
+                                join_type,
+                                vec![SortOptions {
+                                    descending,
+                                    nulls_first: true,
+                                }],
+                                NullEquality::NullEqualsNothing,
+                            )?))
+                            .await?;
+                        assert_eq!(
+                            actual, expected,
+                            "{shape}, {join_type:?}, filter={has_filter}, \
+                             utf8={utf8_keys}, descending={descending}, \
+                             input_rows={input_rows}, batch_size={batch_size}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// On a multi-threaded runtime `prefetch` reads ahead in its own task. The
+/// batches held there are counted in the pool, under the given reservation,
+/// released as the join takes them, and released when it drops the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_ahead_batches_are_reserved_and_released() -> Result<()> {
+    let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+    let reservation = MemoryConsumer::new("test").register(&pool);
+    let keys: Vec<i64> = (0..6400).collect();
+    let input = sorted_key_table("k", "p", &keys, 100, false);
+    let batch_size = input
+        .execute(0, Arc::new(TaskContext::default()))?
+        .next()
+        .await
+        .unwrap()?
+        .get_array_memory_size();
+    let mut stream = input.execute(0, Arc::new(TaskContext::default()))?;
+    super::prefetch(&mut stream, &reservation);
+
+    let wait_for = |want: fn(usize, usize) -> bool| {
+        let pool = Arc::clone(&pool);
+        async move {
+            for _ in 0..200 {
+                if want(pool.reserved(), batch_size) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        }
+    };
+    // Before anything is taken the read-ahead fills its slots.
+    assert!(wait_for(|r, b| r >= 4 * b).await, "{}", pool.reserved());
+    // Taking every batch releases each one's reservation.
+    let mut taken = 0;
+    while let Some(batch) = stream.next().await {
+        batch?;
+        taken += 1;
+        if taken == 10 {
+            break;
+        }
+    }
+    assert!(pool.reserved() <= 5 * batch_size, "{}", pool.reserved());
+    // Dropping the stream mid-way releases what is still read ahead.
+    drop(stream);
+    assert!(wait_for(|r, _| r == 0).await, "leaked {}", pool.reserved());
     Ok(())
 }
