@@ -136,7 +136,7 @@ impl<'a> FileStreamBuilder<'a> {
             lookahead_reservation,
             // Reading ahead pays off only for a single-partition scan; see
             // `ScanState::plan_ahead`.
-            config.file_groups.len() == 1,
+            config.lookahead && config.file_groups.len() == 1,
         ));
 
         Ok(FileStream {

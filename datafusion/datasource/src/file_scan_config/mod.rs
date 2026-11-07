@@ -198,6 +198,9 @@ pub struct FileScanConfig {
     /// Expression adapter used to adapt filters and projections that are pushed down into the scan
     /// from the logical schema to the physical schema of the file.
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// Whether a single-partition scan may open and decode its next file
+    /// ahead of the current one (see [`FileScanConfigBuilder::with_lookahead`]).
+    pub lookahead: bool,
     /// Statistics for the entire table (file schema + partition columns).
     /// See [`FileScanConfigBuilder::with_statistics`] for more details.
     ///
@@ -287,6 +290,7 @@ pub struct FileScanConfigBuilder {
     file_compression_type: Option<FileCompressionType>,
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    lookahead: bool,
 }
 
 impl FileScanConfigBuilder {
@@ -313,6 +317,7 @@ impl FileScanConfigBuilder {
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
+            lookahead: true,
         }
     }
 
@@ -492,6 +497,16 @@ impl FileScanConfigBuilder {
         self
     }
 
+    /// Set whether a scan with a single partition may open and decode its
+    /// next file while the current one is read (default `true`), to overlap
+    /// the decode of consecutive files in an ordered partition. A caller that
+    /// already runs many such scans in parallel can turn it off to bound
+    /// their memory.
+    pub fn with_lookahead(mut self, lookahead: bool) -> Self {
+        self.lookahead = lookahead;
+        self
+    }
+
     /// Register an expression adapter used to adapt filters and projections that are pushed down into the scan
     /// from the logical schema to the physical schema of the file.
     /// This can include things like:
@@ -527,6 +542,7 @@ impl FileScanConfigBuilder {
             file_compression_type,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            lookahead,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
@@ -551,6 +567,7 @@ impl FileScanConfigBuilder {
             file_compression_type,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            lookahead,
             statistics,
             output_partitioning,
         }
@@ -598,6 +615,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
+            lookahead: config.lookahead,
         }
     }
 }

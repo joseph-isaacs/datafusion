@@ -321,6 +321,11 @@ impl SortedScan {
             .collect();
         let config = FileScanConfigBuilder::from(self.config.clone())
             .with_file_groups(vec![FileGroup::new(files)])
+            // The ranges already decode in parallel; reading ahead within
+            // each adds memory but no speed (smj-ts, 8 ranges: all 9
+            // queries within noise; pool peak on Q4 122 MB with it, 7 MB
+            // without).
+            .with_lookahead(false)
             .build();
         Arc::new(RangeSliceExec::new(
             DataSourceExec::from_data_source(config),

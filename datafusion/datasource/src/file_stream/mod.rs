@@ -1891,6 +1891,49 @@ mod tests {
         Ok(())
     }
 
+    /// A single-partition scan built without the lookahead opens no file
+    /// ahead, so it reserves nothing for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scans_without_lookahead_do_not_read_ahead() -> Result<()> {
+        use datafusion_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(
+            (0..4)
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect(),
+        )
+        .with_lookahead(false)
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file: None,
+            }))
+            .with_metrics(&metrics_set)
+            .with_memory_pool(Arc::clone(&pool))
+            .build()?;
+        // With the lookahead, file 1 is decoding ahead by the fourth batch.
+        for _ in 0..4 {
+            stream.next().await.unwrap()?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(pool.reserved(), 0, "a file was read ahead");
+        let mut rows = 4 * 3;
+        while let Some(batch) = stream.next().await {
+            rows += batch?.num_rows();
+        }
+        assert_eq!(rows, 4 * 7 * 3);
+        Ok(())
+    }
+
     /// A memory pool that cannot spare the deep lookahead keeps it at the
     /// minimum depth, and the scan still returns every batch in order.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
