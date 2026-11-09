@@ -1841,6 +1841,14 @@ config_namespace! {
         /// that overlap its range. 0 or 1 disables the split.
         pub range_split_sort_merge_join: usize, default = 0
 
+        /// When true, an equi-join whose inputs are both file scans that prove
+        /// a range split exact (see `range_split_sort_merge_join`) is planned
+        /// as a range-split sort-merge join even when `prefer_hash_join` is
+        /// true, with `range_split_sort_merge_join` ranges if that is greater
+        /// than 1, otherwise `target_partitions`. Joins over any other inputs
+        /// are planned as before.
+        pub sort_merge_join_for_sorted_inputs: bool, default = true
+
         /// When set to true, piecewise merge join is enabled. PiecewiseMergeJoin is currently
         /// experimental. Physical planner will opt for PiecewiseMergeJoin when there is only
         /// one range filter.
