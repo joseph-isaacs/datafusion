@@ -47,7 +47,6 @@ use datafusion_execution::{
 use datafusion_expr::Operator;
 
 use crate::source::OpenArgs;
-use datafusion_common::stats::Precision;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column};
 use datafusion_physical_expr::projection::{ProjectionExprs, ProjectionMapping};
 use datafusion_physical_expr::utils::reassign_expr_columns;
@@ -1259,19 +1258,14 @@ impl FileScanConfig {
         self.file_source.table_schema().table_partition_cols()
     }
 
-    /// Returns the unprojected table statistics, marking them as inexact if filters are present.
+    /// Returns the unprojected table statistics after [`FileSource::filtered_statistics`].
     ///
     /// When filters are pushed down (including pruning predicates and bloom filters),
     /// we can't guarantee the statistics are exact because we don't know how many
     /// rows will be filtered out.
     pub fn statistics(&self) -> Statistics {
-        let filter_may_change_row_count = self.file_source.filter().is_some()
-            && self.statistics.num_rows != Precision::Exact(0);
-        if filter_may_change_row_count {
-            self.statistics.clone().to_inexact()
-        } else {
-            self.statistics.clone()
-        }
+        self.file_source
+            .filtered_statistics(self.statistics.clone())
     }
 
     pub fn projected_schema(&self) -> Result<Arc<Schema>> {

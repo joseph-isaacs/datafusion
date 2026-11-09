@@ -29,8 +29,9 @@ use crate::morsel::{FileOpenerMorselizer, Morselizer};
 #[expect(deprecated)]
 use crate::schema_adapter::SchemaAdapterFactory;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{Result, not_impl_err};
+use datafusion_common::{Result, Statistics, not_impl_err};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::DisplayFormatType;
@@ -112,6 +113,21 @@ pub trait FileSource: Any + Send + Sync {
     /// These expressions are in terms of the unprojected [`Self::table_schema`].
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
         None
+    }
+
+    /// Returns the statistics of the rows this source produces, given the
+    /// `statistics` of the files it reads.
+    ///
+    /// Both are in terms of the unprojected [`Self::table_schema`]. The default
+    /// marks the statistics inexact when [`Self::filter`] may remove rows. A
+    /// source that absorbs filters, so that no `FilterExec` estimates them, can
+    /// override this to apply their selectivity.
+    fn filtered_statistics(&self, statistics: Statistics) -> Statistics {
+        if self.filter().is_some() && statistics.num_rows != Precision::Exact(0) {
+            statistics.to_inexact()
+        } else {
+            statistics
+        }
     }
 
     /// Return the projection that will be applied to the output stream on top
