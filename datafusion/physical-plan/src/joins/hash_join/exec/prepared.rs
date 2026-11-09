@@ -178,6 +178,7 @@ impl HashJoinExec {
             false,
             0,
             !byte_keys,
+            0,
             config,
             self.null_equality,
             None,

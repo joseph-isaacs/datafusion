@@ -13,6 +13,7 @@ use crate::ExecutionPlanProperties;
 use crate::Partitioning;
 use crate::joins::Map;
 use crate::joins::PartitionMode;
+use crate::joins::hash_join::bloom_filter::{BloomFilterExpr, SplitBlockBloomFilter};
 use crate::joins::hash_join::exec::HASH_JOIN_SEED;
 use crate::joins::hash_join::inlist_builder::build_struct_fields;
 use crate::joins::hash_join::not_in::NotIn;
@@ -169,6 +170,15 @@ fn create_membership_predicate(
                 pruning_bitmap,
             )?) as Arc<dyn PhysicalExpr>))
         }
+        // Bloom filter over the build keys for predicate transfer
+        PushdownStrategy::Bloom(bloom, pruning_bitmap) => {
+            Ok(Some(Arc::new(BloomFilterExpr::new(
+                on_right.to_vec(),
+                random_state.clone(),
+                bloom,
+                pruning_bitmap,
+            )) as Arc<dyn PhysicalExpr>))
+        }
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
     }
@@ -313,6 +323,9 @@ pub(crate) enum PushdownStrategy {
     /// Use map lookup for large build sides. If `Some` the second field
     /// represents the build side's keys using a bucket bitmap.
     Map(Arc<Map>, Option<Arc<KeyRangeBitmap>>),
+    /// Predicate transfer: a Bloom filter over every build key, used in
+    /// place of `Map` for large build sides. The second field is as for `Map`.
+    Bloom(Arc<SplitBlockBloomFilter>, Option<Arc<KeyRangeBitmap>>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
 }
@@ -725,7 +738,7 @@ impl SharedBuildAccumulator {
                         PushdownStrategy::Map(map, _) => {
                             matches!(map.as_ref(), Map::HashMap(_))
                         }
-                        PushdownStrategy::InList(_) => true,
+                        PushdownStrategy::InList(_) | PushdownStrategy::Bloom(..) => true,
                         PushdownStrategy::Empty => false,
                     };
                     members = members.filter(|_| mergeable).map(|mut members| {
@@ -763,6 +776,22 @@ impl SharedBuildAccumulator {
                         "attempted to finalize dynamic filter with pending partition"
                     );
                 }
+            }
+        }
+
+        // Hash tables merge into a routed lookup and Bloom filters into one
+        // Bloom filter, but the two kinds do not merge with each other (a
+        // partition skips its Bloom filter when memory runs short).
+        if let Some(parts) = &members {
+            let has = |bloom: bool| {
+                parts.iter().any(|(_, pushdown, _)| match pushdown {
+                    PushdownStrategy::Bloom(..) => bloom,
+                    PushdownStrategy::Map(..) => !bloom,
+                    _ => false,
+                })
+            };
+            if has(true) && has(false) {
+                members = None;
             }
         }
 
@@ -900,6 +929,15 @@ impl SharedBuildAccumulator {
                 self.probe_schema.as_ref(),
             )?
             .expect("an IN list always has a membership predicate")
+        } else if let Some(bloom) = self.merged_bloom(members)? {
+            // Predicate transfer: one Bloom filter holds every partition's
+            // keys, so probe rows need no routing to their partition.
+            Arc::new(BloomFilterExpr::new(
+                self.on_right.clone(),
+                HASH_JOIN_SEED,
+                Arc::new(bloom),
+                self.merged_pruning_bitmap(members, merged_bounds.as_ref()),
+            )) as Arc<dyn PhysicalExpr>
         } else {
             // Each probe row is looked up in the table of the partition its key
             // routes to, so the partitions' tables are shared as they are: no
@@ -909,8 +947,10 @@ impl SharedBuildAccumulator {
                 maps[*partition_id] = Some(match pushdown {
                     PushdownStrategy::Map(map, _) => Arc::clone(map),
                     PushdownStrategy::InList(values) => self.in_list_hash_map(values)?,
-                    PushdownStrategy::Empty => {
-                        return internal_err!("empty partitions have no members");
+                    PushdownStrategy::Bloom(..) | PushdownStrategy::Empty => {
+                        return internal_err!(
+                            "empty and Bloom filter partitions have no hash table"
+                        );
                     }
                 });
             }
@@ -951,15 +991,48 @@ impl SharedBuildAccumulator {
         })
     }
 
-    /// A hash table of an IN list partition's keys, hashed as the probe side
+    /// The hashes of an IN list partition's keys, hashed as the probe side
     /// hashes its join keys: one column per join key.
-    fn in_list_hash_map(&self, values: &ArrayRef) -> Result<Arc<Map>> {
+    fn in_list_hashes(&self, values: &ArrayRef) -> Result<Vec<u64>> {
         let columns = match values.as_struct_opt() {
             Some(columns) if self.on_right.len() > 1 => columns.columns(),
             _ => std::slice::from_ref(values),
         };
         let mut hashes = vec![0; values.len()];
         create_hashes(columns, HASH_JOIN_SEED.random_state(), &mut hashes)?;
+        Ok(hashes)
+    }
+
+    /// One Bloom filter over every member's keys, when the members are Bloom
+    /// filters and IN lists with at least one Bloom filter; `None` otherwise.
+    fn merged_bloom(
+        &self,
+        members: &[(usize, PushdownStrategy, PartitionBounds)],
+    ) -> Result<Option<SplitBlockBloomFilter>> {
+        let mut blooms = Vec::with_capacity(members.len());
+        for (_, pushdown, _) in members {
+            match pushdown {
+                PushdownStrategy::Bloom(bloom, _) => blooms.push(bloom.as_ref()),
+                PushdownStrategy::InList(_) => {}
+                PushdownStrategy::Map(..) | PushdownStrategy::Empty => return Ok(None),
+            }
+        }
+        let Some(mut merged) = SplitBlockBloomFilter::union(blooms.iter().copied())
+        else {
+            return Ok(None);
+        };
+        for (_, pushdown, _) in members {
+            if let PushdownStrategy::InList(values) = pushdown {
+                merged.insert_hashes(&self.in_list_hashes(values)?);
+            }
+        }
+        Ok(Some(merged))
+    }
+
+    /// A hash table of an IN list partition's keys, hashed as the probe side
+    /// hashes its join keys: one column per join key.
+    fn in_list_hash_map(&self, values: &ArrayRef) -> Result<Arc<Map>> {
+        let hashes = self.in_list_hashes(values)?;
         let mut map = JoinHashMapU32::with_capacity(hashes.len());
         map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
         Ok(Arc::new(Map::HashMap(Box::new(map))))
@@ -981,7 +1054,8 @@ impl SharedBuildAccumulator {
         let parts = members
             .iter()
             .map(|(_, pushdown, bounds)| match pushdown {
-                PushdownStrategy::Map(_, Some(bitmap)) => {
+                PushdownStrategy::Map(_, Some(bitmap))
+                | PushdownStrategy::Bloom(_, Some(bitmap)) => {
                     Some(KeyRangePart::Bitmap(bitmap))
                 }
                 PushdownStrategy::InList(keys) => Some(KeyRangePart::Keys(keys.as_ref())),
@@ -1444,6 +1518,101 @@ mod tests {
         let probe: Vec<i32> = (0..40).collect();
         let expected: Vec<bool> = probe.iter().map(|key| key % 2 == 0).collect();
         assert_matches(&acc, &probe, &expected);
+    }
+
+    /// A Bloom filter over `keys` sized for `partitions` times as many keys,
+    /// as each partition of a partitioned build sizes its filter.
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn bloom_of(keys: &[i32], partitions: usize) -> PushdownStrategy {
+        use crate::joins::hash_join::bloom_filter::BLOOM_BITS_PER_KEY;
+        let keys: ArrayRef = Arc::new(Int32Array::from(keys.to_vec()));
+        let mut hashes = vec![0; keys.len()];
+        create_hashes([&keys], HASH_JOIN_SEED.random_state(), &mut hashes).unwrap();
+        let mut bloom = SplitBlockBloomFilter::try_with_capacity(
+            keys.len() * partitions,
+            BLOOM_BITS_PER_KEY,
+        )
+        .unwrap();
+        bloom.insert_hashes(&hashes);
+        PushdownStrategy::Bloom(Arc::new(bloom), None)
+    }
+
+    /// Predicate transfer: partitions that built Bloom filters (and small ones
+    /// that chose an IN list) merge into a single Bloom filter, with no `CASE`
+    /// and no partition routing, that keeps every build key.
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn partitioned_bloom_partitions_merge_into_one_bloom_filter() {
+        let acc = make_partitioned_expr_accumulator_for_test(4);
+        let build: Vec<i32> = (0..4000).step_by(2).collect();
+
+        acc.build_filter(FinalizeInput::Partitioned(routed_partitions(
+            &acc,
+            4,
+            &build,
+            |partition, keys| {
+                if partition == 3 {
+                    in_list(keys)
+                } else {
+                    bloom_of(keys, 4)
+                }
+            },
+        )))
+        .unwrap();
+
+        let expr = current_expr(&acc);
+        assert!(
+            expr.downcast_ref::<BloomFilterExpr>().is_some(),
+            "expected one Bloom filter, got: {expr}"
+        );
+        // Every build key passes; with 16 bits per key few absent keys do.
+        let expected = vec![true; build.len()];
+        assert_matches(&acc, &build, &expected);
+
+        let absent: Vec<i32> = (0..4000).map(|k| k * 2 + 1).collect();
+        let probe = RecordBatch::try_new(
+            test_probe_schema(),
+            vec![Arc::new(Int32Array::from(absent.clone()))],
+        )
+        .unwrap();
+        let matched = expr
+            .evaluate(&probe)
+            .unwrap()
+            .into_array(absent.len())
+            .unwrap();
+        assert!(matched.as_boolean().true_count() < absent.len() / 50);
+    }
+
+    /// A partition that fell back to its hash table does not merge with Bloom
+    /// filter partitions: the filter routes rows with a `CASE` instead, and
+    /// still keeps every build key.
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn partitioned_bloom_and_hash_map_partitions_use_case() {
+        let acc = make_partitioned_expr_accumulator_for_test(3);
+        let build: Vec<i32> = (0..300).collect();
+
+        acc.build_filter(FinalizeInput::Partitioned(routed_partitions(
+            &acc,
+            3,
+            &build,
+            |partition, keys| {
+                if partition == 0 {
+                    hash_map_of(keys)
+                } else {
+                    bloom_of(keys, 3)
+                }
+            },
+        )))
+        .unwrap();
+
+        assert!(
+            current_expr(&acc).downcast_ref::<CaseExpr>().is_some(),
+            "expected a CASE, got: {}",
+            current_expr(&acc)
+        );
+        let expected = vec![true; build.len()];
+        assert_matches(&acc, &build, &expected);
     }
 
     /// IN list partitions whose combined list passes the IN list limits merge

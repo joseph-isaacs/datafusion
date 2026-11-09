@@ -1876,6 +1876,17 @@ config_namespace! {
         /// See: <https://trino.io/docs/current/admin/dynamic-filtering.html#dynamic-filter-collection-thresholds>
         pub hash_join_inlist_pushdown_max_distinct_values: usize, default = 150
 
+        /// (Experimental) When set to true, hash joins use predicate transfer for
+        /// their dynamic filters: a build side too large for an IN list is
+        /// pushed to the probe side as a compact split-block Bloom filter over
+        /// the build keys, instead of a lookup into the join's hash table. The
+        /// Bloom filter is cheaper to evaluate in scans, needs no partition
+        /// routing for partitioned joins, and is transferred across equi-join
+        /// keys to the scans of the joins below like any other dynamic filter.
+        /// It may keep rows without a match but never drops a matching row.
+        /// Requires `enable_join_dynamic_filter_pushdown`.
+        pub enable_predicate_transfer: bool, default = false
+
         /// The default filter selectivity used by Filter Statistics
         /// when an exact selectivity cannot be determined. Valid values are
         /// between 0 (no selectivity) and 100 (all rows are selected).

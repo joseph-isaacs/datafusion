@@ -38,7 +38,8 @@ use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee};
 use datafusion_physical_expr::{PhysicalExprRef, expressions as phys_expr};
 use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt;
-use datafusion_physical_plan::joins::HashTableLookupExpr;
+use datafusion_physical_plan::joins::key_range_bitmap::KeyRangeBitmap;
+use datafusion_physical_plan::joins::{BloomFilterExpr, HashTableLookupExpr};
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
 /// Used to prove that arbitrary predicates (boolean expression) can not
@@ -1547,13 +1548,16 @@ fn min_max_non_null_exprs(
 /// build side pushed down as an opaque hash-table lookup): tests container
 /// min/max stats against the build side's key-range bitmap, which is fixed size
 /// and built once with the join's hash table.
+///
+/// A predicate transfer [`BloomFilterExpr`] carries the same bitmap and is
+/// pruned the same way.
 fn build_hash_lookup_pruning_expr(
-    lookup: &HashTableLookupExpr,
+    bitmap: Option<&Arc<KeyRangeBitmap>>,
+    on_columns: &[&Arc<dyn PhysicalExpr>],
     schema: &Schema,
     required_columns: &mut RequiredColumns,
 ) -> Option<Arc<dyn PhysicalExpr>> {
-    let bitmap = Arc::clone(lookup.pruning_bitmap()?);
-    let on_columns = lookup.children();
+    let bitmap = Arc::clone(bitmap?);
     let [column_expr] = on_columns[..] else {
         return None;
     };
@@ -1862,8 +1866,22 @@ fn build_predicate_expression(
         }
     }
     if let Some(lookup) = expr.downcast_ref::<HashTableLookupExpr>() {
-        return build_hash_lookup_pruning_expr(lookup, schema, required_columns)
-            .unwrap_or_else(|| unhandled_hook.handle(expr));
+        return build_hash_lookup_pruning_expr(
+            lookup.pruning_bitmap(),
+            &lookup.children(),
+            schema,
+            required_columns,
+        )
+        .unwrap_or_else(|| unhandled_hook.handle(expr));
+    }
+    if let Some(bloom) = expr.downcast_ref::<BloomFilterExpr>() {
+        return build_hash_lookup_pruning_expr(
+            bloom.pruning_bitmap(),
+            &bloom.children(),
+            schema,
+            required_columns,
+        )
+        .unwrap_or_else(|| unhandled_hook.handle(expr));
     }
     // A partitioned hash join hides its per-partition filters under a `CASE` on the
     // repartition hash. A row takes exactly one branch, so a container may match

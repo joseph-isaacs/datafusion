@@ -18,6 +18,7 @@ use crate::filter_pushdown::{
 };
 use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
+use crate::joins::hash_join::bloom_filter::{BLOOM_BITS_PER_KEY, SplitBlockBloomFilter};
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::not_in::{NotIn, NotInBuild};
 use crate::joins::hash_join::shared_bounds::{
@@ -1696,6 +1697,18 @@ impl ExecutionPlan for HashJoinExec {
             .flatten()
             .flatten();
 
+        // With predicate transfer, each build partition also builds a Bloom
+        // filter over its keys, sized as if every partition held as many keys
+        // so the partitions' filters merge into one of the right size.
+        let predicate_transfer = enable_dynamic_filter_pushdown
+            && context
+                .session_config()
+                .options()
+                .optimizer
+                .enable_predicate_transfer;
+        let bloom_partitions =
+            |partitions: usize| if predicate_transfer { partitions } else { 0 };
+
         let left_fut = match (&self.prepared_build, self.mode) {
             (Some(prepared), _) => {
                 // Public join fields can change after builder validation.
@@ -1720,6 +1733,7 @@ impl ExecutionPlan for HashJoinExec {
                     need_produce_result_in_final(self.join_type),
                     right_partitions,
                     enable_dynamic_filter_pushdown,
+                    bloom_partitions(1),
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     not_in,
@@ -1742,6 +1756,7 @@ impl ExecutionPlan for HashJoinExec {
                     need_produce_result_in_final(self.join_type),
                     1,
                     enable_dynamic_filter_pushdown,
+                    bloom_partitions(left_partitions),
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     not_in,
@@ -3055,6 +3070,7 @@ async fn collect_left_input(
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
     should_compute_dynamic_filters: bool,
+    bloom_partitions: usize,
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     not_in: Option<NotIn>,
@@ -3148,6 +3164,7 @@ async fn collect_left_input(
         with_visited_indices_bitmap,
         probe_threads_count,
         should_compute_dynamic_filters,
+        bloom_partitions,
         &config,
         null_equality,
         not_in,
@@ -3179,6 +3196,7 @@ fn build_in_memory(
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
     should_compute_dynamic_filters: bool,
+    bloom_partitions: usize,
     config: &ConfigOptions,
     null_equality: NullEquality,
     not_in: Option<NotIn>,
@@ -3186,6 +3204,11 @@ fn build_in_memory(
     prepared: bool,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
+
+    // Predicate transfer: a Bloom filter over the build keys, filled from the
+    // hashes the hash table is built from. It is dropped again if the build
+    // side turns out small enough for an IN list.
+    let mut bloom = None;
 
     let (join_hash_map, batch, left_values) = if let Some((min_val, max_val)) =
         array_map_key_range(
@@ -3218,6 +3241,15 @@ fn build_in_memory(
         // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
         let mut hashmap = new_join_hashmap(num_rows, &mut reservation, metrics)?;
 
+        if bloom_partitions > 0 && should_compute_dynamic_filters && num_rows > 0 {
+            bloom = SplitBlockBloomFilter::try_with_capacity(
+                num_rows.saturating_mul(bloom_partitions),
+                BLOOM_BITS_PER_KEY,
+            )
+            // Optional, so skip it rather than fail when the pool is full.
+            .filter(|bloom| reservation.try_grow(bloom.size()).is_ok());
+        }
+
         let scratch_reservation = reservation.new_empty();
         if prepared {
             scratch_reservation.try_grow(prepared::prepared_scratch_bytes(
@@ -3248,6 +3280,11 @@ fn build_in_memory(
                 true,
                 null_equality,
             )?;
+            // Every row's hash, NULL keys included: a superset of the keys
+            // the hash table holds, so no probe row with a match is dropped.
+            if let Some(bloom) = bloom.as_mut() {
+                bloom.insert_hashes(&hashes_buffer);
+            }
         }
 
         // Merge all batches into a single batch, so we can directly index into the arrays
@@ -3340,6 +3377,9 @@ fn build_in_memory(
         if pushdown_inlist
             && let Some(in_list_values) = build_struct_inlist_values(&left_values)?
         {
+            if let Some(bloom) = bloom.take() {
+                reservation.shrink(bloom.size());
+            }
             PushdownStrategy::InList(in_list_values)
         } else {
             // Past the InList threshold use a bucket bitmap for container pruning.
@@ -3366,9 +3406,18 @@ fn build_in_memory(
                 }
                 ok
             });
-            PushdownStrategy::Map(Arc::clone(&map), pruning_bitmap)
+            match bloom.take() {
+                Some(bloom) => {
+                    metrics.build_mem_used.add(bloom.size());
+                    PushdownStrategy::Bloom(Arc::new(bloom), pruning_bitmap)
+                }
+                None => PushdownStrategy::Map(Arc::clone(&map), pruning_bitmap),
+            }
         }
     };
+    if let Some(bloom) = bloom.take() {
+        reservation.shrink(bloom.size());
+    }
 
     if is_phj_candidate && !should_compute_dynamic_filters {
         bounds = None;
@@ -4272,6 +4321,7 @@ mod tests {
             false,
             1,
             false,
+            0,
             Arc::new(ConfigOptions::default()),
             NullEquality::NullEqualsNothing,
             None,
@@ -9907,6 +9957,101 @@ mod tests {
 
         // The NULL-NULL row (d1 = 200, d2 = 20) is only produced if the probe
         // NULL survived the pushed filter on its route.
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+-----+----+----+
+            | c1 | d1  | c2 | d2 |
+            +----+-----+----+----+
+            |    | 200 |    | 20 |
+            | 1  | 100 | 1  | 10 |
+            +----+-----+----+----+
+            ");
+        }
+        Ok(())
+    }
+
+    /// With predicate transfer the pushed membership filter is a Bloom filter
+    /// (one merged filter for a partitioned join, with no routing) and the
+    /// join output is unchanged, including the NULL-NULL match of a
+    /// null-equal join, which the `IS NULL` escape keeps.
+    #[rstest]
+    #[case::collect_left(PartitionMode::CollectLeft)]
+    #[case::partitioned(PartitionMode::Partitioned)]
+    #[tokio::test]
+    async fn test_predicate_transfer_pushes_bloom_filter(
+        #[case] mode: PartitionMode,
+    ) -> Result<()> {
+        let mut session_config = SessionConfig::default();
+        let optimizer = &mut session_config.options_mut().optimizer;
+        optimizer.enable_predicate_transfer = true;
+        // No IN list, so the build side takes the large-build strategy.
+        optimizer.hash_join_inlist_pushdown_max_size = 1;
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(session_config));
+
+        let left = build_table_dict_key(
+            "c1",
+            vec![Some(1), None, Some(2)],
+            vec![0, 1, 2],
+            "d1",
+            vec![Some(100), Some(200), Some(300)],
+        );
+        let right = build_table_dict_key(
+            "c2",
+            vec![Some(1), None, Some(4)],
+            vec![0, 1, 2],
+            "d2",
+            vec![Some(10), Some(20), Some(40)],
+        );
+        let left_key =
+            Arc::new(Column::new_with_schema("c1", &left.schema())?) as PhysicalExprRef;
+        let right_key =
+            Arc::new(Column::new_with_schema("c2", &right.schema())?) as PhysicalExprRef;
+        let on = vec![(Arc::clone(&left_key), Arc::clone(&right_key))];
+
+        let (left, right): (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) = match mode {
+            PartitionMode::Partitioned => (
+                Arc::new(RepartitionExec::try_new(
+                    left,
+                    Partitioning::Hash(vec![left_key], 4),
+                )?),
+                Arc::new(RepartitionExec::try_new(
+                    right,
+                    Partitioning::Hash(vec![right_key], 4),
+                )?),
+            ),
+            _ => (left, right),
+        };
+        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let consumer: Arc<dyn PhysicalExpr> = Arc::clone(&dynamic_filter) as _;
+        let right = Arc::new(FilterExecBuilder::new(consumer, right).build()?);
+        let mut join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            mode,
+            NullEquality::NullEqualsNull,
+            false,
+        )?;
+        join.dynamic_filter = Some(HashJoinExecDynamicFilter {
+            filter: Arc::clone(&dynamic_filter),
+            build_accumulator: OnceLock::new(),
+        });
+
+        let batches = crate::execution_plan::collect(Arc::new(join), task_ctx).await?;
+
+        dynamic_filter.wait_complete().await;
+        let filter = dynamic_filter.current()?.to_string();
+        assert!(
+            filter.starts_with("c2@0 IS NULL OR")
+                && filter.ends_with("bloom_filter")
+                && !filter.contains("hash_lookup")
+                && !filter.contains("CASE"),
+            "expected a single Bloom filter, got: {filter}"
+        );
         allow_duplicates! {
             assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+-----+----+----+

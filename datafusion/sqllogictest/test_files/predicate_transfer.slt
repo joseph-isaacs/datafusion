@@ -1,0 +1,297 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+# Predicate transfer (`datafusion.optimizer.enable_predicate_transfer`): a hash
+# join whose build side is too large for an IN list pushes a Bloom filter over
+# its build keys (`bloom_filter`) to the probe side instead of a lookup into
+# its hash table (`hash_lookup`). Like any join dynamic filter it is
+# transferred across equi-join keys, so it reaches the scans of the joins
+# below. It is only pushed where the join drops unmatched probe rows.
+
+statement ok
+set datafusion.explain.physical_plan_only = true;
+
+statement ok
+set datafusion.execution.parquet.pushdown_filters = true;
+
+statement ok
+set datafusion.explain.analyze_categories = 'rows';
+
+# Never use an IN list, so even these small build sides use the large-build
+# strategy: a hash table lookup, or a Bloom filter with predicate transfer.
+statement ok
+set datafusion.optimizer.hash_join_inlist_pushdown_max_size = 1;
+
+# ... and a hash table rather than a perfect-hash array over these dense keys.
+statement ok
+set datafusion.execution.perfect_hash_join_small_build_threshold = 0;
+
+statement ok
+COPY (
+  SELECT value AS d_key, CASE WHEN value % 10 = 0 THEN 'keep' ELSE 'drop' END AS d_flag
+  FROM generate_series(1, 300)
+) TO 'test_files/scratch/predicate_transfer/dim.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT value AS m_key, value * 10 AS m_val FROM generate_series(1, 300)
+) TO 'test_files/scratch/predicate_transfer/mid.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT value % 300 + 1 AS f_key, value AS f_val FROM generate_series(0, 2999)
+) TO 'test_files/scratch/predicate_transfer/fact.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE dim STORED AS PARQUET
+LOCATION 'test_files/scratch/predicate_transfer/dim.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE mid STORED AS PARQUET
+LOCATION 'test_files/scratch/predicate_transfer/mid.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE fact STORED AS PARQUET
+LOCATION 'test_files/scratch/predicate_transfer/fact.parquet';
+
+########
+# Off (the default): the large-build strategy is a hash table lookup.
+########
+
+query TT
+EXPLAIN ANALYZE SELECT count(*), sum(f_val)
+FROM fact JOIN dim ON f_key = d_key WHERE d_flag = 'keep';
+----
+Plan with Metrics
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(fact.f_val)@1 as sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+03)----CoalescePartitionsExec, metrics=[output_rows=4, output_batches=4]
+04)------AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), sum(fact.f_val)], metrics=[output_rows=4, output_batches=4]
+05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true, metrics=[output_rows=300, output_batches=1, spill_count=0, spilled_rows=0]
+06)----------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d_key@0, f_key@0)], projection=[f_val@2], metrics=[output_rows=300, output_batches=1, array_map_created_count=0, build_input_batches=1, build_input_rows=30, input_batches=1, input_rows=300, avg_fanout=100% (300/300), probe_hit_rate=100% (300/300)]
+07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/dim.parquet]]}, projection=[d_key], output_ordering=[d_key@0 ASC NULLS LAST], file_type=parquet, predicate=d_flag@1 = keep, pruning_predicate=d_flag_null_count@2 != row_count@3 AND d_flag_min@0 <= keep AND keep <= d_flag_max@1, required_guarantees=[d_flag in (keep)], metrics=[output_rows=30, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=300 total → 300 matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=30, pushdown_rows_pruned=270, predicate_cache_inner_records=0, predicate_cache_records=0, scan_efficiency_ratio=59.21% (942/1.59 K)]
+08)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/fact.parquet]]}, projection=[f_key, f_val], output_ordering=[f_val@1 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ f_key@0 >= 10 AND f_key@0 <= 300 AND hash_lookup ], dynamic_rg_pruning=eligible, pruning_predicate=f_key_null_count@1 != row_count@2 AND f_key_max@0 >= 10 AND f_key_null_count@1 != row_count@2 AND f_key_min@3 <= 300 AND f_key_null_count@1 != row_count@2 AND KEY_RANGE_BITMAP(f_key_min@3, f_key_max@0, 30/512 buckets), required_guarantees=[], metrics=[output_rows=300, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=3.00 K total → 3.00 K matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=300, pushdown_rows_pruned=2.70 K, predicate_cache_inner_records=3.00 K, predicate_cache_records=2.99 K, scan_efficiency_ratio=94.14% (11.01 K/11.69 K)]
+
+query II
+SELECT count(*), sum(f_val) FROM fact JOIN dim ON f_key = d_key WHERE d_flag = 'keep';
+----
+300 451200
+
+statement ok
+set datafusion.optimizer.enable_predicate_transfer = true;
+
+########
+# On: the probe-side scan evaluates a Bloom filter over the build keys. The
+# bounds and the key range bitmap still prune row groups as before.
+########
+
+query TT
+EXPLAIN ANALYZE SELECT count(*), sum(f_val)
+FROM fact JOIN dim ON f_key = d_key WHERE d_flag = 'keep';
+----
+Plan with Metrics
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(fact.f_val)@1 as sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+03)----CoalescePartitionsExec, metrics=[output_rows=4, output_batches=4]
+04)------AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), sum(fact.f_val)], metrics=[output_rows=4, output_batches=4]
+05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true, metrics=[output_rows=300, output_batches=1, spill_count=0, spilled_rows=0]
+06)----------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d_key@0, f_key@0)], projection=[f_val@2], metrics=[output_rows=300, output_batches=1, array_map_created_count=0, build_input_batches=1, build_input_rows=30, input_batches=1, input_rows=310, avg_fanout=100% (300/300), probe_hit_rate=96.77% (300/310)]
+07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/dim.parquet]]}, projection=[d_key], output_ordering=[d_key@0 ASC NULLS LAST], file_type=parquet, predicate=d_flag@1 = keep, pruning_predicate=d_flag_null_count@2 != row_count@3 AND d_flag_min@0 <= keep AND keep <= d_flag_max@1, required_guarantees=[d_flag in (keep)], metrics=[output_rows=30, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=300 total → 300 matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=30, pushdown_rows_pruned=270, predicate_cache_inner_records=0, predicate_cache_records=0, scan_efficiency_ratio=59.21% (942/1.59 K)]
+08)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/fact.parquet]]}, projection=[f_key, f_val], output_ordering=[f_val@1 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ f_key@0 >= 10 AND f_key@0 <= 300 AND bloom_filter ], dynamic_rg_pruning=eligible, pruning_predicate=f_key_null_count@1 != row_count@2 AND f_key_max@0 >= 10 AND f_key_null_count@1 != row_count@2 AND f_key_min@3 <= 300 AND f_key_null_count@1 != row_count@2 AND KEY_RANGE_BITMAP(f_key_min@3, f_key_max@0, 30/512 buckets), required_guarantees=[], metrics=[output_rows=310, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=3.00 K total → 3.00 K matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=310, pushdown_rows_pruned=2.69 K, predicate_cache_inner_records=3.00 K, predicate_cache_records=2.99 K, scan_efficiency_ratio=94.14% (11.01 K/11.69 K)]
+
+query II
+SELECT count(*), sum(f_val) FROM fact JOIN dim ON f_key = d_key WHERE d_flag = 'keep';
+----
+300 451200
+
+########
+# Transitive transfer: the `dim` Bloom filter reaches `mid`, the other input of
+# the join below, and through `mid.m_key = fact.f_key` the `fact` scan too.
+########
+
+query TT
+EXPLAIN ANALYZE SELECT count(*), sum(m_val), sum(f_val)
+FROM mid JOIN fact ON m_key = f_key JOIN dim ON d_key = m_key
+WHERE d_flag = 'keep';
+----
+Plan with Metrics
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(mid.m_val)@1 as sum(mid.m_val), sum(fact.f_val)@2 as sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), sum(mid.m_val), sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+03)----CoalescePartitionsExec, metrics=[output_rows=4, output_batches=4]
+04)------AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), sum(mid.m_val), sum(fact.f_val)], metrics=[output_rows=4, output_batches=4]
+05)--------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d_key@0, m_key@0)], projection=[m_val@2, f_val@3], metrics=[output_rows=300, output_batches=1, array_map_created_count=0, build_input_batches=1, build_input_rows=30, input_batches=1, input_rows=310, avg_fanout=100% (300/300), probe_hit_rate=96.77% (300/310)]
+06)----------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/dim.parquet]]}, projection=[d_key], output_ordering=[d_key@0 ASC NULLS LAST], file_type=parquet, predicate=d_flag@1 = keep, pruning_predicate=d_flag_null_count@2 != row_count@3 AND d_flag_min@0 <= keep AND keep <= d_flag_max@1, required_guarantees=[d_flag in (keep)], metrics=[output_rows=30, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=300 total → 300 matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=30, pushdown_rows_pruned=270, predicate_cache_inner_records=0, predicate_cache_records=0, scan_efficiency_ratio=59.21% (942/1.59 K)]
+07)----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true, metrics=[output_rows=310, output_batches=1, spill_count=0, spilled_rows=0]
+08)------------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(m_key@0, f_key@0)], projection=[m_key@0, m_val@1, f_val@3], metrics=[output_rows=310, output_batches=1, array_map_created_count=0, build_input_batches=1, build_input_rows=31, input_batches=1, input_rows=310, avg_fanout=100% (310/310), probe_hit_rate=100% (310/310)]
+09)--------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/mid.parquet]]}, projection=[m_key, m_val], output_ordering=[m_key@0 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ m_key@0 >= 10 AND m_key@0 <= 300 AND bloom_filter ], dynamic_rg_pruning=eligible, pruning_predicate=m_key_null_count@1 != row_count@2 AND m_key_max@0 >= 10 AND m_key_null_count@1 != row_count@2 AND m_key_min@3 <= 300 AND m_key_null_count@1 != row_count@2 AND KEY_RANGE_BITMAP(m_key_min@3, m_key_max@0, 30/512 buckets), required_guarantees=[], metrics=[output_rows=31, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=300 total → 300 matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=31, pushdown_rows_pruned=269, predicate_cache_inner_records=300, predicate_cache_records=291, scan_efficiency_ratio=71.09% (1.67 K/2.34 K)]
+10)--------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/fact.parquet]]}, projection=[f_key, f_val], output_ordering=[f_val@1 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ f_key@0 >= 10 AND f_key@0 <= 300 AND bloom_filter ] AND DynamicFilter [ f_key@0 >= 10 AND f_key@0 <= 300 AND bloom_filter ], dynamic_rg_pruning=eligible, pruning_predicate=f_key_null_count@1 != row_count@2 AND f_key_max@0 >= 10 AND f_key_null_count@1 != row_count@2 AND f_key_min@3 <= 300 AND f_key_null_count@1 != row_count@2 AND KEY_RANGE_BITMAP(f_key_min@3, f_key_max@0, 31/512 buckets) AND f_key_null_count@1 != row_count@2 AND f_key_max@0 >= 10 AND f_key_null_count@1 != row_count@2 AND f_key_min@3 <= 300 AND f_key_null_count@1 != row_count@2 AND KEY_RANGE_BITMAP(f_key_min@3, f_key_max@0, 30/512 buckets), required_guarantees=[], metrics=[output_rows=310, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=3.00 K total → 3.00 K matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=310, pushdown_rows_pruned=2.69 K, predicate_cache_inner_records=3.00 K, predicate_cache_records=2.99 K, scan_efficiency_ratio=94.14% (11.01 K/11.69 K)]
+
+query III
+SELECT count(*), sum(m_val), sum(f_val)
+FROM mid JOIN fact ON m_key = f_key JOIN dim ON d_key = m_key
+WHERE d_flag = 'keep';
+----
+300 465000 451200
+
+statement ok
+set datafusion.optimizer.enable_predicate_transfer = false;
+
+query III
+SELECT count(*), sum(m_val), sum(f_val)
+FROM mid JOIN fact ON m_key = f_key JOIN dim ON d_key = m_key
+WHERE d_flag = 'keep';
+----
+300 465000 451200
+
+statement ok
+set datafusion.optimizer.enable_predicate_transfer = true;
+
+########
+# Semi join: the probe side only needs keys with a match, so it is filtered.
+########
+
+query II
+SELECT count(*), sum(f_val) FROM fact
+WHERE f_key IN (SELECT d_key FROM dim WHERE d_flag = 'keep');
+----
+300 451200
+
+########
+# Outer and anti joins must keep unmatched rows of the preserved side, so no
+# Bloom filter may be pushed to it.
+########
+
+# `fact LEFT JOIN dim` builds `dim` and probes the preserved `fact` side: no
+# dynamic filter on the `fact` scan.
+query TT
+EXPLAIN ANALYZE SELECT count(*), count(d_key), sum(f_val)
+FROM fact LEFT JOIN (SELECT d_key FROM dim WHERE d_flag = 'keep') d ON f_key = d_key;
+----
+Plan with Metrics
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), count(d.d_key)@1 as count(d.d_key), sum(fact.f_val)@2 as sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), count(d.d_key), sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+03)----CoalescePartitionsExec, metrics=[output_rows=4, output_batches=4]
+04)------AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), count(d.d_key), sum(fact.f_val)], metrics=[output_rows=4, output_batches=4]
+05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true, metrics=[output_rows=3.00 K, output_batches=1, spill_count=0, spilled_rows=0]
+06)----------HashJoinExec: mode=CollectLeft, join_type=Right, on=[(d_key@0, f_key@0)], projection=[f_val@2, d_key@0], metrics=[output_rows=3.00 K, output_batches=1, array_map_created_count=0, build_input_batches=1, build_input_rows=30, input_batches=1, input_rows=3.00 K, avg_fanout=100% (300/300), probe_hit_rate=10% (300/3.00 K)]
+07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/dim.parquet]]}, projection=[d_key], output_ordering=[d_key@0 ASC NULLS LAST], file_type=parquet, predicate=d_flag@1 = keep, pruning_predicate=d_flag_null_count@2 != row_count@3 AND d_flag_min@0 <= keep AND keep <= d_flag_max@1, required_guarantees=[d_flag in (keep)], metrics=[output_rows=30, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=300 total → 300 matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=30, pushdown_rows_pruned=270, predicate_cache_inner_records=0, predicate_cache_records=0, scan_efficiency_ratio=59.21% (942/1.59 K)]
+08)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/fact.parquet]]}, projection=[f_key, f_val], output_ordering=[f_val@1 ASC NULLS LAST], file_type=parquet, metrics=[output_rows=3.00 K, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=0 total → 0 matched, page_index_rows_pruned=0 total → 0 matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=0, pushdown_rows_pruned=0, predicate_cache_inner_records=0, predicate_cache_records=0, scan_efficiency_ratio=94.14% (11.01 K/11.69 K)]
+
+query III
+SELECT count(*), count(d_key), sum(f_val)
+FROM fact LEFT JOIN (SELECT d_key FROM dim WHERE d_flag = 'keep') d ON f_key = d_key;
+----
+3000 300 4498500
+
+query III
+SELECT count(*), count(d_key), sum(f_val)
+FROM fact FULL JOIN (SELECT d_key FROM dim WHERE d_flag = 'keep') d ON f_key = d_key;
+----
+3000 300 4498500
+
+query II
+SELECT count(*), sum(f_val) FROM fact
+WHERE NOT EXISTS (SELECT 1 FROM dim WHERE d_flag = 'keep' AND d_key = f_key);
+----
+2700 4047300
+
+query II
+SELECT count(*), sum(f_val) FROM fact
+WHERE f_key NOT IN (SELECT d_key FROM dim WHERE d_flag = 'keep');
+----
+2700 4047300
+
+statement ok
+set datafusion.optimizer.enable_predicate_transfer = false;
+
+query III
+SELECT count(*), count(d_key), sum(f_val)
+FROM fact LEFT JOIN (SELECT d_key FROM dim WHERE d_flag = 'keep') d ON f_key = d_key;
+----
+3000 300 4498500
+
+query II
+SELECT count(*), sum(f_val) FROM fact
+WHERE NOT EXISTS (SELECT 1 FROM dim WHERE d_flag = 'keep' AND d_key = f_key);
+----
+2700 4047300
+
+statement ok
+set datafusion.optimizer.enable_predicate_transfer = true;
+
+########
+# Partitioned join: every build partition builds a Bloom filter sized for the
+# whole build, and they merge into one filter that needs no partition routing
+# (no `CASE` and no routed `hash_lookup`).
+########
+
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold = 0;
+
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold_rows = 0;
+
+query TT
+EXPLAIN ANALYZE SELECT count(*), sum(f_val)
+FROM fact JOIN dim ON f_key = d_key WHERE d_flag = 'keep';
+----
+Plan with Metrics
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(fact.f_val)@1 as sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), sum(fact.f_val)], metrics=[output_rows=1, output_batches=1]
+03)----CoalescePartitionsExec, metrics=[output_rows=4, output_batches=4]
+04)------AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), sum(fact.f_val)], metrics=[output_rows=4, output_batches=4]
+05)--------HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d_key@0, f_key@0)], projection=[f_val@2], metrics=[output_rows=300, output_batches=4, array_map_created_count=0, build_input_batches=4, build_input_rows=30, input_batches=4, input_rows=310, avg_fanout=100% (300/300), probe_hit_rate=96.77% (300/310)]
+06)----------RepartitionExec: partitioning=Hash([d_key@0], 4), input_partitions=1, maintains_sort_order=true, metrics=[output_rows=30, output_batches=4, spill_count=0, spilled_rows=0]
+07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/dim.parquet]]}, projection=[d_key], output_ordering=[d_key@0 ASC NULLS LAST], file_type=parquet, predicate=d_flag@1 = keep, pruning_predicate=d_flag_null_count@2 != row_count@3 AND d_flag_min@0 <= keep AND keep <= d_flag_max@1, required_guarantees=[d_flag in (keep)], metrics=[output_rows=30, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=300 total → 300 matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=30, pushdown_rows_pruned=270, predicate_cache_inner_records=0, predicate_cache_records=0, scan_efficiency_ratio=59.21% (942/1.59 K)]
+08)----------RepartitionExec: partitioning=Hash([f_key@0], 4), input_partitions=1, maintains_sort_order=true, metrics=[output_rows=310, output_batches=4, spill_count=0, spilled_rows=0]
+09)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/predicate_transfer/fact.parquet]]}, projection=[f_key, f_val], output_ordering=[f_val@1 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ f_key@0 >= 10 AND f_key@0 <= 300 AND bloom_filter ], dynamic_rg_pruning=eligible, pruning_predicate=f_key_null_count@1 != row_count@2 AND f_key_max@0 >= 10 AND f_key_null_count@1 != row_count@2 AND f_key_min@3 <= 300 AND f_key_null_count@1 != row_count@2 AND KEY_RANGE_BITMAP(f_key_min@3, f_key_max@0, 30/512 buckets), required_guarantees=[], metrics=[output_rows=310, output_batches=1, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=1 total → 1 matched, page_index_pages_pruned=1 total → 1 matched, page_index_rows_pruned=3.00 K total → 3.00 K matched, limit_pruned_row_groups=0 total → 0 matched, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, num_predicate_creation_errors=0, predicate_evaluation_errors=0, pushdown_rows_matched=310, pushdown_rows_pruned=2.69 K, predicate_cache_inner_records=3.00 K, predicate_cache_records=2.99 K, scan_efficiency_ratio=94.14% (11.01 K/11.69 K)]
+
+query II
+SELECT count(*), sum(f_val) FROM fact JOIN dim ON f_key = d_key WHERE d_flag = 'keep';
+----
+300 451200
+
+statement ok
+set datafusion.optimizer.enable_predicate_transfer = false;
+
+query II
+SELECT count(*), sum(f_val) FROM fact JOIN dim ON f_key = d_key WHERE d_flag = 'keep';
+----
+300 451200
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold;
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold_rows;
+
+statement ok
+reset datafusion.optimizer.enable_predicate_transfer;
+
+statement ok
+reset datafusion.optimizer.hash_join_inlist_pushdown_max_size;
+
+statement ok
+reset datafusion.execution.perfect_hash_join_small_build_threshold;
+
+statement ok
+reset datafusion.explain.analyze_categories;
+
+statement ok
+reset datafusion.execution.parquet.pushdown_filters;
+
+statement ok
+reset datafusion.explain.physical_plan_only;
+
+statement ok
+DROP TABLE dim;
+
+statement ok
+DROP TABLE mid;
+
+statement ok
+DROP TABLE fact;
