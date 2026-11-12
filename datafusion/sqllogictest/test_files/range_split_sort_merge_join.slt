@@ -316,6 +316,22 @@ physical_plan
 02)--CooperativeExec
 03)----RangeSplitJoinExec: ranges=4, bounds=[0, 18, 36, 54, 73], join=SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)]
 
+# A FULL join is not cut inside files: it is planned as before.
+query TT
+EXPLAIN SELECT l1.v, r1.w FROM l1 FULL JOIN r1 ON l1.k = r1.k
+----
+logical_plan
+01)Projection: l1.v, r1.w
+02)--Full Join: l1.k = r1.k
+03)----TableScan: l1 projection=[k, v]
+04)----TableScan: r1 projection=[k, w]
+physical_plan
+01)SortMergeJoinExec: join_type=Full, on=[(k@0, k@0)], projection=[v@1, w@3]
+02)--RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=1, maintains_sort_order=true
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/l1/0.parquet]]}, projection=[k, v], output_ordering=[k@0 ASC NULLS LAST], file_type=parquet
+04)--RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=1, maintains_sort_order=true
+05)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/range_split_sort_merge_join/r1/0.parquet]]}, projection=[k, w], output_ordering=[k@0 ASC NULLS LAST], file_type=parquet
+
 statement ok
 set datafusion.optimizer.sort_merge_join_for_sorted_inputs = false;
 

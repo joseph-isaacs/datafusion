@@ -16,7 +16,9 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{JoinSide, NullEquality, Result, ScalarValue, internal_err};
+use datafusion_common::{
+    JoinSide, JoinType, NullEquality, Result, ScalarValue, internal_err,
+};
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
@@ -97,6 +99,11 @@ pub(crate) fn try_range_split(
     // Cuts inside files need each range's scan to skip what lies outside it.
     let cut_inside_files =
         larger.files.len() < n && left.prunes_row_groups && right.prunes_row_groups;
+    // A FULL join cut inside files lost to the hash join (smj-ts as one
+    // file per table, Q5: x1.06 [1.01, 1.10]); keep the planner's choice.
+    if cut_inside_files && join.join_type() == JoinType::Full {
+        return Ok(None);
+    }
     if cut_inside_files {
         // Too few files to cut at: cut inside them, at equal widths. Each
         // range's scan skips the row groups and pages outside its range by
