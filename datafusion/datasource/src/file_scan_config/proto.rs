@@ -75,6 +75,9 @@ impl FileScanConfig {
             // remains centralized.
             statistics: _,
             output_partitioning,
+            // A memory/speed hint that never changes results: not
+            // serialized, so a decoded scan reads ahead by default.
+            lookahead: _,
         } = self;
 
         // Non-default factories are executable behavior with no protobuf

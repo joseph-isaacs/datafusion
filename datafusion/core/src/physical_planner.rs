@@ -1739,8 +1739,43 @@ impl DefaultPhysicalPlanner {
                     );
                 }
 
+                // Inputs already sorted on the join keys, in files whose key
+                // ranges prove a range split exact, merge-join range by range
+                // (see `sort_merge_join_for_sorted_inputs`).
+                let optimizer = &session.config_options().optimizer;
+                let sorted_split = if !join_on.is_empty()
+                    && can_repartition_join
+                    && optimizer.sort_merge_join_for_sorted_inputs
+                {
+                    let ranges = match optimizer.range_split_sort_merge_join {
+                        n if n > 1 => n,
+                        _ => session.config().target_partitions(),
+                    };
+                    match SortMergeJoinExec::try_new(
+                        Arc::clone(&physical_left),
+                        Arc::clone(&physical_right),
+                        join_on.clone(),
+                        join_filter.clone(),
+                        *join_type,
+                        vec![SortOptions::default(); join_on.len()],
+                        *null_equality,
+                    ) {
+                        Ok(candidate) => {
+                            crate::datasource::range_split_join::try_range_split(
+                                &candidate, ranges,
+                            )?
+                        }
+                        // A join the merge join cannot express is planned as before.
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+
                 // TODO: Allow PWMJ to deal with residual equijoin conditions
-                let join: Arc<dyn ExecutionPlan> = if join_on.is_empty() {
+                let join: Arc<dyn ExecutionPlan> = if let Some(split) = sorted_split {
+                    split
+                } else if join_on.is_empty() {
                     if join_filter.is_none() && *join_type == JoinType::Inner {
                         // cross join if there is no join conditions and no join filter set
                         Arc::new(CrossJoinExec::new(physical_left, physical_right))
@@ -1874,7 +1909,7 @@ impl DefaultPhysicalPlanner {
                 {
                     // Use SortMergeJoin if hash join is not preferred
                     let join_on_len = join_on.len();
-                    Arc::new(SortMergeJoinExec::try_new(
+                    let join = SortMergeJoinExec::try_new(
                         physical_left,
                         physical_right,
                         join_on,
@@ -1882,7 +1917,18 @@ impl DefaultPhysicalPlanner {
                         *join_type,
                         vec![SortOptions::default(); join_on_len],
                         *null_equality,
-                    )?)
+                    )?;
+                    let ranges = session
+                        .config()
+                        .options()
+                        .optimizer
+                        .range_split_sort_merge_join;
+                    match crate::datasource::range_split_join::try_range_split(
+                        &join, ranges,
+                    )? {
+                        Some(split) => split,
+                        None => Arc::new(join),
+                    }
                 } else {
                     // Null-aware joins need global probe-side state, so keep
                     // them in CollectLeft mode.

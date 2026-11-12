@@ -1833,6 +1833,22 @@ config_namespace! {
         /// HashJoin can work more efficiently than SortMergeJoin but consumes more memory
         pub prefer_hash_join: bool, default = true
 
+        /// When greater than 1, a sort-merge join planned over two file scans
+        /// whose files are each sorted ascending on the join keys, with exact
+        /// min/max statistics, no nulls in the first key, and non-overlapping
+        /// key ranges, is split into this many independent joins over
+        /// disjoint ranges of the first key, each scanning only the files
+        /// that overlap its range. 0 or 1 disables the split.
+        pub range_split_sort_merge_join: usize, default = 0
+
+        /// When true, an equi-join whose inputs are both file scans that prove
+        /// a range split exact (see `range_split_sort_merge_join`) is planned
+        /// as a range-split sort-merge join even when `prefer_hash_join` is
+        /// true, with `range_split_sort_merge_join` ranges if that is greater
+        /// than 1, otherwise `target_partitions`. Joins over any other inputs
+        /// are planned as before.
+        pub sort_merge_join_for_sorted_inputs: bool, default = true
+
         /// When set to true, piecewise merge join is enabled. PiecewiseMergeJoin is currently
         /// experimental. Physical planner will opt for PiecewiseMergeJoin when there is only
         /// one range filter.

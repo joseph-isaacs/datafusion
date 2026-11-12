@@ -1721,4 +1721,317 @@ mod tests {
             self.stream = None;
         }
     }
+
+    /// A `FileOpener` whose file `mock_file{n}` yields `batches` batches of
+    /// `rows` rows holding consecutive values from `n * 1000`, so the
+    /// stream's output is strictly increasing exactly when its files and
+    /// batches come out in order. Each batch yields to the runtime first, so
+    /// files opened ahead really decode concurrently.
+    struct OrderedOpener {
+        batches: usize,
+        rows: usize,
+        scan_error_file: Option<usize>,
+    }
+
+    impl FileOpener for OrderedOpener {
+        fn open(&self, file: PartitionedFile) -> Result<FileOpenFuture> {
+            let n: usize = file
+                .object_meta
+                .location
+                .as_ref()
+                .trim_start_matches("mock_file")
+                .parse()
+                .unwrap();
+            let (batches, rows) = (self.batches, self.rows);
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+            if self.scan_error_file == Some(n) {
+                let error = futures::future::ready(datafusion_common::exec_err!(
+                    "error scanning"
+                ));
+                return Ok(futures::future::ready(Ok(
+                    futures::stream::once(error).boxed()
+                ))
+                .boxed());
+            }
+            let stream = futures::stream::iter(0..batches)
+                .then(move |b| {
+                    let schema = Arc::clone(&schema);
+                    async move {
+                        tokio::task::yield_now().await;
+                        let start = (n * 1000 + b * rows) as i32;
+                        let values = arrow::array::Int32Array::from_iter_values(
+                            start..start + rows as i32,
+                        );
+                        Ok(RecordBatch::try_new(schema, vec![Arc::new(values)])?)
+                    }
+                })
+                .boxed();
+            Ok(futures::future::ready(Ok(stream)).boxed())
+        }
+    }
+
+    async fn ordered_values(
+        num_files: usize,
+        on_error: OnError,
+        scan_error_file: Option<usize>,
+    ) -> Result<Vec<i32>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(
+            (0..num_files)
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect(),
+        )
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file,
+            }))
+            .with_metrics(&metrics_set)
+            .with_on_error(on_error)
+            .build()?;
+        let batches = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(batches
+            .iter()
+            .flat_map(|b| b.column(0).as_primitive::<Int32Type>().values().to_vec())
+            .collect())
+    }
+
+    /// On a multi-threaded runtime the scan opens and decodes the next file
+    /// ahead of the current one; its output must still be in file order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_opened_ahead_keep_their_order() -> Result<()> {
+        for num_files in [1, 2, 9] {
+            let values = ordered_values(num_files, OnError::Fail, None).await?;
+            let expected: Vec<i32> = (0..num_files as i32)
+                .flat_map(|n| n * 1000..n * 1000 + 21)
+                .collect();
+            assert_eq!(values, expected, "{num_files} files");
+        }
+        Ok(())
+    }
+
+    /// A file failing to scan while opened ahead fails the scan, or is skipped
+    /// in place, just as without the lookahead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_opened_ahead_report_errors_in_order() -> Result<()> {
+        assert!(ordered_values(5, OnError::Fail, Some(3)).await.is_err());
+        let values = ordered_values(5, OnError::Skip, Some(3)).await?;
+        let expected: Vec<i32> = [0, 1, 2, 4]
+            .into_iter()
+            .flat_map(|n| n * 1000..n * 1000 + 21)
+            .collect();
+        assert_eq!(values, expected);
+        Ok(())
+    }
+
+    /// Batches a file opened ahead decodes are reserved in the stream's
+    /// memory pool while they wait, and released when the stream is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_opened_ahead_reserve_their_batches() -> Result<()> {
+        use datafusion_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(
+            (0..4)
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect(),
+        )
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file: None,
+            }))
+            .with_metrics(&metrics_set)
+            .with_memory_pool(Arc::clone(&pool))
+            .build()?;
+        // Each batch of file 0 takes the lookahead one planning step further
+        // (open file 1, resolve its I/O, produce its morsel); by the fourth,
+        // file 1 is decoding ahead.
+        for _ in 0..4 {
+            stream.next().await.unwrap()?;
+        }
+        let mut reserved = 0;
+        for _ in 0..200 {
+            reserved = pool.reserved();
+            if reserved > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(reserved > 0, "lookahead batches not reserved");
+        drop(stream);
+        for _ in 0..200 {
+            if pool.reserved() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(pool.reserved(), 0, "lookahead reservation leaked");
+        Ok(())
+    }
+
+    /// A single-partition scan built without the lookahead opens no file
+    /// ahead, so it reserves nothing for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scans_without_lookahead_do_not_read_ahead() -> Result<()> {
+        use datafusion_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(
+            (0..4)
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect(),
+        )
+        .with_lookahead(false)
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file: None,
+            }))
+            .with_metrics(&metrics_set)
+            .with_memory_pool(Arc::clone(&pool))
+            .build()?;
+        // With the lookahead, file 1 is decoding ahead by the fourth batch.
+        for _ in 0..4 {
+            stream.next().await.unwrap()?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(pool.reserved(), 0, "a file was read ahead");
+        let mut rows = 4 * 3;
+        while let Some(batch) = stream.next().await {
+            rows += batch?.num_rows();
+        }
+        assert_eq!(rows, 4 * 7 * 3);
+        Ok(())
+    }
+
+    /// A memory pool that cannot spare the deep lookahead keeps it at the
+    /// minimum depth, and the scan still returns every batch in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_opened_ahead_respect_the_memory_limit() -> Result<()> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        const LIMIT: usize = 4096;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(LIMIT));
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(
+            (0..4)
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect(),
+        )
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file: None,
+            }))
+            .with_metrics(&metrics_set)
+            .with_memory_pool(Arc::clone(&pool))
+            .build()?;
+        let mut batches = vec![];
+        let mut max_reserved = 0;
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+            max_reserved = max_reserved.max(pool.reserved());
+        }
+        let batch_size = batches[0].get_array_memory_size();
+        assert!(
+            super::scan_state::LOOKAHEAD_MAX_BATCHES * batch_size > LIMIT,
+            "the deep lookahead must not fit the pool for this test to mean anything"
+        );
+        assert!(
+            max_reserved
+                <= LIMIT.max(super::scan_state::LOOKAHEAD_MIN_BATCHES * batch_size),
+            "reserved {max_reserved} bytes, over the {LIMIT} byte pool"
+        );
+        assert_eq!(batches.len(), 4 * 7);
+        let values: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(values.is_sorted(), "batches out of order");
+        drop(stream);
+        Ok(())
+    }
+
+    /// A scan with more than one partition reads no file ahead: its other
+    /// partitions already keep the cores busy decoding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_partition_scans_do_not_read_ahead() -> Result<()> {
+        use datafusion_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let group = |files: std::ops::Range<usize>| {
+            files
+                .map(|n| PartitionedFile::new(format!("mock_file{n}"), 10))
+                .collect()
+        };
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(TableSchema::from(schema))),
+        )
+        .with_file_group(group(0..4))
+        .with_file_group(group(4..8))
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut stream = FileStreamBuilder::new(&config)
+            .with_partition(0)
+            .with_file_opener(Arc::new(OrderedOpener {
+                batches: 7,
+                rows: 3,
+                scan_error_file: None,
+            }))
+            .with_metrics(&metrics_set)
+            .with_memory_pool(Arc::clone(&pool))
+            .build()?;
+        // Far past the point where a single-partition scan reads ahead.
+        for _ in 0..6 {
+            stream.next().await.unwrap()?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(pool.reserved(), 0, "a multi-partition scan read ahead");
+        Ok(())
+    }
 }

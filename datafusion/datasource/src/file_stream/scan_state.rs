@@ -9,9 +9,12 @@ use std::task::{Context, Poll};
 use crate::morsel::{Morsel, MorselPlanner, Morselizer, PendingMorselPlanner};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result};
+use datafusion_common_runtime::SpawnedTask;
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_plan::metrics::ScopedTimerGuard;
 use futures::stream::BoxStream;
 use futures::{FutureExt as _, StreamExt as _};
+use std::sync::Arc;
 
 use super::work_source::WorkSource;
 use super::{FileStreamMetrics, OnError};
@@ -70,6 +73,12 @@ pub(super) struct ScanState {
     pending_planner: Option<PendingMorselPlanner>,
     /// Metrics for the active scan queues.
     metrics: FileStreamMetrics,
+    /// Where batches decoded ahead by a morsel opened in advance are
+    /// reserved while they wait for the consumer, if the stream has a pool.
+    lookahead_reservation: Option<MemoryReservation>,
+    /// Whether to open and decode the next file ahead; see
+    /// [`Self::plan_ahead`].
+    lookahead: bool,
 }
 
 impl ScanState {
@@ -79,6 +88,8 @@ impl ScanState {
         morselizer: Box<dyn Morselizer>,
         on_error: OnError,
         metrics: FileStreamMetrics,
+        lookahead_reservation: Option<MemoryReservation>,
+        lookahead: bool,
     ) -> Self {
         Self {
             work_source,
@@ -90,6 +101,8 @@ impl ScanState {
             reader: None,
             pending_planner: None,
             metrics,
+            lookahead_reservation,
+            lookahead,
         }
     }
 
@@ -110,8 +123,9 @@ impl ScanState {
     /// The return [`ScanAndReturn`] tells `poll_inner` how to update the
     /// outer `FileStreamState`.
     pub(super) fn poll_scan(&mut self, cx: &mut Context<'_>) -> ScanAndReturn {
-        let _processing_timer: ScopedTimerGuard<'_> =
-            self.metrics.time_processing.timer();
+        // A clone (sharing the metric), so the guard does not borrow `self`.
+        let time_processing = self.metrics.time_processing.clone();
+        let _processing_timer: ScopedTimerGuard<'_> = time_processing.timer();
 
         // Try and resolve outstanding IO first. If it is still pending, check
         // the current reader or ready morsels before yielding. New planning
@@ -167,6 +181,7 @@ impl ScanState {
                         }
                         None => {
                             self.metrics.time_scanning_total.start();
+                            self.plan_ahead();
                             (batch, false)
                         }
                     };
@@ -274,6 +289,180 @@ impl ScanState {
                 OnError::Fail => ScanAndReturn::Error(err),
             },
         }
+    }
+}
+
+impl ScanState {
+    /// While the active reader still has batches, take one step towards the
+    /// next file's morsel, and start decoding it in the background.
+    ///
+    /// A partition reads its files one after another, and a file's reader
+    /// decodes only when polled, so without this the next file is not even
+    /// opened until the current one is drained, and a partition never has
+    /// more than one file decoding at once. That leaves the scan of an
+    /// ordered partition, which has to read its files in order on a single
+    /// stream, as one serial chain of decode work. Each step here runs only
+    /// when nothing else is queued or in flight (keeping the single
+    /// outstanding I/O), so at most one file is ever opened ahead, and its
+    /// stream is spawned with [`spawn_morsel`], which reads at most
+    /// [`LOOKAHEAD_BYTES`] ahead. Files still start in order, so
+    /// the partition's batches keep their order.
+    ///
+    /// Not used with a row limit (extra files may never be needed), outside
+    /// a multi-threaded runtime (nowhere to run the decode), or for a scan
+    /// with more than one partition: there every core is already decoding a
+    /// partition of its own, so the extra decode tasks only add contention
+    /// (TPC-H SF1, 4 partitions: Q3 +7.6%, Q21 +14.1% with hash joins; Q17
+    /// +9.9%, Q18 +10.2% with sort-merge joins).
+    fn plan_ahead(&mut self) {
+        if !self.lookahead
+            || !multi_thread_runtime()
+            || !self.ready_morsels.is_empty()
+            || self.pending_planner.is_some()
+        {
+            return;
+        }
+        if let Some(planner) = self.ready_planners.pop_front() {
+            match planner.plan() {
+                Ok(Some(mut plan)) => {
+                    let reservation = self.lookahead_reservation.as_ref();
+                    let morsels = plan.take_morsels();
+                    // The file's budget is shared by its morsels.
+                    let budget = LOOKAHEAD_BYTES / morsels.len().max(1);
+                    self.ready_morsels.extend(
+                        morsels
+                            .into_iter()
+                            .map(|morsel| spawn_morsel(morsel, reservation, budget)),
+                    );
+                    self.ready_planners.extend(plan.take_ready_planners());
+                    self.pending_planner = plan.take_pending_planner();
+                }
+                Ok(None) => self.metrics.files_processed.add(1),
+                // Leave the error to the regular path: re-plan the file then.
+                Err(_) => {}
+            }
+            return;
+        }
+        let Some(part_file) = self.work_source.pop_front() else {
+            return;
+        };
+        match self.morselizer.plan_file(part_file) {
+            Ok(planner) => {
+                self.metrics.files_opened.add(1);
+                self.ready_planners.push_back(planner);
+            }
+            // Surface the error as the regular path would, after the active
+            // reader: queue a planner that fails when planned.
+            Err(err) => self
+                .ready_planners
+                .push_back(Box::new(FailedPlanner(Some(err)))),
+        }
+    }
+}
+
+/// Bytes of decoded batches a file opened ahead may hold before the scan
+/// reaches it, shared by the file's morsels. A deep lookahead is what lets
+/// the next file decode alongside the current one: two batches ahead, its
+/// decoder stalls almost at once. On smj-ts (one ordered partition per join
+/// input), 16 MiB is 12% to 33% faster than two batches on 8 of 9 joins (the
+/// ninth unchanged), against 4 MiB (3% to 14%) and 8 MiB (13% to 28%); the
+/// pool peak is 51-69 MB, where the default hash join's is 52-646 MB.
+const LOOKAHEAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// The depth bounds, in batches, whatever the batch size.
+pub(super) const LOOKAHEAD_MIN_BATCHES: usize = 2;
+pub(super) const LOOKAHEAD_MAX_BATCHES: usize = 128;
+
+fn multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+        handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    })
+}
+
+/// Decodes `morsel` in its own task, ahead of its consumer. Dropping the
+/// returned morsel, or its stream, stops the task.
+///
+/// The task may run [`LOOKAHEAD_MIN_BATCHES`] batches ahead until the first
+/// batch is decoded; its size then sets the depth to [`LOOKAHEAD_BYTES`]
+/// worth of batches, within the depth bounds. With a `reservation`, that
+/// capacity is reserved from it with `try_grow`: if the pool cannot spare it,
+/// the depth stays at the minimum (whose capacity is still counted). It is
+/// released when the morsel's stream is dropped.
+fn spawn_morsel(
+    morsel: Box<dyn Morsel>,
+    reservation: Option<&MemoryReservation>,
+    budget: usize,
+) -> Box<dyn Morsel> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // One permit per batch that may exist ahead of the consumer, held by the
+    // batch until the consumer takes it.
+    let slots = Arc::new(tokio::sync::Semaphore::new(LOOKAHEAD_MIN_BATCHES));
+    let mut stream = morsel.into_stream();
+    let held = reservation.map(|r| Arc::new(r.new_empty()));
+    let producer = held.clone();
+    let task = SpawnedTask::spawn(async move {
+        let mut sized = false;
+        while let Ok(slot) = Arc::clone(&slots).acquire_owned().await {
+            let Some(item) = stream.next().await else {
+                break;
+            };
+            if !sized && let Ok(batch) = &item {
+                sized = true;
+                let batch_size = batch.get_array_memory_size().max(1);
+                let depth = (budget / batch_size)
+                    .clamp(LOOKAHEAD_MIN_BATCHES, LOOKAHEAD_MAX_BATCHES);
+                let depth = match &producer {
+                    Some(reservation)
+                        if reservation.try_grow(depth * batch_size).is_err() =>
+                    {
+                        reservation.grow(LOOKAHEAD_MIN_BATCHES * batch_size);
+                        LOOKAHEAD_MIN_BATCHES
+                    }
+                    _ => depth,
+                };
+                slots.add_permits(depth - LOOKAHEAD_MIN_BATCHES);
+            }
+            if tx.send((item, slot)).is_err() {
+                break;
+            }
+        }
+    });
+    // The consumer's side keeps the reservation until the stream is dropped,
+    // covering batches still waiting in the channel after decoding ends.
+    let stream =
+        futures::stream::unfold((rx, task, held), |(mut rx, task, held)| async move {
+            rx.recv()
+                .await
+                .map(|(item, _slot)| (item, (rx, task, held)))
+        });
+    Box::new(SpawnedMorsel(stream.boxed()))
+}
+
+struct SpawnedMorsel(BoxStream<'static, Result<RecordBatch>>);
+
+impl std::fmt::Debug for SpawnedMorsel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnedMorsel").finish_non_exhaustive()
+    }
+}
+
+impl Morsel for SpawnedMorsel {
+    fn into_stream(self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>> {
+        self.0
+    }
+}
+
+/// A planner standing in for a file whose planning failed while it was
+/// being opened ahead, so the error surfaces in order.
+#[derive(Debug)]
+struct FailedPlanner(Option<DataFusionError>);
+
+impl MorselPlanner for FailedPlanner {
+    fn plan(mut self: Box<Self>) -> Result<Option<crate::morsel::MorselPlan>> {
+        Err(self
+            .0
+            .take()
+            .unwrap_or_else(|| internal_datafusion_err!("FailedPlanner planned twice")))
     }
 }
 

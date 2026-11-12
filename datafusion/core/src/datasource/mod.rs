@@ -13,6 +13,7 @@ pub mod listing_table_factory;
 mod memory_test;
 pub mod physical_plan;
 pub mod provider;
+pub(crate) mod range_split_join;
 mod view_test;
 
 // backwards compatibility
