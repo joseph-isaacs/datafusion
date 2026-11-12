@@ -221,7 +221,7 @@ logical_plan
 physical_plan
 01)ProjectionExec: expr=[v@2 as v, w@5 as w]
 02)--CooperativeExec
-03)----RangeSplitJoinExec: ranges=2, bounds=[0, 10, 20], join=SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)], filter=__range_split_key_0@0 = __range_split_key_1@1
+03)----RangeSplitJoinExec: ranges=4, bounds=[0, 5, 10, 15, 20], join=SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)], filter=__range_split_key_0@0 = __range_split_key_1@1
 
 statement ok
 set datafusion.optimizer.range_split_sort_merge_join = 0;
@@ -280,6 +280,89 @@ DROP TABLE l2;
 
 statement ok
 DROP TABLE r2;
+
+# One sorted file per side, many row groups: the ranges cut inside the files
+# and each range's scan skips the row groups outside it.
+statement ok
+set datafusion.execution.parquet.max_row_group_size = 7;
+
+statement ok
+COPY (SELECT value / 2 AS k, value AS v FROM range(0, 100) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/l1/0.parquet';
+
+statement ok
+COPY (SELECT value * 3 AS k, value AS w FROM range(0, 25) ORDER BY k) TO 'test_files/scratch/range_split_sort_merge_join/r1/0.parquet';
+
+statement ok
+RESET datafusion.execution.parquet.max_row_group_size;
+
+statement ok
+CREATE EXTERNAL TABLE l1 (k BIGINT NOT NULL, v BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/l1/' WITH ORDER (k ASC NULLS LAST);
+
+statement ok
+CREATE EXTERNAL TABLE r1 (k BIGINT NOT NULL, w BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/range_split_sort_merge_join/r1/' WITH ORDER (k ASC NULLS LAST);
+
+query TT
+EXPLAIN SELECT l1.v, r1.w FROM l1 JOIN r1 ON l1.k = r1.k
+----
+logical_plan
+01)Projection: l1.v, r1.w
+02)--Inner Join: l1.k = r1.k
+03)----TableScan: l1 projection=[k, v]
+04)----TableScan: r1 projection=[k, w]
+physical_plan
+01)ProjectionExec: expr=[v@1 as v, w@3 as w]
+02)--CooperativeExec
+03)----RangeSplitJoinExec: ranges=4, bounds=[0, 18, 36, 54, 73], join=SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)]
+
+statement ok
+set datafusion.optimizer.sort_merge_join_for_sorted_inputs = false;
+
+statement ok
+set datafusion.optimizer.range_split_sort_merge_join = 0;
+
+query IIII
+SELECT count(*), sum(l1.v), sum(r1.w), count(DISTINCT l1.k) FROM l1 JOIN r1 ON l1.k = r1.k
+----
+34 1649 272 17
+
+query IIIII
+SELECT count(*), sum(l1.v), sum(r1.w), count(l1.k), count(r1.k) FROM l1 FULL JOIN r1 ON l1.k = r1.k
+----
+108 4950 436 100 42
+
+query II
+SELECT count(*), sum(l1.v) FROM l1 WHERE NOT EXISTS (SELECT 1 FROM r1 WHERE r1.k = l1.k)
+----
+66 3301
+
+statement ok
+RESET datafusion.optimizer.sort_merge_join_for_sorted_inputs;
+
+statement ok
+set datafusion.optimizer.range_split_sort_merge_join = 4;
+
+query IIII
+SELECT count(*), sum(l1.v), sum(r1.w), count(DISTINCT l1.k) FROM l1 JOIN r1 ON l1.k = r1.k
+----
+34 1649 272 17
+
+query IIIII
+SELECT count(*), sum(l1.v), sum(r1.w), count(l1.k), count(r1.k) FROM l1 FULL JOIN r1 ON l1.k = r1.k
+----
+108 4950 436 100 42
+
+query II
+SELECT count(*), sum(l1.v) FROM l1 WHERE NOT EXISTS (SELECT 1 FROM r1 WHERE r1.k = l1.k)
+----
+66 3301
+
+statement ok
+DROP TABLE l1;
+
+statement ok
+DROP TABLE r1;
 
 # Files whose key ranges overlap cannot be split: a plain merge join.
 statement ok

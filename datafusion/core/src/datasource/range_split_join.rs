@@ -18,13 +18,14 @@ use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{JoinSide, NullEquality, Result, ScalarValue, internal_err};
 use datafusion_datasource::PartitionedFile;
+use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
-use datafusion_physical_expr::expressions::BinaryExpr;
 use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
 use datafusion_physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr,
 };
@@ -93,13 +94,30 @@ pub(crate) fn try_range_split(
     };
     let total = larger.rows().max(1);
     let mut bounds = vec![min];
-    let mut seen = 0;
-    for file in &larger.files {
-        let next = bounds.len();
-        if next < n && seen * n >= total * next && file.min > *bounds.last().unwrap() {
-            bounds.push(file.min);
+    // Cuts inside files need each range's scan to skip what lies outside it.
+    let cut_inside_files =
+        larger.files.len() < n && left.prunes_row_groups && right.prunes_row_groups;
+    if cut_inside_files {
+        // Too few files to cut at: cut inside them, at equal widths. Each
+        // range's scan skips the row groups and pages outside its range by
+        // their statistics, so a file is decoded about once all the same.
+        let span = (max as i128) - (min as i128) + 1;
+        for i in 1..n {
+            let cut = (min as i128 + span * i as i128 / n as i128) as i64;
+            if cut > *bounds.last().unwrap() {
+                bounds.push(cut);
+            }
         }
-        seen += file.rows;
+    } else {
+        let mut seen = 0;
+        for file in &larger.files {
+            let next = bounds.len();
+            if next < n && seen * n >= total * next && file.min > *bounds.last().unwrap()
+            {
+                bounds.push(file.min);
+            }
+            seen += file.rows;
+        }
     }
     // Half-open ranges covering `min..=max`.
     bounds.push(max + 1);
@@ -112,8 +130,8 @@ pub(crate) fn try_range_split(
         .map(|w| {
             let (lo, hi) = (w[0], w[1]);
             let joined = SortMergeJoinExec::try_new(
-                left.range(lo, hi),
-                right.range(lo, hi),
+                left.range(lo, hi, cut_inside_files),
+                right.range(lo, hi, cut_inside_files),
                 join.on()[..ordered].to_vec(),
                 filter.clone(),
                 join.join_type(),
@@ -176,6 +194,19 @@ fn keys_into_filter(
         .map(|e| JoinFilter::new(e, column_indices, Arc::new(Schema::new(fields)))))
 }
 
+#[cfg(feature = "parquet")]
+fn is_parquet(config: &FileScanConfig) -> bool {
+    config
+        .file_source
+        .downcast_ref::<datafusion_datasource_parquet::source::ParquetSource>()
+        .is_some()
+}
+
+#[cfg(not(feature = "parquet"))]
+fn is_parquet(_config: &FileScanConfig) -> bool {
+    false
+}
+
 /// A file with the exact min and max of the first join key.
 struct KeyedFile {
     file: PartitionedFile,
@@ -195,6 +226,12 @@ struct SortedScan {
     prefixes: [usize; 2],
     /// In key order, non-overlapping.
     files: Vec<KeyedFile>,
+    /// The first key's column in the table schema, for a range predicate.
+    table_key: Column,
+    key_type: DataType,
+    /// Whether the source prunes row groups and pages by a predicate
+    /// (Parquet), so a range need not decode the parts of a file outside it.
+    prunes_row_groups: bool,
 }
 
 impl SortedScan {
@@ -299,11 +336,18 @@ impl SortedScan {
         if files.is_empty() || files.windows(2).any(|w| w[1].min < w[0].max) {
             return Ok(None);
         }
+        let table_schema = config.file_source.table_schema().table_schema();
+        let Ok(table_index) = table_schema.index_of(key.name()) else {
+            return Ok(None);
+        };
         Ok(Some(Self {
             config: config.clone(),
             key: key.index(),
             prefixes,
             files,
+            table_key: Column::new(key.name(), table_index),
+            key_type: projected.field(key.index()).data_type().clone(),
+            prunes_row_groups: is_parquet(config),
         }))
     }
 
@@ -311,15 +355,56 @@ impl SortedScan {
         self.files.iter().map(|f| f.rows).sum()
     }
 
-    /// This input's rows with keys in `lo..hi`.
-    fn range(&self, lo: i64, hi: i64) -> Arc<dyn ExecutionPlan> {
+    /// The scan's Parquet source with `lo <= key < hi` added to its
+    /// predicate, so the reader skips row groups and pages outside the range.
+    #[cfg(feature = "parquet")]
+    fn range_source(&self, lo: i64, hi: i64) -> Option<Arc<dyn FileSource>> {
+        use datafusion_datasource_parquet::source::ParquetSource;
+        let parquet = self.config.file_source.downcast_ref::<ParquetSource>()?;
+        let bound = |v: i64| -> Option<Arc<dyn PhysicalExpr>> {
+            let value = ScalarValue::Int64(Some(v)).cast_to(&self.key_type).ok()?;
+            Some(Arc::new(Literal::new(value)))
+        };
+        let key = Arc::new(self.table_key.clone()) as Arc<dyn PhysicalExpr>;
+        let range = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::clone(&key),
+                Operator::GtEq,
+                bound(lo)?,
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(key, Operator::Lt, bound(hi)?)),
+        )) as Arc<dyn PhysicalExpr>;
+        let predicate = match parquet.filter() {
+            Some(existing) => {
+                Arc::new(BinaryExpr::new(existing, Operator::And, range)) as _
+            }
+            None => range,
+        };
+        Some(Arc::new(parquet.with_predicate(predicate)))
+    }
+
+    #[cfg(not(feature = "parquet"))]
+    fn range_source(&self, _lo: i64, _hi: i64) -> Option<Arc<dyn FileSource>> {
+        None
+    }
+
+    /// This input's rows with keys in `lo..hi`, skipping row groups and pages
+    /// outside the range when `prune`.
+    fn range(&self, lo: i64, hi: i64, prune: bool) -> Arc<dyn ExecutionPlan> {
         let files = self
             .files
             .iter()
             .filter(|f| f.max >= lo && f.min < hi)
             .map(|f| f.file.clone())
             .collect();
-        let config = FileScanConfigBuilder::from(self.config.clone())
+        let mut builder = FileScanConfigBuilder::from(self.config.clone());
+        // Ranges cut at file starts read whole files: the predicate would
+        // only cost its evaluation (smj-ts, 8 files: Q8 +5%).
+        if let Some(source) = prune.then(|| self.range_source(lo, hi)).flatten() {
+            builder = builder.with_source(source);
+        }
+        let config = builder
             .with_file_groups(vec![FileGroup::new(files)])
             // The ranges already decode in parallel; reading ahead within
             // each adds memory but no speed (smj-ts, 8 ranges: all 9

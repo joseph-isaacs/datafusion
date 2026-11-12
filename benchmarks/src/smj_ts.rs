@@ -89,6 +89,11 @@ pub struct RunOpt {
     #[arg(long = "range-partitions")]
     range_partitions: Option<usize>,
 
+    /// Parquet files written per table when generating data (each covers a
+    /// consecutive, non-overlapping timestamp range).
+    #[arg(long = "files-per-table", default_value_t = 8)]
+    files_per_table: u64,
+
     /// Directory holding (or receiving) the generated Parquet tables
     #[arg(short = 'p', long = "path", default_value = "data/smj_ts")]
     path: PathBuf,
@@ -101,8 +106,6 @@ pub struct RunOpt {
     #[arg(short = 'o', long = "output")]
     output_path: Option<PathBuf>,
 }
-
-const FILES_PER_TABLE: u64 = 8;
 
 /// (table name, total rows, timestamp-in-ms expression of `value`, extra columns)
 const TABLES: &[(&str, u64, &str, &str)] = &[
@@ -220,7 +223,7 @@ impl RunOpt {
         self.path.join(table)
     }
 
-    /// Writes each table as `FILES_PER_TABLE` Parquet files covering
+    /// Writes each table as `files_per_table` Parquet files covering
     /// consecutive, non-overlapping timestamp ranges, each sorted by `ts`.
     async fn generate_data(&self, ctx: &SessionContext) -> Result<()> {
         for (name, rows, ts_expr, extra) in TABLES {
@@ -230,8 +233,8 @@ impl RunOpt {
             }
             std::fs::create_dir_all(&dir)?;
             println!("Generating {name} into {}", dir.display());
-            let per_file = rows.div_ceil(FILES_PER_TABLE);
-            for file in 0..FILES_PER_TABLE {
+            let per_file = rows.div_ceil(self.files_per_table);
+            for file in 0..self.files_per_table {
                 let start = file * per_file;
                 let end = (start + per_file).min(*rows);
                 let file_path = dir.join(format!("part-{file:03}.parquet"));
